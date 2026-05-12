@@ -30,7 +30,7 @@ from app.models.osdu import (
     WorkflowStatus,
     parse_workflow_status,
 )
-from app.services.legal_tags import LEGAL_TAGS_PATH
+from app.services.legal_tags import LEGAL_TAG_VALIDATE_PATH, LEGAL_TAGS_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +41,7 @@ INGESTION_TIMEOUT_SECONDS = 30
 # truth lives in the legal_tags module.
 __all__ = [
     "INGESTION_TIMEOUT_SECONDS",
+    "LEGAL_TAG_VALIDATE_PATH",
     "LEGAL_TAGS_PATH",
     "SAMPLE_PLACEHOLDER_ACL_OWNERS",
     "SAMPLE_PLACEHOLDER_ACL_VIEWERS",
@@ -54,6 +55,7 @@ __all__ = [
     "get_workflow_status",
     "submit_manifest",
     "substitute_manifest_placeholders",
+    "validate_legal_tag",
     "validate_manifest_json",
 ]
 
@@ -337,12 +339,33 @@ def check_legal_tag(
     token: str,
     legal_tag_name: str,
 ) -> LegalTagCheckResult:
-    """Probe ``GET /api/legal/v1/legaltags/{name}``.
+    """Pre-flight a legal tag via ``POST /api/legal/v1/legaltags:validate``.
 
-    Returns a :class:`LegalTagCheckResult`. 404 produces a curated
-    "not found in partition" message; other failures use the standard
-    error-body extraction. Transport failures return ``ok=False`` with
-    ``http_status=None`` and never raise.
+    Thin alias kept for callers that historically used the GET-based
+    "exists" probe. Delegates to :func:`validate_legal_tag`, which is
+    the more correct call: it confirms the tag is *valid* (not just
+    present) and matches the shape the workflow service uses
+    internally before accepting a manifest.
+    """
+    return validate_legal_tag(connection, token, legal_tag_name)
+
+
+def validate_legal_tag(
+    connection: ADMEConnection,
+    token: str,
+    legal_tag_name: str,
+) -> LegalTagCheckResult:
+    """Probe ``POST /api/legal/v1/legaltags:validate``.
+
+    Sends ``{"names": [legal_tag_name]}``. A 2xx response carries
+    ``{"invalidLegalTags": [...]}``: an empty list means the tag is
+    valid; the tag name appearing in the list means it exists but is
+    invalid *or* does not exist (the server does not distinguish).
+    Either way we surface a single curated "not valid" error so the
+    page can tell the operator to fix or create the tag.
+
+    Transport failures return ``ok=False`` with ``http_status=None``
+    and never raise.
     """
     if not legal_tag_name or not legal_tag_name.strip():
         raise ValueError(
@@ -350,14 +373,13 @@ def check_legal_tag(
             "legal-tag check."
         )
 
-    quoted_name = quote(legal_tag_name, safe="")
-    path = f"{LEGAL_TAGS_PATH}/{quoted_name}"
-
     parsed_body, http_status, correlation_id, latency_ms, error_message = (
-        _call_legal(
+        _call(
             connection=connection,
             token=token,
-            path=path,
+            method="POST",
+            path=LEGAL_TAG_VALIDATE_PATH,
+            json_body={"names": [legal_tag_name]},
         )
     )
 
@@ -372,6 +394,49 @@ def check_legal_tag(
         )
 
     if 200 <= http_status < 300:
+        body = parsed_body if isinstance(parsed_body, dict) else None
+        if body is None:
+            return LegalTagCheckResult(
+                name=legal_tag_name,
+                ok=False,
+                http_status=http_status,
+                latency_ms=latency_ms,
+                correlation_id=correlation_id,
+                error_message=(
+                    "Legal-tag validate returned a 2xx with no JSON body."
+                ),
+            )
+        raw_invalid = body.get("invalidLegalTags")
+        if not isinstance(raw_invalid, list):
+            return LegalTagCheckResult(
+                name=legal_tag_name,
+                ok=False,
+                http_status=http_status,
+                latency_ms=latency_ms,
+                correlation_id=correlation_id,
+                error_message=(
+                    "Legal-tag validate response is missing "
+                    "'invalidLegalTags' list."
+                ),
+            )
+        invalid_names = {
+            entry for entry in raw_invalid if isinstance(entry, str)
+        }
+        if legal_tag_name in invalid_names:
+            friendly = (
+                f"Legal tag '{legal_tag_name}' is not valid in "
+                f"partition '{connection.data_partition_id}'. The "
+                "workflow service will reject this manifest. Create "
+                "or fix the tag in Legal Tags, then retry."
+            )
+            return LegalTagCheckResult(
+                name=legal_tag_name,
+                ok=False,
+                http_status=http_status,
+                latency_ms=latency_ms,
+                correlation_id=correlation_id,
+                error_message=friendly,
+            )
         return LegalTagCheckResult(
             name=legal_tag_name,
             ok=True,
@@ -379,20 +444,6 @@ def check_legal_tag(
             latency_ms=latency_ms,
             correlation_id=correlation_id,
             error_message=None,
-        )
-
-    if http_status == 404:
-        friendly = (
-            f"Legal tag '{legal_tag_name}' not found in partition "
-            f"'{connection.data_partition_id}'."
-        )
-        return LegalTagCheckResult(
-            name=legal_tag_name,
-            ok=False,
-            http_status=http_status,
-            latency_ms=latency_ms,
-            correlation_id=correlation_id,
-            error_message=friendly,
         )
 
     return LegalTagCheckResult(
@@ -625,21 +676,6 @@ def _call_workflow(
         method=method,
         path=path,
         json_body=json_body,
-    )
-
-
-def _call_legal(
-    connection: ADMEConnection,
-    token: str,
-    path: str,
-) -> tuple[dict | str | None, int | None, str | None, float, str | None]:
-    """Shared HTTP wrapper for the legal service calls (GET only)."""
-    return _call(
-        connection=connection,
-        token=token,
-        method="GET",
-        path=path,
-        json_body=None,
     )
 
 
