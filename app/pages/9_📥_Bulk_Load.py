@@ -17,7 +17,9 @@ submit manifests without hand-authoring JSON templates.
 
 from __future__ import annotations
 
+import hashlib
 import io
+import json
 import sys
 import tempfile
 from pathlib import Path
@@ -40,14 +42,26 @@ from app.models.connection import (  # noqa: E402
     AuthMethod,
 )
 from app.models.osdu import (  # noqa: E402
+    CircuitBreakerTripped,
     DatasetDescriptor,
     FieldMapping,
     ManifestPreview,
     MappingResult,
+    QueueItem,
+    QueueSubmitResult,
+    QueueValidationResult,
     SchemaField,
     SubmitResult,
 )
 from app.services.auth import AuthenticationError, get_token  # noqa: E402
+from app.services.bulk_ingestion import (  # noqa: E402
+    MAX_QUEUE_SIZE,
+    build_queue_from_files,
+    enforce_queue_size_limit,
+    parse_pasted_manifests,
+    submit_queue,
+    validate_queue,
+)
 from app.services.bulk_loader import (  # noqa: E402
     DATA_ROOT,
     _clear_cache,
@@ -112,6 +126,59 @@ SUBMIT_BUTTON_LABEL = "🚀 Submit all manifests"
 DISMISS_BUTTON_LABEL = "Dismiss error"
 REFRESH_OPTIONS_LABEL = "🔄 Refresh legal tags & groups"
 
+# --- Queue tab session-state keys (locked — tests assert these names) ----
+QUEUE_INPUT_MODE_KEY = "queue_input_mode"
+QUEUE_UPLOADED_FILES_KEY = "queue_uploaded_files"
+QUEUE_PASTE_TEXT_KEY = "queue_paste_text"
+QUEUE_LEGAL_TAG_KEY = "queue_legal_tag"
+QUEUE_ACL_OWNERS_KEY = "queue_acl_owners"
+QUEUE_ACL_VIEWERS_KEY = "queue_acl_viewers"
+QUEUE_INTER_SUBMIT_DELAY_KEY = "queue_inter_submit_delay"
+QUEUE_SKIP_INVALID_KEY = "queue_skip_invalid"
+QUEUE_PARSED_ITEMS_KEY = "queue_parsed_items"
+QUEUE_VALIDATION_RESULTS_KEY = "queue_validation_results"
+QUEUE_PREVIEW_SEEN_KEY = "queue_preview_seen"  # bool — reviewed checkbox
+QUEUE_LIVE_RESULTS_KEY = "queue_live_results"
+QUEUE_LIVE_ATTEMPTS_KEY = "queue_live_attempts"
+QUEUE_BREAKER_EVENT_KEY = "queue_breaker_event"
+QUEUE_LAST_BATCH_SUMMARY_KEY = "queue_last_batch_summary"
+QUEUE_ABORT_KEY = "queue_abort_requested"
+QUEUE_SUBMIT_IN_FLIGHT_KEY = "queue_submit_in_flight"
+
+# Queue helper keys (autorun-once dropdown options + signature/last-mode).
+QUEUE_LEGAL_TAG_OPTIONS_KEY = "queue_legal_tag_options"
+QUEUE_ACL_OWNER_OPTIONS_KEY = "queue_acl_owner_options"
+QUEUE_ACL_VIEWER_OPTIONS_KEY = "queue_acl_viewer_options"
+QUEUE_OPTIONS_AUTORUN_KEY = "queue_options_autorun_done"
+QUEUE_LAST_MODE_KEY = "queue_last_input_mode"
+QUEUE_INPUT_SIGNATURE_KEY = "queue_input_signature"
+
+QUEUE_INPUT_MODE_UPLOAD = "Multi-file upload"
+QUEUE_INPUT_MODE_PASTE = "Paste many (--- separator)"
+QUEUE_FILE_UPLOADER_LABEL = "Manifest files"
+QUEUE_PASTE_TEXTAREA_LABEL = "Paste manifests (separate each with a line of `---`)"
+QUEUE_PARSE_BUTTON_LABEL = "🔎 Parse queue"
+QUEUE_SUBMIT_BUTTON_LABEL = "🚀 Submit queue"
+QUEUE_ABORT_BUTTON_LABEL = "⏹️ Abort queue"
+QUEUE_PREVIEW_CHECKBOX_LABEL = "I have reviewed the queue"
+QUEUE_RESUME_BUTTON_LABEL = "▶️ Resume after breaker"
+QUEUE_DOWNLOAD_FAILED_LABEL = "⬇️ Download failed rows (JSON)"
+QUEUE_REFRESH_OPTIONS_LABEL = "🔄 Refresh legal tags & groups (queue)"
+
+# Row state → operator emoji mapping for the live progress board.
+_QUEUE_ROW_STATE_EMOJI: dict[str, str] = {
+    "queued": "⏸",
+    "submitting": "⏳",
+    "retrying": "🟡",
+    "success": "✅",
+    "error": "❌",
+    "rejected": "❌",
+    "skipped": "⏹",
+    "skipped_invalid": "⛔",
+    "skipped_breaker": "🛑",
+    "breaker_tripped": "🛑",
+}
+
 
 def main() -> None:
     """Render the Bulk Load page."""
@@ -144,8 +211,8 @@ def main() -> None:
         f"Endpoint: `{connection.endpoint}`"
     )
 
-    tab_datasets, tab_csv = st.tabs(
-        ["📦 Registered Datasets", "📄 Generate from CSV"]
+    tab_datasets, tab_csv, tab_queue = st.tabs(
+        ["📦 Registered Datasets", "📄 Generate from CSV", "📋 Queue"]
     )
 
     with tab_datasets:
@@ -153,6 +220,9 @@ def main() -> None:
 
     with tab_csv:
         _render_csv_generation_tab(connection)
+
+    with tab_queue:
+        _render_queue_tab(connection)
 
 
 def _render_registered_datasets_tab(connection: ADMEConnection) -> None:
@@ -232,6 +302,23 @@ def _ensure_page_defaults() -> None:
     st.session_state.setdefault(GEN_LEGAL_TAG_OPTIONS_KEY, None)
     st.session_state.setdefault(GEN_ACL_OWNER_OPTIONS_KEY, None)
     st.session_state.setdefault(GEN_ACL_VIEWER_OPTIONS_KEY, None)
+
+    # Queue tab defaults
+    st.session_state.setdefault(QUEUE_PARSED_ITEMS_KEY, None)
+    st.session_state.setdefault(QUEUE_VALIDATION_RESULTS_KEY, None)
+    st.session_state.setdefault(QUEUE_PREVIEW_SEEN_KEY, False)
+    st.session_state.setdefault(QUEUE_LIVE_RESULTS_KEY, [])
+    st.session_state.setdefault(QUEUE_LIVE_ATTEMPTS_KEY, {})
+    st.session_state.setdefault(QUEUE_BREAKER_EVENT_KEY, None)
+    st.session_state.setdefault(QUEUE_LAST_BATCH_SUMMARY_KEY, None)
+    st.session_state.setdefault(QUEUE_ABORT_KEY, False)
+    st.session_state.setdefault(QUEUE_SUBMIT_IN_FLIGHT_KEY, False)
+    st.session_state.setdefault(QUEUE_OPTIONS_AUTORUN_KEY, False)
+    st.session_state.setdefault(QUEUE_LEGAL_TAG_OPTIONS_KEY, None)
+    st.session_state.setdefault(QUEUE_ACL_OWNER_OPTIONS_KEY, None)
+    st.session_state.setdefault(QUEUE_ACL_VIEWER_OPTIONS_KEY, None)
+    st.session_state.setdefault(QUEUE_LAST_MODE_KEY, "")
+    st.session_state.setdefault(QUEUE_INPUT_SIGNATURE_KEY, "")
 
 
 # ---------------------------------------------------------------------------
@@ -1335,6 +1422,656 @@ def _load_gen_input_options(
         st.session_state[GEN_ACL_VIEWER_OPTIONS_KEY] = None
 
     st.session_state[GEN_OPTIONS_AUTORUN_KEY] = True
+
+
+# ===========================================================================
+# Queue tab — Issue #34 (Kevin's bulk_ingestion service)
+# ===========================================================================
+
+
+def _set_queue_abort() -> None:
+    """``on_click`` callback — sets the graceful abort flag (Queue tab)."""
+    st.session_state[QUEUE_ABORT_KEY] = True
+
+
+def _reset_queue_abort_and_mark_in_flight() -> None:
+    """``on_click`` for Queue Submit — clears abort and marks submit running."""
+    st.session_state[QUEUE_ABORT_KEY] = False
+    st.session_state[QUEUE_SUBMIT_IN_FLIGHT_KEY] = True
+
+
+def _queue_abort_check() -> bool:
+    """Closure passed to ``submit_queue`` as ``abort_check``."""
+    return bool(st.session_state.get(QUEUE_ABORT_KEY, False))
+
+
+def _compute_queue_input_signature(items: list[QueueItem] | None) -> str:
+    """Stable hash of the queue's parsed inputs.
+
+    Changes when the operator re-parses different content. Used to
+    invalidate the preview-gate checkbox automatically on re-parse.
+    """
+    if not items:
+        return ""
+    h = hashlib.sha256()
+    for item in items:
+        h.update(item.label.encode("utf-8"))
+        h.update(b"\x1f")
+        h.update(item.raw_text.encode("utf-8"))
+        h.update(b"\x1e")
+    return h.hexdigest()
+
+
+def _load_queue_input_options(
+    connection: ADMEConnection, *, force: bool = False
+) -> None:
+    """Autorun-once load of legal tags + entitlement groups for the Queue tab."""
+    if not force and st.session_state.get(QUEUE_OPTIONS_AUTORUN_KEY, False):
+        return
+
+    token = _acquire_token(connection)
+    if token is None:
+        st.session_state[QUEUE_OPTIONS_AUTORUN_KEY] = True
+        return
+
+    try:
+        legal_result = list_legal_tags(connection, token, valid=True)
+        if legal_result.ok and legal_result.items:
+            names = sorted({t.name for t in legal_result.items if t.name})
+            st.session_state[QUEUE_LEGAL_TAG_OPTIONS_KEY] = names or None
+        else:
+            st.session_state[QUEUE_LEGAL_TAG_OPTIONS_KEY] = None
+    except Exception:  # noqa: BLE001
+        st.session_state[QUEUE_LEGAL_TAG_OPTIONS_KEY] = None
+
+    try:
+        groups_result = fetch_groups(connection, token)
+        owners, viewers = _partition_acl_groups(groups_result)
+        st.session_state[QUEUE_ACL_OWNER_OPTIONS_KEY] = owners or None
+        st.session_state[QUEUE_ACL_VIEWER_OPTIONS_KEY] = viewers or None
+    except Exception:  # noqa: BLE001
+        st.session_state[QUEUE_ACL_OWNER_OPTIONS_KEY] = None
+        st.session_state[QUEUE_ACL_VIEWER_OPTIONS_KEY] = None
+
+    st.session_state[QUEUE_OPTIONS_AUTORUN_KEY] = True
+
+
+def _build_failed_rows_payload(
+    results: list[QueueSubmitResult], partition_id: str
+) -> bytes:
+    """Build a JSON download payload of failed rows.
+
+    Includes rows with status ``error``, ``rejected`` and any row whose
+    ``error_message`` starts with ``"skipped: circuit breaker"``.
+    Excludes operator-aborted rows.
+    """
+    failed: list[dict[str, Any]] = []
+    for row in results:
+        err_msg = (row.error_message or "").strip()
+        is_failure = row.status in ("error", "rejected")
+        is_breaker_skip = (
+            row.status == "skipped"
+            and err_msg.startswith("skipped: circuit breaker")
+        )
+        if not (is_failure or is_breaker_skip):
+            continue
+        failed.append(
+            {
+                "label": row.label,
+                "status": row.status,
+                "run_id": row.run_id,
+                "correlation_id": row.correlation_id,
+                "http_status": row.http_status,
+                "latency_ms": row.latency_ms,
+                "error_message": row.error_message,
+                "attempts": row.attempts,
+                "raw_text": row.raw_text,
+                "data_partition_id": partition_id,
+            }
+        )
+    return json.dumps(failed, indent=2, default=str).encode("utf-8")
+
+
+def _make_queue_progress_callback() -> Any:
+    """Build a progress callback that updates session state.
+
+    The callback never calls ``st.rerun`` — Streamlit will rerun
+    automatically at the end of the script run.
+    """
+
+    def _cb(
+        row_index: int,
+        state: str,
+        *,
+        result: QueueSubmitResult | None = None,
+        attempt: int | None = None,
+        trip: CircuitBreakerTripped | None = None,
+    ) -> None:
+        attempts = dict(st.session_state.get(QUEUE_LIVE_ATTEMPTS_KEY) or {})
+        if attempt is not None:
+            attempts[row_index] = attempt
+        attempts[f"{row_index}:state"] = state
+        st.session_state[QUEUE_LIVE_ATTEMPTS_KEY] = attempts
+        if trip is not None:
+            st.session_state[QUEUE_BREAKER_EVENT_KEY] = trip
+        # The yielded result is appended by the main loop, not here.
+        del result  # unused — kept for callback signature compatibility
+
+    return _cb
+
+
+def _render_queue_progress_board(
+    results: list[QueueSubmitResult],
+    attempts: dict[Any, Any],
+    total: int,
+) -> None:
+    """Render the live per-row progress board."""
+    bar = st.progress(0.0)
+    completed = len(results)
+    bar.progress(min(1.0, completed / total) if total else 0.0)
+    rows: list[dict[str, Any]] = []
+    for index, row in enumerate(results, start=1):
+        emoji = _QUEUE_ROW_STATE_EMOJI.get(row.status, "•")
+        rows.append(
+            {
+                "#": index,
+                "state": f"{emoji} {row.status}",
+                "label": row.label,
+                "attempts": row.attempts,
+                "http": row.http_status,
+                "error": (row.error_message or "")[:140],
+            }
+        )
+    if rows:
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+    if attempts:
+        last_state = attempts.get(f"{completed}:state")
+        if last_state and last_state in _QUEUE_ROW_STATE_EMOJI:
+            st.caption(
+                f"Last event: {_QUEUE_ROW_STATE_EMOJI[last_state]} {last_state}"
+            )
+
+
+def _handle_parse_queue(
+    mode: str,
+    uploaded_files: list[Any] | None,
+    pasted_text: str,
+) -> None:
+    """Parse + validate the operator's input. Stores into session state.
+
+    Resets the preview-gate checkbox and the input signature so the
+    operator must explicitly re-confirm the new queue before submitting.
+    """
+    items: list[QueueItem] = []
+    parse_error: str | None = None
+    try:
+        if mode == QUEUE_INPUT_MODE_UPLOAD:
+            files = list(uploaded_files or [])
+            if not files:
+                parse_error = (
+                    "Upload one or more manifest files (.json) to build a queue."
+                )
+            else:
+                items = build_queue_from_files(files)
+        else:
+            text = (pasted_text or "").strip()
+            if not text:
+                parse_error = "Paste one or more manifests separated by `---`."
+            else:
+                items = parse_pasted_manifests(text)
+    except ValueError as exc:
+        parse_error = str(exc)
+    except Exception as exc:  # noqa: BLE001
+        parse_error = f"{type(exc).__name__}: {exc}"
+
+    if parse_error is not None:
+        st.error(parse_error)
+        return
+
+    try:
+        enforce_queue_size_limit(items)
+    except ValueError as exc:
+        # Surface but still keep parsed items so the operator can see them.
+        st.error(str(exc))
+
+    validations = validate_queue(items)
+
+    st.session_state[QUEUE_PARSED_ITEMS_KEY] = items
+    st.session_state[QUEUE_VALIDATION_RESULTS_KEY] = validations
+    # Reset preview gate + signature so the new queue must be confirmed.
+    st.session_state[QUEUE_PREVIEW_SEEN_KEY] = False
+    st.session_state[QUEUE_INPUT_SIGNATURE_KEY] = (
+        _compute_queue_input_signature(items)
+    )
+
+
+def _iterate_submit_queue(
+    *,
+    items: list[QueueItem],
+    validations: list[QueueValidationResult],
+    acl_owners: list[str],
+    acl_viewers: list[str],
+    legal_tag: str,
+    data_partition_id: str,
+    connection: ADMEConnection,
+    token: str,
+    skip_invalid: bool,
+    inter_submit_delay_seconds: float,
+    progress_callback: Any,
+    abort_check: Any,
+) -> tuple[list[QueueSubmitResult], CircuitBreakerTripped | None]:
+    """Drive ``submit_queue`` and capture results + any breaker trip.
+
+    Returns the collected per-row results and the breaker event (if any).
+    Catches ``CircuitBreakerTripped`` defensively in case the service
+    ever escalates a trip via exception rather than callback.
+    """
+    collected: list[QueueSubmitResult] = []
+    breaker: CircuitBreakerTripped | None = None
+    try:
+        iterator = submit_queue(
+            items,
+            validations,
+            acl_owners=acl_owners,
+            acl_viewers=acl_viewers,
+            legal_tag=legal_tag,
+            data_partition_id=data_partition_id,
+            connection=connection,
+            token=token,
+            skip_invalid=skip_invalid,
+            inter_submit_delay_seconds=inter_submit_delay_seconds,
+            abort_check=abort_check,
+            progress_callback=progress_callback,
+        )
+        for row in iterator:
+            collected.append(row)
+    except CircuitBreakerTripped as trip:
+        breaker = trip
+    return collected, breaker
+
+
+def _handle_submit_queue(
+    connection: ADMEConnection,
+    *,
+    items: list[QueueItem],
+    validations: list[QueueValidationResult],
+    acl_owners: list[str],
+    acl_viewers: list[str],
+    legal_tag: str,
+    skip_invalid: bool,
+    inter_submit_delay: float,
+    start_index: int = 0,
+) -> None:
+    """Submit (or resume) the queue and record results to session state."""
+    token = _acquire_token(connection)
+    if token is None:
+        st.session_state[QUEUE_SUBMIT_IN_FLIGHT_KEY] = False
+        return
+
+    work_items = items[start_index:]
+    work_validations = validations[start_index:]
+
+    progress_cb = _make_queue_progress_callback()
+    st.session_state[QUEUE_LIVE_ATTEMPTS_KEY] = {}
+    st.session_state[QUEUE_BREAKER_EVENT_KEY] = None
+
+    results, breaker = _iterate_submit_queue(
+        items=work_items,
+        validations=work_validations,
+        acl_owners=acl_owners,
+        acl_viewers=acl_viewers,
+        legal_tag=legal_tag,
+        data_partition_id=connection.data_partition_id,
+        connection=connection,
+        token=token,
+        skip_invalid=skip_invalid,
+        inter_submit_delay_seconds=inter_submit_delay,
+        progress_callback=progress_cb,
+        abort_check=_queue_abort_check,
+    )
+
+    if breaker is not None:
+        st.session_state[QUEUE_BREAKER_EVENT_KEY] = breaker
+
+    # Merge with prior partial results (for resume).
+    prior = list(st.session_state.get(QUEUE_LIVE_RESULTS_KEY) or [])
+    merged = prior + results
+    st.session_state[QUEUE_LIVE_RESULTS_KEY] = merged
+
+    # Compute summary.
+    succeeded = sum(1 for r in merged if r.status == "success")
+    failed = sum(1 for r in merged if r.status in ("error", "rejected"))
+    skipped = sum(1 for r in merged if r.status == "skipped")
+    aborted = bool(st.session_state.get(QUEUE_ABORT_KEY, False))
+    st.session_state[QUEUE_LAST_BATCH_SUMMARY_KEY] = {
+        "total": len(merged),
+        "succeeded": succeeded,
+        "failed": failed,
+        "skipped": skipped,
+        "aborted": aborted,
+        "completed_count": len(merged),
+        "planned_total": len(items),
+    }
+    st.session_state[QUEUE_SUBMIT_IN_FLIGHT_KEY] = False
+
+
+def _render_queue_tab(connection: ADMEConnection) -> None:
+    """Render the multi-manifest Queue tab."""
+    st.header("📋 Manifest Queue")
+    st.caption(
+        "Submit many manifests in a single batch. Uploads or pasted blocks "
+        "are parsed, validated, then sent through Kevin's bulk-ingestion "
+        "service with retry + circuit-breaker protection."
+    )
+
+    # Auto-clear parsed state when the input mode changes between reruns.
+    last_mode = str(st.session_state.get(QUEUE_LAST_MODE_KEY) or "")
+
+    mode = st.radio(
+        "Input mode",
+        options=[QUEUE_INPUT_MODE_UPLOAD, QUEUE_INPUT_MODE_PASTE],
+        key=QUEUE_INPUT_MODE_KEY,
+        horizontal=True,
+        help="Choose how to provide manifests to the queue.",
+    )
+
+    if last_mode and last_mode != mode:
+        st.session_state[QUEUE_PARSED_ITEMS_KEY] = None
+        st.session_state[QUEUE_VALIDATION_RESULTS_KEY] = None
+        st.session_state[QUEUE_PREVIEW_SEEN_KEY] = False
+        st.session_state[QUEUE_INPUT_SIGNATURE_KEY] = ""
+    st.session_state[QUEUE_LAST_MODE_KEY] = mode
+
+    uploaded_files: list[Any] | None = None
+    pasted_text: str = ""
+    if mode == QUEUE_INPUT_MODE_UPLOAD:
+        uploaded_files = st.file_uploader(
+            QUEUE_FILE_UPLOADER_LABEL,
+            type=["json"],
+            accept_multiple_files=True,
+            key=QUEUE_UPLOADED_FILES_KEY,
+            help="Drop one or more OSDU manifest JSON files.",
+        )
+    else:
+        pasted_text = st.text_area(
+            QUEUE_PASTE_TEXTAREA_LABEL,
+            key=QUEUE_PASTE_TEXT_KEY,
+            height=200,
+            help="Paste many manifests, separated by a line containing only `---`.",
+        )
+
+    parse_clicked = st.button(
+        QUEUE_PARSE_BUTTON_LABEL,
+        key="queue_parse_btn",
+        help="Parse and validate the queue without submitting.",
+    )
+    if parse_clicked:
+        files_in: list[Any] | None
+        if uploaded_files is None:
+            files_in = None
+        elif isinstance(uploaded_files, list):
+            files_in = uploaded_files
+        else:
+            files_in = [uploaded_files]
+        _handle_parse_queue(mode, files_in, pasted_text)
+
+    items: list[QueueItem] | None = st.session_state.get(QUEUE_PARSED_ITEMS_KEY)
+    validations: list[QueueValidationResult] | None = st.session_state.get(
+        QUEUE_VALIDATION_RESULTS_KEY
+    )
+
+    # ----- Preview + cap UX -----
+    cap_exceeded = False
+    if items:
+        valid_count = sum(1 for v in (validations or []) if v.ok)
+        invalid_count = len(items) - valid_count
+        col_a, col_b, col_c = st.columns(3)
+        col_a.metric("Parsed", len(items))
+        col_b.metric("Valid", valid_count)
+        col_c.metric("Invalid", invalid_count)
+
+        if len(items) > MAX_QUEUE_SIZE:
+            cap_exceeded = True
+            st.error(
+                f"Queue exceeds the {MAX_QUEUE_SIZE}-row hard cap "
+                f"({len(items)} parsed). Trim the input and re-parse."
+            )
+        elif len(items) >= 400:
+            st.warning(
+                f"Queue has {len(items)} rows — approaching the "
+                f"{MAX_QUEUE_SIZE}-row cap. Consider splitting the batch."
+            )
+
+        # Show a compact preview table.
+        rows = []
+        for idx, item in enumerate(items, start=1):
+            validation = (
+                validations[idx - 1] if validations and idx - 1 < len(validations) else None
+            )
+            ok_flag = validation.ok if validation is not None else False
+            err = validation.error_message if validation is not None else None
+            rows.append(
+                {
+                    "#": idx,
+                    "label": item.label,
+                    "valid": "✅" if ok_flag else "❌",
+                    "kinds": ", ".join(
+                        validation.kinds if validation is not None else []
+                    ),
+                    "records": validation.record_count if validation else 0,
+                    "error": (err or "")[:140],
+                }
+            )
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No queue parsed yet. Provide input above and click Parse.")
+
+    st.markdown("---")
+    st.subheader("Submission settings")
+
+    # Load options autorun-once, with a manual refresh.
+    _load_queue_input_options(connection)
+    if st.button(
+        QUEUE_REFRESH_OPTIONS_LABEL,
+        key="queue_refresh_options_btn",
+        help="Re-fetch legal tags and entitlement groups from ADME.",
+    ):
+        _load_queue_input_options(connection, force=True)
+
+    _render_option_field(
+        label="Legal tag",
+        session_key=QUEUE_LEGAL_TAG_KEY,
+        options=st.session_state.get(QUEUE_LEGAL_TAG_OPTIONS_KEY),
+        placeholder="opendes-public-usa-dataset-1",
+        help_text="Legal tag applied to every record in the batch.",
+        empty_caption="Legal tag list unavailable — type the name manually.",
+    )
+    _render_option_field(
+        label="ACL owners",
+        session_key=QUEUE_ACL_OWNERS_KEY,
+        options=st.session_state.get(QUEUE_ACL_OWNER_OPTIONS_KEY),
+        placeholder="data.default.owners@example.com",
+        help_text="Entitlement group with owner rights.",
+        empty_caption="Entitlement groups unavailable — type the email manually.",
+    )
+    _render_option_field(
+        label="ACL viewers",
+        session_key=QUEUE_ACL_VIEWERS_KEY,
+        options=st.session_state.get(QUEUE_ACL_VIEWER_OPTIONS_KEY),
+        placeholder="data.default.viewers@example.com",
+        help_text="Entitlement group with viewer rights.",
+        empty_caption="Entitlement groups unavailable — type the email manually.",
+    )
+
+    inter_delay = st.number_input(
+        "Pause between submits (seconds)",
+        min_value=0.0,
+        max_value=30.0,
+        value=0.0,
+        step=0.25,
+        key=QUEUE_INTER_SUBMIT_DELAY_KEY,
+        help="Throttle the queue to avoid hammering the ingestion endpoint.",
+    )
+    skip_invalid = st.checkbox(
+        "Skip invalid rows (otherwise they are reported and skipped anyway)",
+        value=True,
+        key=QUEUE_SKIP_INVALID_KEY,
+        help="Validation failures never block the rest of the queue.",
+    )
+
+    # Preview gate.
+    preview_ok = st.checkbox(
+        QUEUE_PREVIEW_CHECKBOX_LABEL,
+        key=QUEUE_PREVIEW_SEEN_KEY,
+        value=bool(st.session_state.get(QUEUE_PREVIEW_SEEN_KEY, False)),
+        help="Required before submitting. Re-parsing clears this checkbox.",
+    )
+
+    legal_tag = str(st.session_state.get(QUEUE_LEGAL_TAG_KEY) or "").strip()
+    acl_owners_raw = str(st.session_state.get(QUEUE_ACL_OWNERS_KEY) or "").strip()
+    acl_viewers_raw = str(
+        st.session_state.get(QUEUE_ACL_VIEWERS_KEY) or ""
+    ).strip()
+    acl_owners = [acl_owners_raw] if acl_owners_raw else []
+    acl_viewers = [acl_viewers_raw] if acl_viewers_raw else []
+
+    can_submit = bool(
+        items
+        and validations is not None
+        and not cap_exceeded
+        and preview_ok
+        and legal_tag
+        and acl_owners
+        and acl_viewers
+        and not st.session_state.get(QUEUE_SUBMIT_IN_FLIGHT_KEY, False)
+    )
+    disabled_reason: str | None = None
+    if not items:
+        disabled_reason = "Parse a queue before submitting."
+    elif cap_exceeded:
+        disabled_reason = (
+            f"Queue exceeds the {MAX_QUEUE_SIZE}-row cap — trim and re-parse."
+        )
+    elif not preview_ok:
+        disabled_reason = "Check the preview-confirmation box to unlock Submit."
+    elif not legal_tag:
+        disabled_reason = "Pick a legal tag."
+    elif not acl_owners or not acl_viewers:
+        disabled_reason = "Pick ACL owners and viewers."
+
+    col_submit, col_abort = st.columns(2)
+    with col_submit:
+        submit_clicked = st.button(
+            QUEUE_SUBMIT_BUTTON_LABEL,
+            key="queue_submit_btn",
+            disabled=not can_submit,
+            on_click=_reset_queue_abort_and_mark_in_flight,
+            help="Send every valid row through the bulk-ingestion service.",
+        )
+    with col_abort:
+        st.button(
+            QUEUE_ABORT_BUTTON_LABEL,
+            key="queue_abort_btn",
+            on_click=_set_queue_abort,
+            help="Stop after the row currently in flight finishes.",
+        )
+
+    if disabled_reason is not None and not can_submit:
+        st.caption(f"⏸️ {disabled_reason}")
+
+    if submit_clicked and can_submit and items and validations is not None:
+        # Fresh batch — clear prior live results.
+        st.session_state[QUEUE_LIVE_RESULTS_KEY] = []
+        _handle_submit_queue(
+            connection,
+            items=items,
+            validations=validations,
+            acl_owners=acl_owners,
+            acl_viewers=acl_viewers,
+            legal_tag=legal_tag,
+            skip_invalid=bool(skip_invalid),
+            inter_submit_delay=float(inter_delay),
+            start_index=0,
+        )
+
+    # ----- Breaker banner + resume -----
+    breaker_event = st.session_state.get(QUEUE_BREAKER_EVENT_KEY)
+    if breaker_event is not None:
+        st.error(
+            "🛑 Circuit breaker tripped — "
+            f"{breaker_event.threshold} consecutive failures detected. "
+            f"Remaining rows skipped: {breaker_event.remaining_count}. "
+            "Inspect the failed rows below before resuming."
+        )
+        resume_index = len(
+            st.session_state.get(QUEUE_LIVE_RESULTS_KEY) or []
+        )
+        if items and resume_index < len(items):
+            resume_clicked = st.button(
+                QUEUE_RESUME_BUTTON_LABEL,
+                key="queue_resume_btn",
+                help=(
+                    f"Resume the queue starting at row {resume_index + 1} "
+                    "using the previous submission settings."
+                ),
+            )
+            if resume_clicked and validations is not None:
+                st.session_state[QUEUE_BREAKER_EVENT_KEY] = None
+                st.session_state[QUEUE_ABORT_KEY] = False
+                _handle_submit_queue(
+                    connection,
+                    items=items,
+                    validations=validations,
+                    acl_owners=acl_owners,
+                    acl_viewers=acl_viewers,
+                    legal_tag=legal_tag,
+                    skip_invalid=bool(skip_invalid),
+                    inter_submit_delay=float(inter_delay),
+                    start_index=resume_index,
+                )
+
+    # ----- Live progress / post-batch summary -----
+    live_results: list[QueueSubmitResult] = list(
+        st.session_state.get(QUEUE_LIVE_RESULTS_KEY) or []
+    )
+    if live_results:
+        st.markdown("---")
+        st.subheader("Submission progress")
+        _render_queue_progress_board(
+            live_results,
+            dict(st.session_state.get(QUEUE_LIVE_ATTEMPTS_KEY) or {}),
+            total=len(items) if items else len(live_results),
+        )
+
+    summary = st.session_state.get(QUEUE_LAST_BATCH_SUMMARY_KEY)
+    if summary:
+        if summary.get("aborted"):
+            st.warning(
+                f"⏹ Batch aborted by operator after "
+                f"{summary['completed_count']} of {summary['planned_total']} rows."
+            )
+        elif summary.get("failed", 0) == 0 and summary.get("skipped", 0) == 0:
+            st.success(
+                f"✅ All {summary['succeeded']} rows submitted successfully."
+            )
+        else:
+            st.warning(
+                f"{summary['succeeded']} of {summary['total']} succeeded — "
+                f"{summary['failed']} failed, {summary['skipped']} skipped."
+            )
+
+        # Download failed-rows JSON.
+        payload = _build_failed_rows_payload(
+            live_results, connection.data_partition_id
+        )
+        if payload != b"[]":
+            st.download_button(
+                QUEUE_DOWNLOAD_FAILED_LABEL,
+                data=payload,
+                file_name="failed-queue-rows.json",
+                mime="application/json",
+                key="queue_download_failed_btn",
+            )
 
 
 if __name__ == "__main__":

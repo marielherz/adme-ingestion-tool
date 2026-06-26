@@ -1,0 +1,7 @@
+{
+    "chat.tools.terminal.autoApprove": {
+        "gh": true,
+        "Out-File": true,
+        "Copy-Item": true
+    }
+}

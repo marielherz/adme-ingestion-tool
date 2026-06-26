@@ -100,3 +100,14 @@
 - 2026-05-18T20:00:00Z (Scribe): PR #33 (Search + Manifest Generator) is in upstream review. Backlog Now = #4 Bulk ingestion submit (Lead pick after PR #11-#15 merges).
 
 
+
+## Learnings (2026-05-22) — bulk ingest v1
+
+- `ADMEConnection` fields: endpoint/tenant_id/client_id/data_partition_id (no `name`, no `base_url`). Copy the `_connection()` builder from tests/test_bulk_loader_service.py.
+- Manifest envelope: `parsed = {'executionContext': {'manifest': {ReferenceData/MasterData/Data}}}`. `inject_acl_and_legal` expects the INNER manifest, not the top-level. Harvest helpers must descend into `executionContext.manifest` too.
+- Promoted `_inject_acl_and_legal` -> public `inject_acl_and_legal`; kept private alias for back-compat.
+- Final-lock 2026-05-22 §4: aborted rows MUST NOT write run history. Skipped rows also skip history.
+- Breaker reset semantics: success resets counter to 0; threshold is consecutive failures only.
+- `WorkflowRunResult` does not expose response headers, so `_parse_retry_after` is implemented and unit-tested but not yet wired through `submit_manifest` (deferred — needs ingestion service to surface Retry-After).
+- `progress_callback` exceptions are caught + logged; never propagate to caller.
+- Synthetic run_ids for non-network outcomes: `bulk-load:rejected:{uuid}`, `bulk-load:error:{uuid}`, `bulk-load:skipped:{uuid}`.

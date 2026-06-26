@@ -42,6 +42,7 @@ __all__ = [
     "DATASETS_ROOT",
     "DATA_ROOT",
     "SUBMIT_SOURCE",
+    "inject_acl_and_legal",
     "list_datasets",
     "load_dataset",
     "preview_tier",
@@ -267,7 +268,7 @@ def preview_tier(dataset_id: str, tier: str) -> list[ManifestPreview]:
     return previews
 
 
-def _inject_acl_and_legal(
+def inject_acl_and_legal(
     manifest_body: dict[str, Any],
     *,
     section: str,
@@ -303,6 +304,12 @@ def _inject_acl_and_legal(
         if not legal.get("legaltags"):
             legal["legaltags"] = [legal_tag]
     return out
+
+
+# Deprecated private name retained for one release while callers
+# migrate to the public ``inject_acl_and_legal``. See
+# decisions: kevin-bulk-ingest-contract-2026-05-19.md \u00a72.
+_inject_acl_and_legal = inject_acl_and_legal
 
 
 def _extract_record_id(result: Any) -> str | None:
@@ -407,7 +414,7 @@ def submit_tier(
             body = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(body, dict):
                 raise ValueError("manifest body is not a JSON object")
-            shaped = _inject_acl_and_legal(
+            shaped = inject_acl_and_legal(
                 body,
                 section=section,
                 acl_owners=acl_owners,
