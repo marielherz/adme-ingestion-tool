@@ -15,6 +15,7 @@ from azure.identity import (
 )
 
 from app.models.connection import ADMEConnection, AuthMethod
+from app.services import token_utils
 
 USER_AUTH_REDIRECT_URI = "http://localhost:8501"
 MSAL_AUTHORITY_TEMPLATE = "https://login.microsoftonline.com/{tenant_id}"
@@ -151,6 +152,42 @@ def complete_user_auth_flow(
         ) from None
 
     return _user_auth_state_from_msal_result(result)
+
+
+def user_auth_state_from_pasted_token(token: str) -> UserAuthState:
+    """Build user auth state from a manually pasted bearer token.
+
+    Intended for environments where interactive browser sign-in is blocked
+    (for example Microsoft Entra Conditional Access) but the operator can
+    mint a token out-of-band, such as with
+    ``az account get-access-token --resource <adme-app-id>``.
+
+    The token is a bearer credential we send to ADME as-is; we only decode it
+    locally to read its expiry so the session can warn before it lapses. No
+    signature, issuer, or audience validation happens here — the trust
+    boundary is whoever issued the token (see ``token_utils``).
+    """
+    cleaned = token.strip()
+    if not cleaned:
+        raise AuthenticationError("Paste a non-empty bearer token.")
+    if cleaned.count(".") != 2:
+        raise AuthenticationError(
+            "That does not look like a JWT bearer token (expected three "
+            "dot-separated segments). Re-copy the full token value."
+        )
+    expires_at = token_utils.extract_expiry(cleaned)
+    if expires_at is None:
+        raise AuthenticationError(
+            "Could not read an expiry from the pasted token. Re-copy the full "
+            "token value (for example from 'az account get-access-token')."
+        )
+    state = UserAuthState(access_token=cleaned, expires_at=expires_at)
+    if state.is_expired():
+        raise AuthenticationError(
+            "The pasted token is already expired. Generate a fresh token and "
+            "paste it again."
+        )
+    return state
 
 
 def get_token(

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
 
@@ -39,12 +40,16 @@ from app.models.connection import (  # noqa: E402
     AuthMethod,
     ServiceHealthResult,
 )
-from app.services import settings_store  # noqa: E402
+from app.services import (  # noqa: E402
+    settings_store,
+    token_utils,
+)
 from app.services.auth import (  # noqa: E402
     AuthenticationError,
     complete_user_auth_flow,
     get_token,
     start_user_auth_flow,
+    user_auth_state_from_pasted_token,
 )
 from app.services.health import check_all  # noqa: E402
 from app.storage_bridge import (  # noqa: E402
@@ -365,13 +370,77 @@ def _render_user_auth_controls(connection: ADMEConnection | None) -> None:
         if st.button("Sign Out"):
             clear_user_auth_state(st.session_state)
             st.success("Signed out. Sign in again before testing the connection.")
+        _render_paste_token_section(connection)
         return
 
     st.info("Sign in to enable Test Connection for this saved connection.")
     authorization_url = _authorization_url_for_user_sign_in(connection)
-    if authorization_url is None:
-        return
-    st.link_button("Sign In", authorization_url, type="primary")
+    if authorization_url is not None:
+        st.link_button("Sign In", authorization_url, type="primary")
+    _render_paste_token_section(connection)
+
+
+def _render_paste_token_section(connection: ADMEConnection) -> None:
+    """Render an advanced paste-a-bearer-token alternative to browser sign-in.
+
+    For tenants where interactive sign-in is blocked (e.g. Conditional
+    Access), operators can mint a token out-of-band — for example with
+    ``az account get-access-token`` — and paste it here.
+    """
+    with st.expander("Advanced: paste a bearer token (no browser sign-in)"):
+        st.caption(
+            "Use this when interactive sign-in is blocked (e.g. Conditional "
+            "Access). Generate a token out-of-band and paste it below. The "
+            "token is held in this Streamlit session only and never written "
+            "to disk."
+        )
+        st.code(
+            "az login\n"
+            "az account get-access-token "
+            f'--resource "{connection.client_id}" '
+            "--query accessToken -o tsv",
+            language="powershell",
+        )
+        pasted = st.text_area(
+            "Bearer token",
+            key="paste_bearer_token",
+            placeholder="eyJ0eXAiOiJKV1Qi...",
+            help=(
+                "Paste the access token value only (a long string with three "
+                "dot-separated segments). It is used as-is for ADME calls."
+            ),
+        )
+        if not st.button("Use pasted token"):
+            return
+        try:
+            auth_state = user_auth_state_from_pasted_token(pasted)
+        except AuthenticationError as exc:
+            st.error(str(exc))
+            return
+        store_user_auth_state(st.session_state, auth_state)
+        st.success(_pasted_token_summary(auth_state.access_token))
+        st.rerun()
+
+
+def _pasted_token_summary(token: str) -> str:
+    """Return a short identity/expiry summary for a freshly accepted token."""
+    identity = token_utils.extract_first_string_claim(
+        token,
+        ("upn", "unique_name", "preferred_username", "appid"),
+    )
+    expiry = token_utils.extract_expiry(token)
+    parts = ["Token accepted for this session."]
+    if identity:
+        parts.append(f"Identity: {identity}.")
+    if expiry is not None:
+        local_expiry = _format_unix_local(expiry)
+        parts.append(f"Expires: {local_expiry}.")
+    return " ".join(parts)
+
+
+def _format_unix_local(epoch_seconds: int) -> str:
+    """Format a Unix timestamp as a local-time string."""
+    return datetime.fromtimestamp(epoch_seconds).strftime("%Y-%m-%d %H:%M:%S")
 
 
 def _authorization_url_for_user_sign_in(

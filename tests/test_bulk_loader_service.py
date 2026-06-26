@@ -163,7 +163,7 @@ def test_preview_tier_tno_reference_data() -> None:
 
 def test_preview_tier_disabled_raises() -> None:
     with pytest.raises(ValueError, match="disabled"):
-        bulk_loader.preview_tier("tno", "master-data")
+        bulk_loader.preview_tier("tno", "work-products")
 
 
 def test_preview_tier_unknown_tier_raises() -> None:

@@ -51,6 +51,26 @@ def extract_first_string_claim(
     return None
 
 
+def extract_expiry(token: str) -> int | None:
+    """Return the ``exp`` claim (Unix seconds) from a JWT, or ``None``.
+
+    The JWT payload is decoded without validation for local inspection only;
+    see the module docstring for the trust boundary. Any malformed input or a
+    missing/non-numeric ``exp`` claim yields ``None`` rather than raising.
+    """
+    payload = _decode_payload(token)
+    if payload is None:
+        return None
+    value = payload.get("exp")
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    return None
+
+
 def _decode_payload(token: str) -> dict[str, object] | None:
     if not token:
         return None

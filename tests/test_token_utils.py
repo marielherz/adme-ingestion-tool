@@ -13,7 +13,11 @@ from typing import Any
 
 import pytest
 
-from app.services.token_utils import extract_first_string_claim, extract_object_id
+from app.services.token_utils import (
+    extract_expiry,
+    extract_first_string_claim,
+    extract_object_id,
+)
 
 
 def _b64url_no_pad(data: bytes) -> str:
@@ -199,3 +203,41 @@ def test_extract_object_id_returns_none_for_empty_string_oid_claim() -> None:
     token = _make_jwt({"oid": ""})
 
     assert extract_object_id(token) is None
+
+
+# ---------------------------------------------------------------------------
+# extract_expiry
+# ---------------------------------------------------------------------------
+
+
+def test_extract_expiry_returns_exp_claim() -> None:
+    token = _make_jwt({"oid": "x", "exp": 1_782_506_941})
+
+    assert extract_expiry(token) == 1_782_506_941
+
+
+def test_extract_expiry_coerces_float_exp_to_int() -> None:
+    token = _make_jwt({"exp": 1_782_506_941.0})
+
+    assert extract_expiry(token) == 1_782_506_941
+
+
+def test_extract_expiry_returns_none_when_exp_missing() -> None:
+    token = _make_jwt({"oid": "x"})
+
+    assert extract_expiry(token) is None
+
+
+@pytest.mark.parametrize("non_numeric_exp", [True, False, "soon", None, [1], {"a": 1}])
+def test_extract_expiry_returns_none_for_non_numeric_exp(
+    non_numeric_exp: Any,
+) -> None:
+    token = _make_jwt({"exp": non_numeric_exp})
+
+    assert extract_expiry(token) is None
+
+
+def test_extract_expiry_returns_none_for_malformed_token() -> None:
+    assert extract_expiry("") is None
+    assert extract_expiry("only-one-segment") is None
+    assert extract_expiry("header.@@@not-base64@@@.sig") is None
