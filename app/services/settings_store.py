@@ -129,9 +129,20 @@ def _load_secret(name: str) -> str | None:
 
 _USER_TOKEN_SUFFIX = "::user-token"
 
+# Windows Credential Manager caps a single credential blob at 2560 bytes
+# (~1280 UTF-16 chars). A JWT bearer token is ~2 KB+, so the payload is split
+# into chunks that comfortably fit and reassembled on load. A separate
+# ``::count`` entry records how many chunks to read back.
+_USER_TOKEN_CHUNK_SIZE = 1000
+_MAX_TOKEN_CHUNKS = 64
 
-def _user_token_key(name: str) -> str:
-    return f"{name}{_USER_TOKEN_SUFFIX}"
+
+def _user_token_count_key(name: str) -> str:
+    return f"{name}{_USER_TOKEN_SUFFIX}::count"
+
+
+def _user_token_chunk_key(name: str, index: int) -> str:
+    return f"{name}{_USER_TOKEN_SUFFIX}::{index}"
 
 
 def save_user_token(
@@ -143,8 +154,9 @@ def save_user_token(
 
     Stored alongside (but separate from) the client secret, never in SQLite.
     Scoped to the active connection name so switching connections does not
-    leak a token across instances. Raises :class:`SettingsStoreError` when the
-    keyring backend is unavailable so callers can keep it best-effort.
+    leak a token across instances. The JSON payload is chunked to stay under
+    the OS credential blob size limit. Raises :class:`SettingsStoreError` when
+    the keyring backend is unavailable so callers can keep it best-effort.
     """
     target = name or get_active_connection_name()
     if not target or not access_token:
@@ -152,7 +164,16 @@ def save_user_token(
     payload = json.dumps(
         {"access_token": access_token, "expires_at": expires_at}
     )
-    _store_secret(_user_token_key(target), payload)
+    chunks = [
+        payload[i : i + _USER_TOKEN_CHUNK_SIZE]
+        for i in range(0, len(payload), _USER_TOKEN_CHUNK_SIZE)
+    ] or [""]
+
+    # Clear any prior chunks first so a shorter token can't leave stale tails.
+    _clear_user_token(target)
+    for index, chunk in enumerate(chunks):
+        _store_secret(_user_token_chunk_key(target, index), chunk)
+    _store_secret(_user_token_count_key(target), str(len(chunks)))
 
 
 def load_user_token(
@@ -166,9 +187,24 @@ def load_user_token(
     target = name or get_active_connection_name()
     if not target:
         return None
-    raw = _load_secret(_user_token_key(target))
-    if not raw:
+    count_raw = _load_secret(_user_token_count_key(target))
+    if not count_raw:
         return None
+    try:
+        count = int(count_raw)
+    except (ValueError, TypeError):
+        return None
+    if count < 1 or count > _MAX_TOKEN_CHUNKS:
+        return None
+
+    parts: list[str] = []
+    for index in range(count):
+        chunk = _load_secret(_user_token_chunk_key(target, index))
+        if chunk is None:
+            return None
+        parts.append(chunk)
+    raw = "".join(parts)
+
     try:
         data = json.loads(raw)
     except (ValueError, TypeError):
@@ -193,7 +229,22 @@ def clear_user_token(name: str | None = None) -> None:
     target = name or get_active_connection_name()
     if not target:
         return
-    _store_secret(_user_token_key(target), None)
+    _clear_user_token(target)
+
+
+def _clear_user_token(target: str) -> None:
+    """Delete the chunk-count entry and every chunk for ``target``."""
+    count_raw = _load_secret(_user_token_count_key(target))
+    count = 0
+    if count_raw:
+        try:
+            count = int(count_raw)
+        except (ValueError, TypeError):
+            count = 0
+    _store_secret(_user_token_count_key(target), None)
+    for index in range(max(count, _MAX_TOKEN_CHUNKS)):
+        _store_secret(_user_token_chunk_key(target, index), None)
+
 
 _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """

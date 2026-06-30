@@ -107,7 +107,10 @@ def test_user_token_load_returns_none_when_absent(
 def test_user_token_load_handles_malformed_payload(
     fake_keyring: _FakeKeyring,
 ) -> None:
-    fake_keyring.store[(KEYRING_SERVICE_NAME, "default::user-token")] = (
+    fake_keyring.store[(KEYRING_SERVICE_NAME, "default::user-token::count")] = (
+        "1"
+    )
+    fake_keyring.store[(KEYRING_SERVICE_NAME, "default::user-token::0")] = (
         "not-json"
     )
 
@@ -120,6 +123,26 @@ def test_user_token_persists_none_expiry(
     save_user_token("aa.bb.cc", None, name="default")
 
     assert load_user_token(name="default") == ("aa.bb.cc", None)
+
+
+def test_user_token_roundtrips_large_token_via_chunks(
+    fake_keyring: _FakeKeyring,
+) -> None:
+    # A ~3 KB token exceeds the Windows credential blob limit; it must be
+    # chunked across multiple entries and reassembled intact.
+    big_token = "h." + ("x" * 3000) + ".sig"
+
+    save_user_token(big_token, 1700000000, name="default")
+
+    # Stored as multiple chunk entries plus a count entry.
+    count_raw = fake_keyring.store[
+        (KEYRING_SERVICE_NAME, "default::user-token::count")
+    ]
+    assert int(count_raw) >= 3
+    assert load_user_token(name="default") == (big_token, 1700000000)
+
+    clear_user_token(name="default")
+    assert load_user_token(name="default") is None
 
 
 def test_save_connection_writes_secret_to_keyring(
