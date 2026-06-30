@@ -14,6 +14,7 @@ insert/update and stored separately in the OS credential store — see
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sqlite3
@@ -28,13 +29,16 @@ __all__ = [
     "DEFAULT_DB_PATH",
     "SettingsStoreError",
     "clear_active_connection",
+    "clear_user_token",
     "delete_connection",
     "get_active_connection_name",
     "get_db_path",
     "initialize_store",
     "list_connections",
     "load_connection",
+    "load_user_token",
     "save_connection",
+    "save_user_token",
     "set_active_connection",
 ]
 
@@ -121,6 +125,75 @@ def _load_secret(name: str) -> str | None:
             exc,
         )
         return None
+
+
+_USER_TOKEN_SUFFIX = "::user-token"
+
+
+def _user_token_key(name: str) -> str:
+    return f"{name}{_USER_TOKEN_SUFFIX}"
+
+
+def save_user_token(
+    access_token: str,
+    expires_at: int | None,
+    name: str | None = None,
+) -> None:
+    """Persist a user bearer token + expiry in the OS keyring.
+
+    Stored alongside (but separate from) the client secret, never in SQLite.
+    Scoped to the active connection name so switching connections does not
+    leak a token across instances. Raises :class:`SettingsStoreError` when the
+    keyring backend is unavailable so callers can keep it best-effort.
+    """
+    target = name or get_active_connection_name()
+    if not target or not access_token:
+        return
+    payload = json.dumps(
+        {"access_token": access_token, "expires_at": expires_at}
+    )
+    _store_secret(_user_token_key(target), payload)
+
+
+def load_user_token(
+    name: str | None = None,
+) -> tuple[str, int | None] | None:
+    """Return the persisted ``(access_token, expires_at)`` for the connection.
+
+    Returns ``None`` when no token is stored, the keyring is unavailable, or
+    the stored payload is malformed. Hydration is best-effort by design.
+    """
+    target = name or get_active_connection_name()
+    if not target:
+        return None
+    raw = _load_secret(_user_token_key(target))
+    if not raw:
+        return None
+    try:
+        data = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    token = data.get("access_token")
+    if not isinstance(token, str) or not token:
+        return None
+    expires_at = data.get("expires_at")
+    if isinstance(expires_at, bool):
+        expires_at = None
+    elif isinstance(expires_at, float):
+        expires_at = int(expires_at)
+    elif not isinstance(expires_at, int):
+        expires_at = None
+    return token, expires_at
+
+
+def clear_user_token(name: str | None = None) -> None:
+    """Delete any persisted user token for the active (or named) connection."""
+    target = name or get_active_connection_name()
+    if not target:
+        return
+    _store_secret(_user_token_key(target), None)
 
 _SCHEMA_STATEMENTS: tuple[str, ...] = (
     """

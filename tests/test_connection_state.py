@@ -511,6 +511,65 @@ def test_ensure_session_defaults_swallows_store_failures(
     assert session_state[USER_AUTH_STATE_KEY] is None
 
 
+def test_store_user_auth_state_persists_token(isolated_store: Path) -> None:
+    settings_store.initialize_store()
+    settings_store.save_connection(DEFAULT_CONNECTION_NAME, _connection())
+    settings_store.set_active_connection(DEFAULT_CONNECTION_NAME)
+    session_state: dict[str, object] = {
+        USER_AUTH_STATE_KEY: None,
+        HEALTH_RESULTS_KEY: [],
+        HEALTH_ERROR_KEY: "",
+    }
+
+    store_user_auth_state(
+        session_state,
+        UserAuthState(access_token="aa.bb.cc", expires_at=1700000000),
+    )
+
+    assert settings_store.load_user_token() == ("aa.bb.cc", 1700000000)
+
+
+def test_clear_user_auth_state_forgets_persisted_token(
+    isolated_store: Path,
+) -> None:
+    settings_store.initialize_store()
+    settings_store.save_connection(DEFAULT_CONNECTION_NAME, _connection())
+    settings_store.set_active_connection(DEFAULT_CONNECTION_NAME)
+    settings_store.save_user_token(
+        "aa.bb.cc", 1700000000, name=DEFAULT_CONNECTION_NAME
+    )
+    session_state: dict[str, object] = {
+        USER_AUTH_STATE_KEY: "placeholder",
+        USER_AUTH_FLOW_KEY: None,
+        HEALTH_RESULTS_KEY: [],
+        HEALTH_ERROR_KEY: "",
+    }
+
+    clear_user_auth_state(session_state)
+
+    assert settings_store.load_user_token() is None
+    assert session_state[USER_AUTH_STATE_KEY] is None
+
+
+def test_ensure_session_defaults_hydrates_persisted_token(
+    isolated_store: Path,
+) -> None:
+    settings_store.initialize_store()
+    settings_store.save_connection(DEFAULT_CONNECTION_NAME, _connection())
+    settings_store.set_active_connection(DEFAULT_CONNECTION_NAME)
+    settings_store.save_user_token(
+        "aa.bb.cc", 1700000000, name=DEFAULT_CONNECTION_NAME
+    )
+    session_state: dict[str, object] = {}
+
+    ensure_session_defaults(session_state)
+
+    restored = session_state[USER_AUTH_STATE_KEY]
+    assert restored is not None
+    assert restored.access_token == "aa.bb.cc"
+    assert restored.expires_at == 1700000000
+
+
 def test_save_connection_persists_to_store_and_marks_active(
     isolated_store: Path,
 ) -> None:

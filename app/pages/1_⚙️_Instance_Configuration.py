@@ -167,9 +167,9 @@ def main() -> None:
     )
     st.caption(
         "Settings are saved persistently when storage is available. "
-        "Service-principal client secrets are stored in your OS credential "
-        "store; pending sign-in and access tokens stay in Streamlit session "
-        "state. User impersonation requires sign-in for each Streamlit session."
+        "Service-principal client secrets and pasted bearer tokens are stored "
+        "in your OS credential store; a saved token is restored on restart "
+        "until it expires."
     )
 
     ensure_session_defaults(st.session_state)
@@ -477,6 +477,7 @@ def _render_identity_controls(connection: ADMEConnection | None) -> None:
         _render_token_expiry(auth_state)
     else:
         st.info(readiness.guidance)
+        _render_token_expiry(auth_state)
 
     sign_in_tab, paste_tab = st.tabs(
         ["Sign in with Microsoft", "Paste a bearer token"]
@@ -605,8 +606,9 @@ def _render_paste_token_section(connection: ADMEConnection) -> None:
         st.caption(
             "Use this when interactive sign-in is blocked (e.g. Conditional "
             "Access). Generate a token out-of-band and paste it below. The "
-            "token is held in this Streamlit session only and never written "
-            "to disk."
+            "token is saved in your OS credential store so it survives "
+            "restarts, and is cleared on sign out or when the connection "
+            "changes."
         )
         st.code(
             "az login\n"

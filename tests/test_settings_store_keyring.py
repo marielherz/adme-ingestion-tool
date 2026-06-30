@@ -20,10 +20,13 @@ from app.services.settings_store import (
     KEYRING_SERVICE_NAME,
     SettingsStoreError,
     _load_secret,
+    clear_user_token,
     delete_connection,
     list_connections,
     load_connection,
+    load_user_token,
     save_connection,
+    save_user_token,
 )
 
 
@@ -82,6 +85,41 @@ def _service_principal_connection(secret: str = "super-secret") -> ADMEConnectio
         auth_method=AuthMethod.SERVICE_PRINCIPAL,
         client_secret=secret,
     )
+
+
+def test_user_token_roundtrip_persists_via_keyring(
+    fake_keyring: _FakeKeyring,
+) -> None:
+    save_user_token("aa.bb.cc", 1700000000, name="default")
+
+    assert load_user_token(name="default") == ("aa.bb.cc", 1700000000)
+
+    clear_user_token(name="default")
+    assert load_user_token(name="default") is None
+
+
+def test_user_token_load_returns_none_when_absent(
+    fake_keyring: _FakeKeyring,
+) -> None:
+    assert load_user_token(name="missing") is None
+
+
+def test_user_token_load_handles_malformed_payload(
+    fake_keyring: _FakeKeyring,
+) -> None:
+    fake_keyring.store[(KEYRING_SERVICE_NAME, "default::user-token")] = (
+        "not-json"
+    )
+
+    assert load_user_token(name="default") is None
+
+
+def test_user_token_persists_none_expiry(
+    fake_keyring: _FakeKeyring,
+) -> None:
+    save_user_token("aa.bb.cc", None, name="default")
+
+    assert load_user_token(name="default") == ("aa.bb.cc", None)
 
 
 def test_save_connection_writes_secret_to_keyring(

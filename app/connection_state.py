@@ -86,6 +86,7 @@ def ensure_session_defaults(session_state: MutableSessionState) -> None:
                 stored = settings_store.load_connection(active_name)
                 if stored is not None:
                     session_state[CONNECTION_KEY] = stored
+                    _hydrate_user_token(session_state)
         except settings_store.SettingsStoreError:
             # Hydration is additive; never block session bootstrap on disk I/O.
             pass
@@ -170,10 +171,15 @@ def store_user_auth_state(
     session_state: MutableSessionState,
     auth_state: UserAuthState,
 ) -> None:
-    """Store completed user auth state and clear stale health results."""
+    """Store completed user auth state and clear stale health results.
+
+    The token is also persisted to the OS credential store (best-effort) so it
+    survives app restarts until it expires.
+    """
     if session_state.get(USER_AUTH_STATE_KEY) != auth_state:
         clear_health_state(session_state)
     session_state[USER_AUTH_STATE_KEY] = auth_state
+    _persist_user_token(auth_state)
 
 
 def clear_user_auth_state(session_state: MutableSessionState) -> None:
@@ -181,6 +187,45 @@ def clear_user_auth_state(session_state: MutableSessionState) -> None:
     session_state[USER_AUTH_STATE_KEY] = None
     clear_pending_user_auth_flow(session_state)
     clear_health_state(session_state)
+    _forget_user_token()
+
+
+def _persist_user_token(auth_state: UserAuthState) -> None:
+    """Best-effort: persist the bearer token to the OS credential store."""
+    try:
+        settings_store.save_user_token(
+            auth_state.access_token,
+            auth_state.expires_at,
+        )
+    except Exception:  # noqa: BLE001 - persistence is best-effort
+        pass
+
+
+def _forget_user_token() -> None:
+    """Best-effort: remove any persisted bearer token."""
+    try:
+        settings_store.clear_user_token()
+    except Exception:  # noqa: BLE001 - persistence is best-effort
+        pass
+
+
+def _hydrate_user_token(session_state: MutableSessionState) -> None:
+    """Restore a persisted bearer token into the session, if one exists."""
+    if session_state.get(USER_AUTH_STATE_KEY) is not None:
+        return
+    try:
+        loaded = settings_store.load_user_token()
+    except Exception:  # noqa: BLE001 - hydration is best-effort
+        return
+    if loaded is None:
+        return
+    token, expires_at = loaded
+    from app.services.auth import UserAuthState as _UserAuthState  # noqa: PLC0415
+
+    session_state[USER_AUTH_STATE_KEY] = _UserAuthState(
+        access_token=token,
+        expires_at=expires_at,
+    )
 
 
 def get_health_results(
