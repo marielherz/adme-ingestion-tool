@@ -136,10 +136,9 @@ def test_settings_page_hides_client_secret_for_user_impersonation(
     ]
     assert client_secret_calls == []
     info_messages = [call.args[0] for call in streamlit_recorder.calls_named("info")]
-    assert (
-        "Sign in with Microsoft for this user-impersonation connection. "
-        "After sign-in completes, Test Connection is enabled for this session."
-    ) in info_messages
+    assert any(
+        "Save your connection above" in message for message in info_messages
+    )
     assert all("device-code" not in message.lower() for message in info_messages)
     assert all("enter code" not in message.lower() for message in info_messages)
     assert all(
@@ -182,7 +181,8 @@ def test_settings_page_defaults_token_scope_to_adme_resource_scope(
         for call in streamlit_recorder.calls_named("text_input")
         if call.args == ("Token scope",)
     ]
-    assert token_scope_call.kwargs["value"] == ADME_RESOURCE_SCOPE
+    assert token_scope_call.kwargs["key"] == "cfg_token_scope"
+    assert streamlit_recorder.session_state["cfg_token_scope"] == ADME_RESOURCE_SCOPE
     assert token_scope_call.kwargs["placeholder"] == ADME_RESOURCE_SCOPE
     help_text = token_scope_call.kwargs["help"]
     assert "OAuth scope" in help_text
@@ -195,6 +195,178 @@ def test_settings_page_defaults_token_scope_to_adme_resource_scope(
     assert any(
         "not a token or secret" in message.lower()
         for message in caption_messages
+    )
+
+
+def test_settings_page_wires_client_id_autofill_callback(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings_module = _load_settings_module(streamlit_recorder, monkeypatch)
+
+    settings_module.main()
+
+    [client_id_call] = [
+        call
+        for call in streamlit_recorder.calls_named("text_input")
+        if call.args == ("Client ID",)
+    ]
+    assert client_id_call.kwargs["key"] == "cfg_client_id"
+    assert (
+        client_id_call.kwargs["on_change"]
+        is settings_module._autofill_token_scope_from_client_id
+    )
+
+
+def test_scope_from_client_id_appends_default_suffix(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings_module = _load_settings_module(streamlit_recorder, monkeypatch)
+
+    assert (
+        settings_module._scope_from_client_id("  client-abc  ")
+        == "client-abc/.default"
+    )
+    assert settings_module._scope_from_client_id("   ") == ""
+
+
+def test_resolve_token_scope_rules(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings_module = _load_settings_module(streamlit_recorder, monkeypatch)
+
+    # Default scope + new client ID -> derived.
+    assert (
+        settings_module._resolve_token_scope(
+            "client-abc", ADME_RESOURCE_SCOPE, ""
+        )
+        == "client-abc/.default"
+    )
+    # Default scope but unchanged saved client ID -> preserved.
+    assert (
+        settings_module._resolve_token_scope(
+            "client-abc", ADME_RESOURCE_SCOPE, "client-abc"
+        )
+        == ADME_RESOURCE_SCOPE
+    )
+    # Blank scope is preserved for backend fallback.
+    assert (
+        settings_module._resolve_token_scope("client-abc", "   ", "") == "   "
+    )
+    # Custom scope is preserved.
+    assert (
+        settings_module._resolve_token_scope(
+            "client-abc", "https://x/.default", ""
+        )
+        == "https://x/.default"
+    )
+    # Default scope with no client ID stays at the default.
+    assert (
+        settings_module._resolve_token_scope("", ADME_RESOURCE_SCOPE, "")
+        == ADME_RESOURCE_SCOPE
+    )
+
+
+def test_autofill_token_scope_fills_default_scope(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings_module = _load_settings_module(streamlit_recorder, monkeypatch)
+    streamlit_recorder.session_state["cfg_client_id"] = (
+        "22222222-2222-2222-2222-222222222222"
+    )
+    streamlit_recorder.session_state["cfg_token_scope"] = ADME_RESOURCE_SCOPE
+
+    settings_module._autofill_token_scope_from_client_id()
+
+    assert (
+        streamlit_recorder.session_state["cfg_token_scope"]
+        == "22222222-2222-2222-2222-222222222222/.default"
+    )
+
+
+def test_autofill_token_scope_preserves_custom_scope(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings_module = _load_settings_module(streamlit_recorder, monkeypatch)
+    streamlit_recorder.session_state["cfg_client_id"] = (
+        "22222222-2222-2222-2222-222222222222"
+    )
+    streamlit_recorder.session_state["cfg_token_scope"] = (
+        "https://custom.energy.azure.com/.default"
+    )
+
+    settings_module._autofill_token_scope_from_client_id()
+
+    assert (
+        streamlit_recorder.session_state["cfg_token_scope"]
+        == "https://custom.energy.azure.com/.default"
+    )
+
+
+def test_autofill_token_scope_overwrites_previous_autofill(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings_module = _load_settings_module(streamlit_recorder, monkeypatch)
+    streamlit_recorder.session_state["cfg_client_id"] = "aaaa/.bad"
+    streamlit_recorder.session_state["cfg_client_id"] = "client-one"
+    streamlit_recorder.session_state["cfg_token_scope"] = "client-zero/.default"
+    streamlit_recorder.session_state["cfg_token_scope_autofilled"] = (
+        "client-zero/.default"
+    )
+
+    settings_module._autofill_token_scope_from_client_id()
+
+    assert (
+        streamlit_recorder.session_state["cfg_token_scope"]
+        == "client-one/.default"
+    )
+
+
+def test_autofill_token_scope_ignores_blank_client_id(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings_module = _load_settings_module(streamlit_recorder, monkeypatch)
+    streamlit_recorder.session_state["cfg_client_id"] = "   "
+    streamlit_recorder.session_state["cfg_token_scope"] = ADME_RESOURCE_SCOPE
+
+    settings_module._autofill_token_scope_from_client_id()
+
+    assert (
+        streamlit_recorder.session_state["cfg_token_scope"]
+        == ADME_RESOURCE_SCOPE
+    )
+
+
+def test_settings_page_save_derives_token_scope_from_client_id(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    streamlit_recorder.widget_values.update(
+        {
+            "ADME endpoint": "https://example.energy.azure.com",
+            "Tenant ID": "11111111-1111-1111-1111-111111111111",
+            "Client ID": "22222222-2222-2222-2222-222222222222",
+            "Data partition ID": "example-opendes",
+            "Authentication method": AuthMethod.SERVICE_PRINCIPAL,
+            "Client secret": "super-secret",
+        }
+    )
+    streamlit_recorder.submit_responses["Save Settings"] = True
+    settings_module = _load_settings_module(streamlit_recorder, monkeypatch)
+
+    settings_module.main()
+
+    saved_connection = streamlit_recorder.session_state[CONNECTION_KEY]
+    assert isinstance(saved_connection, ADMEConnection)
+    assert (
+        saved_connection.token_scope
+        == "22222222-2222-2222-2222-222222222222/.default"
     )
 
 
@@ -263,6 +435,7 @@ def test_settings_page_tests_connection_and_stores_results(
             "Client secret": "super-secret",
         }
     )
+    streamlit_recorder.submit_responses["Save Settings"] = True
     streamlit_recorder.submit_responses["Test Connection"] = True
     settings_module = _load_settings_module(streamlit_recorder, monkeypatch)
 
@@ -393,7 +566,7 @@ def test_settings_page_surfaces_persistence_error_and_skips_validation(
             "Client secret": "super-secret",
         }
     )
-    streamlit_recorder.submit_responses["Test Connection"] = True
+    streamlit_recorder.submit_responses["Save Settings"] = True
     settings_module = _load_settings_module(streamlit_recorder, monkeypatch)
 
     def fail_save(*_args: object, **_kwargs: object) -> None:
@@ -532,13 +705,11 @@ def test_settings_page_clears_auth_and_health_when_token_scope_changes(
     assert captured["connection"] == expected_connection
 
 
-def test_settings_page_disables_user_test_when_only_token_scope_changed(
+def test_settings_page_keeps_test_enabled_with_unsaved_changes_when_signed_in(
     streamlit_recorder: StreamlitRecorder,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    streamlit_recorder.session_state[CONNECTION_KEY] = _user_connection(
-        "https://old.energy.azure.com/.default",
-    )
+    streamlit_recorder.session_state[CONNECTION_KEY] = _user_connection()
     streamlit_recorder.session_state[USER_AUTH_STATE_KEY] = _auth_state()
     streamlit_recorder.widget_values.update(
         {
@@ -550,13 +721,7 @@ def test_settings_page_disables_user_test_when_only_token_scope_changed(
             "Authentication method": AuthMethod.USER_IMPERSONATION,
         }
     )
-    streamlit_recorder.submit_responses["Test Connection"] = True
     settings_module = _load_settings_module(streamlit_recorder, monkeypatch)
-
-    def fail_if_called(*args: object, **kwargs: object) -> str:
-        raise AssertionError("Connection test should stay disabled until save")
-
-    monkeypatch.setattr(settings_module, "get_token", fail_if_called)
 
     settings_module.main()
 
@@ -565,7 +730,89 @@ def test_settings_page_disables_user_test_when_only_token_scope_changed(
         for call in streamlit_recorder.calls_named("form_submit_button")
         if call.args == ("Test Connection",)
     ]
-    assert test_button_call.kwargs["disabled"] is True
+    assert test_button_call.kwargs["disabled"] is False
+    caption_messages = [
+        call.args[0] for call in streamlit_recorder.calls_named("caption")
+    ]
+    assert any(
+        "unsaved changes" in message.lower() for message in caption_messages
+    )
+
+
+def test_settings_page_auth_method_radio_renders_in_identity_section(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings_module = _load_settings_module(streamlit_recorder, monkeypatch)
+
+    settings_module.main()
+
+    radio_calls = streamlit_recorder.calls_named("radio")
+    subheader_calls = [
+        call.args[0] for call in streamlit_recorder.calls_named("subheader")
+    ]
+    assert any(call.args[0] == "Authentication method" for call in radio_calls)
+    assert "Identity & authentication" in subheader_calls
+
+
+def test_settings_page_paste_command_has_no_resource_flag(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    streamlit_recorder.session_state[CONNECTION_KEY] = _user_connection()
+    streamlit_recorder.session_state[USER_AUTH_STATE_KEY] = _auth_state()
+    settings_module = _load_settings_module(streamlit_recorder, monkeypatch)
+
+    settings_module.main()
+
+    code_blocks = [
+        call.args[0] for call in streamlit_recorder.calls_named("code")
+    ]
+    assert any(
+        "az account get-access-token --query accessToken -o tsv" in block
+        for block in code_blocks
+    )
+    assert all("--resource" not in block for block in code_blocks)
+
+
+def test_settings_page_warns_when_session_token_expired(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    streamlit_recorder.session_state[CONNECTION_KEY] = _user_connection()
+    streamlit_recorder.session_state[USER_AUTH_STATE_KEY] = UserAuthState(
+        access_token="placeholder-user-token",
+        expires_at=1,
+    )
+    settings_module = _load_settings_module(streamlit_recorder, monkeypatch)
+
+    settings_module.main()
+
+    info_messages = [
+        call.args[0] for call in streamlit_recorder.calls_named("info")
+    ]
+    assert any("expired" in message.lower() for message in info_messages)
+
+
+def test_settings_page_shows_token_validity_for_fresh_token(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import time as _time
+
+    streamlit_recorder.session_state[CONNECTION_KEY] = _user_connection()
+    streamlit_recorder.session_state[USER_AUTH_STATE_KEY] = UserAuthState(
+        access_token="placeholder-user-token",
+        expires_at=int(_time.time()) + 3600,
+    )
+    settings_module = _load_settings_module(streamlit_recorder, monkeypatch)
+
+    settings_module.main()
+
+    caption_messages = [
+        call.args[0] for call in streamlit_recorder.calls_named("caption")
+    ]
+    assert any("Token valid until" in message for message in caption_messages)
 
 
 def test_settings_page_shows_sign_in_for_saved_user_connection(
@@ -963,6 +1210,7 @@ def test_settings_page_keeps_generic_retry_guidance_for_service_principal_errors
             "Client secret": "super-secret",
         }
     )
+    streamlit_recorder.submit_responses["Save Settings"] = True
     streamlit_recorder.submit_responses["Test Connection"] = True
     settings_module = _load_settings_module(streamlit_recorder, monkeypatch)
 
@@ -980,9 +1228,12 @@ def test_settings_page_keeps_generic_retry_guidance_for_service_principal_errors
         "Connection again to retry."
     ) in error_messages
     assert (
-        "Last connection test failed: Client secret was rejected. Run Test "
-        "Connection again to retry."
-    ) in error_messages
+        sum(
+            "Client secret was rejected" in message
+            for message in error_messages
+        )
+        == 1
+    )
     assert all("separate sign-in tab" not in message for message in error_messages)
 
 

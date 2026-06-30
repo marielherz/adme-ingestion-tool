@@ -7,10 +7,22 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from app.models.connection import ADMEConnection, AuthMethod, ServiceHealthResult
-from app.services import settings_store
+from app.services import settings_store, token_utils
 
 if TYPE_CHECKING:
     from app.services.auth import UserAuthFlowStart, UserAuthState
+
+_IDENTITY_CLAIMS = ("upn", "unique_name", "preferred_username", "appid")
+_SIGN_IN_GUIDANCE = (
+    "Sign in or paste a bearer token on the Instance Configuration page."
+)
+_EXPIRED_GUIDANCE = (
+    "Your session token expired — sign in again or paste a fresh token on the "
+    "Instance Configuration page."
+)
+_SERVICE_PRINCIPAL_GUIDANCE = (
+    "Add the service-principal client secret on the Instance Configuration page."
+)
 
 SessionStateView = Any
 MutableSessionState = Any
@@ -237,6 +249,96 @@ def get_overall_state(session_state: SessionStateView) -> str:
         return "error"
     results = get_health_results(session_state)
     return summarize_health(results).overall_state
+
+
+@dataclass(frozen=True)
+class AuthReadiness:
+    """Describe whether the chosen auth method is ready to make ADME calls.
+
+    ``ready`` gates Test Connection and per-page actions. ``identity_label`` is
+    a human-friendly "acting as" description when known. ``guidance`` is the
+    operator-facing next step when ``ready`` is ``False`` (empty otherwise).
+    """
+
+    ready: bool
+    method: AuthMethod
+    identity_label: str | None
+    guidance: str
+
+
+def _identity_label_from_token(token: str) -> str | None:
+    """Return a friendly identity from a token's claims, if readable."""
+    return token_utils.extract_first_string_claim(token, _IDENTITY_CLAIMS)
+
+
+def auth_readiness(
+    connection: ADMEConnection | None,
+    user_auth_state: UserAuthState | None,
+) -> AuthReadiness:
+    """Return readiness, identity, and guidance for the connection's method.
+
+    Service principal is ready as soon as a client secret is present (the
+    ``client-id`` + secret credential authenticates without a sign-in). User
+    impersonation is ready once a non-expired session token exists — obtained
+    by browser sign-in *or* a pasted bearer token.
+    """
+    if connection is None:
+        return AuthReadiness(
+            ready=False,
+            method=AuthMethod.USER_IMPERSONATION,
+            identity_label=None,
+            guidance=_SIGN_IN_GUIDANCE,
+        )
+
+    method = connection.auth_method
+    if method == AuthMethod.SERVICE_PRINCIPAL:
+        if connection.client_secret.strip():
+            client_id = connection.client_id.strip()
+            label = (
+                f"service principal ({client_id})"
+                if client_id
+                else "service principal"
+            )
+            return AuthReadiness(
+                ready=True,
+                method=method,
+                identity_label=label,
+                guidance="",
+            )
+        return AuthReadiness(
+            ready=False,
+            method=method,
+            identity_label=None,
+            guidance=_SERVICE_PRINCIPAL_GUIDANCE,
+        )
+
+    if (
+        user_auth_state is not None
+        and user_auth_state.access_token
+        and not user_auth_state.is_expired()
+    ):
+        label = (
+            _identity_label_from_token(user_auth_state.access_token)
+            or "signed-in user"
+        )
+        return AuthReadiness(
+            ready=True,
+            method=method,
+            identity_label=label,
+            guidance="",
+        )
+
+    guidance = (
+        _EXPIRED_GUIDANCE
+        if user_auth_state is not None and user_auth_state.is_expired()
+        else _SIGN_IN_GUIDANCE
+    )
+    return AuthReadiness(
+        ready=False,
+        method=method,
+        identity_label=None,
+        guidance=guidance,
+    )
 
 
 def format_auth_method(method: AuthMethod) -> str:

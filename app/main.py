@@ -181,8 +181,8 @@ def main() -> None:
     )
     ingest_landing_page = st.Page(
         INGEST_PAGE_PATH,
-        title="Ingest",
-        icon="📥",
+        title="Overview",
+        icon="🧭",
     )
     manifest_page = st.Page(
         INGESTION_PAGE_PATH,

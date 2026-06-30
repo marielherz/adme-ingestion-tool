@@ -296,7 +296,14 @@ class StreamlitRecorder(ModuleType):
         return bool(self.widget_values.get(label, value))
 
     def text_input(self, label: str, value: str = "", **kwargs: Any) -> str:
-        """Record a text input and return the configured widget value."""
+        """Record a text input and return the configured widget value.
+
+        Resolution order mirrors Streamlit's precedence for keyed widgets:
+        an explicit ``widget_values[label]`` test override wins first, then a
+        seeded ``session_state[key]`` value (for widgets that manage their value
+        through ``key`` instead of ``value=``), and finally the ``value``
+        default.
+        """
         self.calls.append(
             StreamlitCall(
                 name="text_input",
@@ -304,8 +311,12 @@ class StreamlitRecorder(ModuleType):
                 kwargs={"value": value, **kwargs},
             )
         )
-        widget_value = self.widget_values.get(label, value)
-        return str(widget_value)
+        if label in self.widget_values:
+            return str(self.widget_values[label])
+        key = kwargs.get("key")
+        if key is not None and key in self.session_state:
+            return str(self.session_state[key])
+        return str(value)
 
     def radio(
         self,

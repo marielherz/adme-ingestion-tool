@@ -13,6 +13,8 @@ from app.connection_state import (
     HEALTH_RESULTS_KEY,
     USER_AUTH_FLOW_KEY,
     USER_AUTH_STATE_KEY,
+    AuthReadiness,
+    auth_readiness,
     clear_pending_user_auth_flow,
     clear_user_auth_state,
     ensure_session_defaults,
@@ -368,6 +370,100 @@ def test_ensure_session_defaults_no_hydration_when_nothing_active(
     ensure_session_defaults(session_state)
 
     assert session_state[CONNECTION_KEY] is None
+
+
+def _jwt_with(payload: dict[str, object]) -> str:
+    import base64
+    import json
+
+    def _seg(data: dict[str, object]) -> str:
+        raw = json.dumps(data).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    return f"{_seg({'alg': 'none'})}.{_seg(payload)}.signature"
+
+
+def _connection(
+    auth_method: AuthMethod = AuthMethod.USER_IMPERSONATION,
+    client_secret: str = "",
+) -> ADMEConnection:
+    return ADMEConnection(
+        endpoint="https://example.energy.azure.com",
+        tenant_id="11111111-1111-1111-1111-111111111111",
+        client_id="22222222-2222-2222-2222-222222222222",
+        data_partition_id="example-opendes",
+        auth_method=auth_method,
+        client_secret=client_secret,
+    )
+
+
+def test_auth_readiness_none_connection_not_ready() -> None:
+    result = auth_readiness(None, None)
+
+    assert isinstance(result, AuthReadiness)
+    assert result.ready is False
+    assert result.identity_label is None
+    assert "Sign in or paste" in result.guidance
+
+
+def test_auth_readiness_service_principal_ready_with_secret() -> None:
+    connection = _connection(AuthMethod.SERVICE_PRINCIPAL, client_secret="s3cret")
+
+    result = auth_readiness(connection, None)
+
+    assert result.ready is True
+    assert result.method == AuthMethod.SERVICE_PRINCIPAL
+    assert result.identity_label is not None
+    assert "service principal" in result.identity_label
+
+
+def test_auth_readiness_service_principal_missing_secret_not_ready() -> None:
+    connection = _connection(AuthMethod.SERVICE_PRINCIPAL, client_secret="  ")
+
+    result = auth_readiness(connection, None)
+
+    assert result.ready is False
+    assert "client secret" in result.guidance.lower()
+
+
+def test_auth_readiness_user_impersonation_ready_with_token() -> None:
+    connection = _connection(AuthMethod.USER_IMPERSONATION)
+    token = _jwt_with({"upn": "mariel@example.com", "exp": 9999999999})
+    state = UserAuthState(access_token=token, expires_at=9999999999)
+
+    result = auth_readiness(connection, state)
+
+    assert result.ready is True
+    assert result.identity_label == "mariel@example.com"
+
+
+def test_auth_readiness_user_impersonation_no_token_not_ready() -> None:
+    connection = _connection(AuthMethod.USER_IMPERSONATION)
+
+    result = auth_readiness(connection, None)
+
+    assert result.ready is False
+    assert "Sign in or paste" in result.guidance
+
+
+def test_auth_readiness_user_impersonation_expired_token_guidance() -> None:
+    connection = _connection(AuthMethod.USER_IMPERSONATION)
+    state = UserAuthState(access_token="placeholder", expires_at=0)
+
+    result = auth_readiness(connection, state)
+
+    assert result.ready is False
+    assert "expired" in result.guidance.lower()
+
+
+def test_auth_readiness_user_impersonation_falls_back_to_generic_label() -> None:
+    connection = _connection(AuthMethod.USER_IMPERSONATION)
+    state = UserAuthState(access_token="not-a-jwt", expires_at=9999999999)
+
+    result = auth_readiness(connection, state)
+
+    assert result.ready is True
+    assert result.identity_label == "signed-in user"
 
 
 def test_ensure_session_defaults_preserves_existing_session_connection(
