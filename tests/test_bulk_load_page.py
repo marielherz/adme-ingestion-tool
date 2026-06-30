@@ -38,6 +38,7 @@ TIER_KEY = "bulk_tier"
 LEGAL_TAG_KEY = "bulk_legal_tag"
 ACL_OWNERS_KEY = "bulk_acl_owners"
 ACL_VIEWERS_KEY = "bulk_acl_viewers"
+LOAD_PREFIX_KEY = "bulk_load_prefix"
 PREVIEW_SEEN_KEY = "bulk_preview_seen"
 PREVIEW_RESULTS_KEY = "bulk_preview_results"
 SUBMIT_RESULTS_KEY = "bulk_submit_results"
@@ -575,6 +576,80 @@ def test_submit_renders_mixed_success_and_failure_results(
     assert len(stored) == 2
     assert stored[0].status == "success"
     assert stored[1].status == "error"
+
+
+def test_submit_forwards_load_prefix_to_submit_tier(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A load prefix entered on the page is passed through to submit_tier."""
+    streamlit_recorder.session_state[CONNECTION_KEY] = _connection()
+    streamlit_recorder.session_state[DATASET_KEY] = "tno"
+    streamlit_recorder.session_state[TIER_KEY] = "reference-data"
+    streamlit_recorder.session_state[LEGAL_TAG_KEY] = "opendes-tno-data"
+    streamlit_recorder.session_state[ACL_OWNERS_KEY] = "data.x.owners@x"
+    streamlit_recorder.session_state[ACL_VIEWERS_KEY] = "data.x.viewers@x"
+    streamlit_recorder.session_state[LOAD_PREFIX_KEY] = "20260630-"
+    streamlit_recorder.session_state[PREVIEW_SEEN_KEY] = (
+        "tno",
+        "reference-data",
+    )
+    streamlit_recorder.session_state[PREVIEW_RESULTS_KEY] = [
+        _preview_row("load_a.json", "kindA", 1),
+    ]
+    streamlit_recorder.button_responses[SUBMIT_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    tno = _tno_descriptor(tmp_path)
+    spy = _patch_service(
+        page_module,
+        monkeypatch,
+        datasets=[tno],
+        submit_results=[_submit_row("load_a.json", ok=True, run_id="run-1")],
+    )
+
+    page_module.main()
+
+    assert spy["submit"], "submit_tier should have been called"
+    kwargs = spy["submit"][0][2]
+    assert kwargs["load_prefix"] == "20260630-"
+
+
+def test_submit_defaults_load_prefix_to_empty(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """With no prefix entered, submit_tier receives an empty load_prefix."""
+    streamlit_recorder.session_state[CONNECTION_KEY] = _connection()
+    streamlit_recorder.session_state[DATASET_KEY] = "tno"
+    streamlit_recorder.session_state[TIER_KEY] = "reference-data"
+    streamlit_recorder.session_state[LEGAL_TAG_KEY] = "opendes-tno-data"
+    streamlit_recorder.session_state[ACL_OWNERS_KEY] = "data.x.owners@x"
+    streamlit_recorder.session_state[ACL_VIEWERS_KEY] = "data.x.viewers@x"
+    streamlit_recorder.session_state[PREVIEW_SEEN_KEY] = (
+        "tno",
+        "reference-data",
+    )
+    streamlit_recorder.session_state[PREVIEW_RESULTS_KEY] = [
+        _preview_row("load_a.json", "kindA", 1),
+    ]
+    streamlit_recorder.button_responses[SUBMIT_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    tno = _tno_descriptor(tmp_path)
+    spy = _patch_service(
+        page_module,
+        monkeypatch,
+        datasets=[tno],
+        submit_results=[_submit_row("load_a.json", ok=True, run_id="run-1")],
+    )
+
+    page_module.main()
+
+    assert spy["submit"], "submit_tier should have been called"
+    assert spy["submit"][0][2]["load_prefix"] == ""
 
 
 # ===========================================================================

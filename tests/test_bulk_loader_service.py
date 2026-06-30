@@ -516,3 +516,190 @@ def test_submit_tier_continues_past_failure(
     assert errors[0] is None
     assert errors[1] == "workflow rejected"
     assert errors[2] is None
+
+
+# ---------------------------------------------------------------------------
+# per-load prefix (Smart Tier independent copies)
+# ---------------------------------------------------------------------------
+
+
+def test_make_load_prefix_uses_date() -> None:
+    from datetime import date
+
+    assert bulk_loader.make_load_prefix(date(2026, 6, 30)) == "20260630-"
+
+
+def _master_data_bodies() -> list[dict[str, Any]]:
+    well = {
+        "kind": "osdu:wks:Manifest:1.0.0",
+        "MasterData": [
+            {
+                "id": "osdu:master-data--Well:W1",
+                "kind": "osdu:wks:master-data--Well:1.0.0",
+                "data": {"FacilityName": "W1"},
+            }
+        ],
+    }
+    wellbore = {
+        "kind": "osdu:wks:Manifest:1.0.0",
+        "MasterData": [
+            {
+                "id": "osdu:master-data--Wellbore:W1-S1",
+                "kind": "osdu:wks:master-data--Wellbore:1.0.0",
+                "data": {
+                    "WellID": "<namespace>:master-data--Well:W1:",
+                    "ExistenceKind": (
+                        "<namespace>:reference-data--ExistenceKind:Active:"
+                    ),
+                },
+            }
+        ],
+    }
+    return [well, wellbore]
+
+
+def test_apply_load_prefix_rewrites_ids_and_intra_load_references() -> None:
+    bodies = _master_data_bodies()
+    out = bulk_loader.apply_load_prefix(
+        bodies, section="MasterData", prefix="20260630-"
+    )
+
+    well = out[0]["MasterData"][0]
+    wellbore = out[1]["MasterData"][0]
+
+    # Record ids carry the prefix on the unique-id portion only.
+    assert well["id"] == "osdu:master-data--Well:20260630-W1"
+    assert wellbore["id"] == "osdu:master-data--Wellbore:20260630-W1-S1"
+
+    # The cross-manifest reference is rewritten consistently, preserving the
+    # ``<namespace>`` token and the trailing version colon.
+    assert (
+        wellbore["data"]["WellID"]
+        == "<namespace>:master-data--Well:20260630-W1:"
+    )
+
+    # A reference to a record outside this load (shared reference-data) is
+    # left untouched so the link still resolves to the shared copy.
+    assert (
+        wellbore["data"]["ExistenceKind"]
+        == "<namespace>:reference-data--ExistenceKind:Active:"
+    )
+
+
+def test_apply_load_prefix_does_not_touch_kind_strings() -> None:
+    bodies = _master_data_bodies()
+    out = bulk_loader.apply_load_prefix(
+        bodies, section="MasterData", prefix="20260630-"
+    )
+    assert out[0]["MasterData"][0]["kind"] == "osdu:wks:master-data--Well:1.0.0"
+    assert out[0]["kind"] == "osdu:wks:Manifest:1.0.0"
+
+
+def test_apply_load_prefix_blank_prefix_is_noop_deep_copy() -> None:
+    bodies = _master_data_bodies()
+    out = bulk_loader.apply_load_prefix(bodies, section="MasterData", prefix="  ")
+
+    assert out == bodies
+    # A deep copy is returned so callers can mutate without aliasing.
+    assert out[0] is not bodies[0]
+    assert out[0]["MasterData"][0] is not bodies[0]["MasterData"][0]
+
+
+def test_build_prefix_id_map_keys_on_type_and_unique() -> None:
+    bodies = _master_data_bodies()
+    id_map = bulk_loader.build_prefix_id_map(
+        bodies, section="MasterData", prefix="20260630-"
+    )
+    assert id_map == {
+        ("master-data--Well", "W1"): "20260630-W1",
+        ("master-data--Wellbore", "W1-S1"): "20260630-W1-S1",
+    }
+
+
+def test_build_prefix_id_map_blank_prefix_is_empty() -> None:
+    bodies = _master_data_bodies()
+    assert (
+        bulk_loader.build_prefix_id_map(
+            bodies, section="MasterData", prefix=""
+        )
+        == {}
+    )
+
+
+def test_submit_tier_with_load_prefix_rewrites_record_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _build_synthetic_tno(tmp_path, monkeypatch, file_count=2)
+
+    payloads: list[dict[str, Any]] = []
+
+    def fake_submit(
+        connection: ADMEConnection,
+        token: str,
+        manifest_payload: dict[str, Any],
+    ) -> WorkflowRunResult:
+        payloads.append(manifest_payload)
+        return _ok_result(run_id=f"run-{len(payloads)}")
+
+    monkeypatch.setattr(bulk_loader, "submit_manifest", fake_submit)
+
+    list(
+        bulk_loader.submit_tier(
+            "tno",
+            "reference-data",
+            acl_owners=["o@x"],
+            acl_viewers=["v@x"],
+            legal_tag="t",
+            data_partition_id="p",
+            connection=_connection(),
+            token="tok",
+            load_prefix="20260630-",
+        )
+    )
+
+    ids = [
+        payload["executionContext"]["manifest"]["ReferenceData"][0]["id"]
+        for payload in payloads
+    ]
+    assert ids == [
+        "osdu:reference-data--Foo:20260630-item-0",
+        "osdu:reference-data--Foo:20260630-item-1",
+    ]
+
+
+def test_submit_tier_without_prefix_leaves_ids_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _build_synthetic_tno(tmp_path, monkeypatch, file_count=1)
+
+    payloads: list[dict[str, Any]] = []
+
+    def fake_submit(
+        connection: ADMEConnection,
+        token: str,
+        manifest_payload: dict[str, Any],
+    ) -> WorkflowRunResult:
+        payloads.append(manifest_payload)
+        return _ok_result()
+
+    monkeypatch.setattr(bulk_loader, "submit_manifest", fake_submit)
+
+    list(
+        bulk_loader.submit_tier(
+            "tno",
+            "reference-data",
+            acl_owners=["o@x"],
+            acl_viewers=["v@x"],
+            legal_tag="t",
+            data_partition_id="p",
+            connection=_connection(),
+            token="tok",
+        )
+    )
+
+    assert (
+        payloads[0]["executionContext"]["manifest"]["ReferenceData"][0]["id"]
+        == "osdu:reference-data--Foo:item-0"
+    )

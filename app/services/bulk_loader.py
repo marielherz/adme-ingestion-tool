@@ -16,8 +16,8 @@ from __future__ import annotations
 import copy
 import json
 import logging
-from collections.abc import Callable, Iterator, Sequence
-from datetime import UTC, datetime
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -42,9 +42,13 @@ __all__ = [
     "DATASETS_ROOT",
     "DATA_ROOT",
     "SUBMIT_SOURCE",
+    "apply_load_prefix",
+    "apply_prefix_to_body",
+    "build_prefix_id_map",
     "inject_acl_and_legal",
     "list_datasets",
     "load_dataset",
+    "make_load_prefix",
     "preview_tier",
     "submit_tier",
 ]
@@ -312,6 +316,140 @@ def inject_acl_and_legal(
 _inject_acl_and_legal = inject_acl_and_legal
 
 
+def make_load_prefix(load_date: date | None = None) -> str:
+    """Return a date-based load prefix such as ``"20260630-"``.
+
+    Each Smart Tier load needs its own prefix so the three copies live as
+    independent records that age on their own clock. Defaults to today's
+    UTC date.
+    """
+    chosen = load_date or datetime.now(UTC).date()
+    return f"{chosen:%Y%m%d}-"
+
+
+def _split_osdu_id(value: Any) -> tuple[str, str, str, str] | None:
+    """Split an OSDU id/reference into ``(lead, entity_type, unique, rest)``.
+
+    Recognises the ``<lead>:<entity-type>:<unique>[:<version>]`` shape where
+    the entity type carries the ``--`` group marker (e.g.
+    ``master-data--Well``). ``lead`` keeps the partition or ``<namespace>``
+    placeholder token; ``rest`` is the trailing version portion (including
+    its leading colon) or ``""``. Returns ``None`` for anything that is not
+    id-shaped (plain strings, schema ``kind`` values, etc.).
+    """
+    if not isinstance(value, str):
+        return None
+    parts = value.split(":")
+    if len(parts) < 3:
+        return None
+    lead, entity_type, unique = parts[0], parts[1], parts[2]
+    if "--" not in entity_type or not unique:
+        return None
+    rest = "" if len(parts) == 3 else ":" + ":".join(parts[3:])
+    return lead, entity_type, unique, rest
+
+
+def build_prefix_id_map(
+    manifest_bodies: Iterable[dict[str, Any]],
+    *,
+    section: str,
+    prefix: str,
+) -> dict[tuple[str, str], str]:
+    """Map ``(entity_type, unique_id) -> prefixed_unique_id`` for every
+    record in ``section`` across the given manifest bodies.
+
+    Keyed on ``(entity_type, unique_id)`` rather than the full id so that a
+    record id (which uses the literal ``osdu:`` token) and the references
+    that point at it (which use the ``<namespace>:`` placeholder and a
+    trailing version colon) both resolve to the same entry. An empty or
+    blank ``prefix`` yields an empty map (no-op).
+    """
+    id_map: dict[tuple[str, str], str] = {}
+    cleaned = prefix.strip()
+    if not cleaned:
+        return id_map
+    for body in manifest_bodies:
+        records = body.get(section)
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            parsed = _split_osdu_id(record.get("id"))
+            if parsed is None:
+                continue
+            _lead, entity_type, unique, _rest = parsed
+            id_map[(entity_type, unique)] = f"{cleaned}{unique}"
+    return id_map
+
+
+def _rewrite_id_string(
+    value: str, id_map: dict[tuple[str, str], str]
+) -> str:
+    parsed = _split_osdu_id(value)
+    if parsed is None:
+        return value
+    lead, entity_type, unique, rest = parsed
+    new_unique = id_map.get((entity_type, unique))
+    if new_unique is None:
+        return value
+    return f"{lead}:{entity_type}:{new_unique}{rest}"
+
+
+def _rewrite_node(node: Any, id_map: dict[tuple[str, str], str]) -> None:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, str):
+                node[key] = _rewrite_id_string(value, id_map)
+            else:
+                _rewrite_node(value, id_map)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            if isinstance(value, str):
+                node[index] = _rewrite_id_string(value, id_map)
+            else:
+                _rewrite_node(value, id_map)
+
+
+def apply_prefix_to_body(
+    manifest_body: dict[str, Any],
+    id_map: dict[tuple[str, str], str],
+) -> dict[str, Any]:
+    """Return a deep copy of ``manifest_body`` with every id-shaped string
+    whose ``(entity_type, unique)`` is in ``id_map`` rewritten so its
+    unique-id portion carries the load prefix.
+
+    The partition / ``<namespace>`` token and any trailing version are left
+    untouched, and references to records outside this load (e.g. shared
+    reference-data) are ignored — only links to records that are part of the
+    same prefixed load are rewritten, preserving referential integrity.
+    An empty ``id_map`` returns an untouched deep copy.
+    """
+    out = copy.deepcopy(manifest_body)
+    if id_map:
+        _rewrite_node(out, id_map)
+    return out
+
+
+def apply_load_prefix(
+    manifest_bodies: Sequence[dict[str, Any]],
+    *,
+    section: str,
+    prefix: str,
+) -> list[dict[str, Any]]:
+    """Rewrite a set of manifest bodies into an independent, internally
+    consistent copy under ``prefix``.
+
+    Builds the cross-manifest id map first so references that span files
+    (e.g. a ``Wellbore`` pointing at a ``Well`` in another manifest) stay
+    linked. A blank ``prefix`` returns deep copies unchanged.
+    """
+    id_map = build_prefix_id_map(
+        manifest_bodies, section=section, prefix=prefix
+    )
+    return [apply_prefix_to_body(body, id_map) for body in manifest_bodies]
+
+
 def _extract_record_id(result: Any) -> str | None:
     raw = getattr(result, "raw_response", None)
     if isinstance(raw, dict):
@@ -389,6 +527,7 @@ def submit_tier(
     data_partition_id: str,
     connection: ADMEConnection,
     token: str,
+    load_prefix: str = "",
     progress_callback: Callable[[SubmitResult], None] | None = None,
 ) -> Iterator[SubmitResult]:
     """Yield one :class:`SubmitResult` per manifest in this tier.
@@ -397,11 +536,36 @@ def submit_tier(
     an error result and the loop continues to the next file (v1 has no
     abort-on-error policy at the service layer; the page can stop
     consuming the iterator).
+
+    When ``load_prefix`` is set, every record id (and the intra-load
+    references that point at it) is rewritten so its unique-id portion
+    carries the prefix, making this submission an independent copy that
+    ages on its own tier clock. References across manifests in the tier
+    stay linked because the prefix map is built from all files first.
     """
     descriptor = load_dataset(dataset_id)
     tier_descriptor = _resolve_tier(descriptor, tier)
     section = _TIER_TO_SECTION.get(tier, "ReferenceData")
     manifests = _resolve_manifests(descriptor, tier_descriptor)
+
+    # Pre-pass: build the cross-manifest prefix map. Read errors here are
+    # ignored on purpose — the main loop re-reads each file and surfaces
+    # any failure as an error result for that manifest.
+    id_map: dict[tuple[str, str], str] = {}
+    if load_prefix.strip():
+        scanned: list[dict[str, Any]] = []
+        for manifest_path in manifests:
+            try:
+                scanned_body = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(scanned_body, dict):
+                scanned.append(scanned_body)
+        id_map = build_prefix_id_map(
+            scanned, section=section, prefix=load_prefix
+        )
 
     for manifest_path in manifests:
         submitted_at = datetime.now(UTC)
@@ -414,6 +578,8 @@ def submit_tier(
             body = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(body, dict):
                 raise ValueError("manifest body is not a JSON object")
+            if id_map:
+                body = apply_prefix_to_body(body, id_map)
             shaped = inject_acl_and_legal(
                 body,
                 section=section,

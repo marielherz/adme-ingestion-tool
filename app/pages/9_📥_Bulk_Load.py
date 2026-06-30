@@ -66,6 +66,7 @@ from app.services.bulk_loader import (  # noqa: E402
     DATA_ROOT,
     _clear_cache,
     list_datasets,
+    make_load_prefix,
     preview_tier,
     submit_tier,
 )
@@ -90,6 +91,7 @@ BULK_TIER_KEY = "bulk_tier"
 BULK_LEGAL_TAG_KEY = "bulk_legal_tag"
 BULK_ACL_OWNERS_KEY = "bulk_acl_owners"
 BULK_ACL_VIEWERS_KEY = "bulk_acl_viewers"
+BULK_LOAD_PREFIX_KEY = "bulk_load_prefix"  # str — per-load independent-copy id prefix
 BULK_PREVIEW_SEEN_KEY = "bulk_preview_seen"  # tuple[str, str] | None
 BULK_PREVIEW_RESULTS_KEY = "bulk_preview_results"  # list[ManifestPreview]
 BULK_SUBMIT_RESULTS_KEY = "bulk_submit_results"  # list[SubmitResult]
@@ -277,6 +279,7 @@ def _ensure_page_defaults() -> None:
     st.session_state.setdefault(BULK_LEGAL_TAG_KEY, "")
     st.session_state.setdefault(BULK_ACL_OWNERS_KEY, "")
     st.session_state.setdefault(BULK_ACL_VIEWERS_KEY, "")
+    st.session_state.setdefault(BULK_LOAD_PREFIX_KEY, "")
     st.session_state.setdefault(BULK_PREVIEW_SEEN_KEY, None)
     st.session_state.setdefault(BULK_PREVIEW_RESULTS_KEY, [])
     st.session_state.setdefault(BULK_SUBMIT_RESULTS_KEY, [])
@@ -578,6 +581,31 @@ def _render_input_form(connection: ADMEConnection) -> None:
             empty_caption="⚠️ Couldn't load groups — enter manually",
         )
 
+    _render_load_prefix_field()
+
+
+def _render_load_prefix_field() -> None:
+    """Render the optional per-load id prefix input (Smart Tier copies).
+
+    Leave blank for a normal idempotent reload (same ids → upsert). Set a
+    distinct prefix — e.g. today's date — to load the dataset as an
+    *independent* copy whose records age on their own tier clock, which is
+    what the Smart Tier test plan needs for its Day 0 / 30 / 90 loads.
+    """
+    suggested = make_load_prefix()
+    st.text_input(
+        "Load prefix (optional)",
+        key=BULK_LOAD_PREFIX_KEY,
+        placeholder=f"e.g. {suggested}",
+        help=(
+            "Prepended to every record's unique id (and the references "
+            "between them) so this submission is an independent copy. "
+            "Leave blank to reload over the existing records. Use a "
+            "distinct value per Smart Tier load — today's date is "
+            f"`{suggested}`."
+        ),
+    )
+
 
 def _load_input_options(
     connection: ADMEConnection, *, force: bool = False
@@ -811,6 +839,7 @@ def _run_submit(
     acl_viewers = [
         str(st.session_state.get(BULK_ACL_VIEWERS_KEY) or "").strip()
     ]
+    load_prefix = str(st.session_state.get(BULK_LOAD_PREFIX_KEY) or "").strip()
 
     previews: list[ManifestPreview] = st.session_state.get(
         BULK_PREVIEW_RESULTS_KEY, []
@@ -819,6 +848,10 @@ def _run_submit(
     results: list[SubmitResult] = []
 
     st.write(f"Submitting {total} manifest(s)…")
+    if load_prefix:
+        st.caption(
+            f"🔁 Independent copy — record ids prefixed with `{load_prefix}`."
+        )
     st.button(
         "⏹️ Abort",
         key="bulk_abort_btn",
@@ -837,6 +870,7 @@ def _run_submit(
             data_partition_id=connection.data_partition_id,
             connection=connection,
             token=token,
+            load_prefix=load_prefix,
         )
         for index, result in enumerate(iterator, start=1):
             results.append(result)
