@@ -329,7 +329,6 @@ def _refresh_all(connection: ADMEConnection, token: str) -> None:
         for k in st.session_state.get(SEARCH_KIND_SELECTIONS_KEY, [])
         if k in options
     ]
-    st.session_state[SEARCH_KIND_SELECTIONS_KEY] = selections
 
     kind, query = _resolve_search_params(
         selections,
@@ -362,14 +361,13 @@ def _render_toolbar(connection: ADMEConnection, token: str) -> None:
         ) or [WILDCARD_KIND]
         # Wildcard is implicit (empty selection = all kinds).
         selectable = [k for k in kind_options if k != WILDCARD_KIND]
-        selections = st.multiselect(
+        st.multiselect(
             "Kind filter",
             options=selectable,
             key=SEARCH_KIND_SELECTIONS_KEY,
             placeholder="All kinds (wildcard)",
             help="Select one or more OSDU kinds. Leave empty for all.",
         )
-        st.session_state[SEARCH_KIND_SELECTIONS_KEY] = selections
     with cols[2]:
         st.text_input(
             "Free-text query (Lucene syntax)",
@@ -389,11 +387,10 @@ def _render_toolbar(connection: ADMEConnection, token: str) -> None:
         )
 
     if _HAS_AGGREGATION:
-        agg_checked = st.checkbox(
+        st.checkbox(
             "Aggregate by kind",
             key=SEARCH_AGGREGATE_KEY,
         )
-        st.session_state[SEARCH_AGGREGATE_KEY] = agg_checked
 
     st.caption(
         f"[OSDU search syntax reference]({OSDU_SEARCH_SYNTAX_DOCS_URL})"

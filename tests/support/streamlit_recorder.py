@@ -364,7 +364,12 @@ class StreamlitRecorder(ModuleType):
     def checkbox(
         self, label: str, value: bool = False, **kwargs: Any
     ) -> bool:
-        """Record a checkbox and return the configured widget value (bool)."""
+        """Record a checkbox and return the configured widget value (bool).
+
+        Mirrors a keyed Streamlit widget: a ``widget_values[label]`` override
+        wins, else a seeded ``session_state[key]`` value, else ``value``. The
+        resolved value is written back to ``session_state[key]``.
+        """
         self.calls.append(
             StreamlitCall(
                 name="checkbox",
@@ -372,7 +377,16 @@ class StreamlitRecorder(ModuleType):
                 kwargs={"value": value, **kwargs},
             )
         )
-        return bool(self.widget_values.get(label, value))
+        key = kwargs.get("key")
+        if label in self.widget_values:
+            resolved = bool(self.widget_values[label])
+        elif key and key in self.session_state:
+            resolved = bool(self.session_state[key])
+        else:
+            resolved = bool(value)
+        if key:
+            self.session_state[key] = resolved
+        return resolved
 
     def toggle(
         self, label: str, value: bool = False, **kwargs: Any
@@ -424,7 +438,12 @@ class StreamlitRecorder(ModuleType):
         default: list[Any] | None = None,
         **kwargs: Any,
     ) -> list[Any]:
-        """Record a multiselect and return the configured value (list)."""
+        """Record a multiselect and return the configured value (list).
+
+        Mirrors a keyed Streamlit widget: a ``widget_values[label]`` override
+        wins, else a seeded ``session_state[key]`` value, else ``default``. The
+        resolved value is written back to ``session_state[key]``.
+        """
         self.calls.append(
             StreamlitCall(
                 name="multiselect",
@@ -432,9 +451,16 @@ class StreamlitRecorder(ModuleType):
                 kwargs={"default": default, **kwargs},
             )
         )
+        key = kwargs.get("key")
         if label in self.widget_values:
-            return list(self.widget_values[label])
-        return list(default) if default else []
+            resolved = list(self.widget_values[label])
+        elif key and key in self.session_state:
+            resolved = list(self.session_state[key])
+        else:
+            resolved = list(default) if default else []
+        if key:
+            self.session_state[key] = resolved
+        return resolved
 
     def date_input(
         self, label: str, value: Any = None, **kwargs: Any
