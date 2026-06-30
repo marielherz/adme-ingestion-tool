@@ -1800,3 +1800,106 @@ class TestAbortCSVGeneration:
         assert any(
             "abort" in t.lower() for t in all_text
         ), "An abort-related message should be displayed after CSV submit abort"
+
+
+# ===========================================================================
+# Ingestion (workflow run) status indicator
+# ===========================================================================
+
+SUBMIT_RESULTS_KEY = "bulk_submit_results"
+RUN_STATUS_KEY = "bulk_run_status"
+
+
+def _workflow_result(run_id: str, status: Any, *, ok: bool = True) -> Any:
+    from app.models.osdu import WorkflowRunResult
+
+    return WorkflowRunResult(
+        workflow_id="Osdu_ingest",
+        run_id=run_id,
+        status=status,
+        raw_status=str(status.value),
+        message=None,
+        ok=ok,
+        http_status=200 if ok else 404,
+        latency_ms=1.0,
+        correlation_id=None,
+        error_message=None if ok else "run not found",
+        raw_response={},
+    )
+
+
+def test_ingestion_status_section_polls_and_rolls_up(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.models.osdu import WorkflowStatus
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    streamlit_recorder.session_state[SUBMIT_RESULTS_KEY] = [
+        _submit_row("a.json", ok=True, run_id="run-a"),
+        _submit_row("b.json", ok=True, run_id="run-b"),
+        _submit_row("c.json", ok=False, error="boom"),
+    ]
+    streamlit_recorder.button_responses[
+        page_module.RUN_STATUS_BUTTON_LABEL
+    ] = True
+
+    mapping = {"run-a": WorkflowStatus.FINISHED, "run-b": WorkflowStatus.FAILED}
+
+    def fake_get_token(connection: ADMEConnection, **_: Any) -> str:
+        return "test-token"
+
+    def fake_status(
+        connection: ADMEConnection, token: str, run_id: str
+    ) -> Any:
+        return _workflow_result(run_id, mapping[run_id])
+
+    monkeypatch.setattr(page_module, "get_token", fake_get_token)
+    monkeypatch.setattr(page_module, "get_workflow_status", fake_status)
+
+    page_module._render_ingestion_status_section(_connection())
+
+    stored = streamlit_recorder.session_state[RUN_STATUS_KEY]
+    assert stored["run-a"]["state"] == "finished"
+    assert stored["run-b"]["state"] == "failed"
+    warnings = [c.args[0] for c in streamlit_recorder.calls_named("warning")]
+    assert any("1 finished" in w and "1 failed" in w for w in warnings)
+
+
+def test_ingestion_status_section_hidden_without_run_ids(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    streamlit_recorder.session_state[SUBMIT_RESULTS_KEY] = [
+        _submit_row("c.json", ok=False, error="boom"),
+    ]
+
+    page_module._render_ingestion_status_section(_connection())
+
+    markdowns = [
+        call.args[0]
+        for call in streamlit_recorder.calls_named("markdown")
+        if call.args
+    ]
+    assert all("Ingestion status" not in m for m in markdowns)
+
+
+def test_workflow_state_label_maps_statuses(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.models.osdu import WorkflowStatus
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    assert (
+        page_module._workflow_state_label(WorkflowStatus.FINISHED) == "finished"
+    )
+    assert page_module._workflow_state_label(WorkflowStatus.FAILED) == "failed"
+    assert (
+        page_module._workflow_state_label(WorkflowStatus.IN_PROGRESS)
+        == "running"
+    )
+    assert (
+        page_module._workflow_state_label(WorkflowStatus.UNKNOWN) == "unknown"
+    )

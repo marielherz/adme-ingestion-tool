@@ -50,8 +50,8 @@ from app.models.osdu import (  # noqa: E402
     QueueItem,
     QueueSubmitResult,
     QueueValidationResult,
-    SchemaField,
     SubmitResult,
+    WorkflowStatus,
 )
 from app.services.auth import AuthenticationError, get_token  # noqa: E402
 from app.services.bulk_ingestion import (  # noqa: E402
@@ -70,7 +70,7 @@ from app.services.bulk_loader import (  # noqa: E402
     submit_tier,
 )
 from app.services.entitlements import fetch_groups  # noqa: E402
-from app.services.ingestion import submit_manifest  # noqa: E402
+from app.services.ingestion import get_workflow_status, submit_manifest  # noqa: E402
 from app.services.legal_tags import list_legal_tags  # noqa: E402
 from app.services.manifest_generator import (  # noqa: E402
     MappingError,
@@ -93,6 +93,7 @@ BULK_ACL_VIEWERS_KEY = "bulk_acl_viewers"
 BULK_PREVIEW_SEEN_KEY = "bulk_preview_seen"  # tuple[str, str] | None
 BULK_PREVIEW_RESULTS_KEY = "bulk_preview_results"  # list[ManifestPreview]
 BULK_SUBMIT_RESULTS_KEY = "bulk_submit_results"  # list[SubmitResult]
+BULK_RUN_STATUS_KEY = "bulk_run_status"  # dict[run_id, {state, detail}]
 BULK_LAST_ERROR_KEY = "bulk_last_error"  # str | None
 BULK_ABORT_KEY = "bulk_abort_requested"  # bool — graceful mid-loop stop
 
@@ -123,6 +124,7 @@ BULK_ACL_VIEWER_OPTIONS_KEY = "bulk_acl_viewer_options"
 
 PREVIEW_BUTTON_LABEL = "🔍 Preview manifests"
 SUBMIT_BUTTON_LABEL = "🚀 Submit all manifests"
+RUN_STATUS_BUTTON_LABEL = "🔄 Check ingestion status"
 DISMISS_BUTTON_LABEL = "Dismiss error"
 REFRESH_OPTIONS_LABEL = "🔄 Refresh legal tags & groups"
 
@@ -260,7 +262,7 @@ def _render_registered_datasets_tab(connection: ADMEConnection) -> None:
 
     _render_preview_section(descriptor, tier_name)
     _render_submit_section(connection, descriptor, tier_name)
-    _render_results_section()
+    _render_results_section(connection)
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +280,7 @@ def _ensure_page_defaults() -> None:
     st.session_state.setdefault(BULK_PREVIEW_SEEN_KEY, None)
     st.session_state.setdefault(BULK_PREVIEW_RESULTS_KEY, [])
     st.session_state.setdefault(BULK_SUBMIT_RESULTS_KEY, [])
+    st.session_state.setdefault(BULK_RUN_STATUS_KEY, {})
     st.session_state.setdefault(BULK_LAST_ERROR_KEY, None)
     st.session_state.setdefault(BULK_ABORT_KEY, False)
 
@@ -878,7 +881,7 @@ def _render_submit_row(result: SubmitResult) -> None:
         )
 
 
-def _render_results_section() -> None:
+def _render_results_section(connection: ADMEConnection) -> None:
     """Render the persistent summary of the last submit batch."""
     results: list[SubmitResult] = st.session_state.get(
         BULK_SUBMIT_RESULTS_KEY, []
@@ -924,6 +927,136 @@ def _render_results_section() -> None:
         ]
     )
     st.dataframe(frame, use_container_width=True, hide_index=True)
+
+    _render_ingestion_status_section(connection)
+
+
+# ---------------------------------------------------------------------------
+# Ingestion (workflow run) status — closes the submit→ingest loop
+# ---------------------------------------------------------------------------
+
+_RUN_STATE_ICON = {
+    "finished": "✅",
+    "running": "🟡",
+    "failed": "❌",
+    "unknown": "⚪",
+}
+
+
+def _workflow_state_label(status: WorkflowStatus) -> str:
+    """Map a normalized WorkflowStatus to a compact UI state string."""
+    if status == WorkflowStatus.FINISHED:
+        return "finished"
+    if status == WorkflowStatus.FAILED:
+        return "failed"
+    if status == WorkflowStatus.IN_PROGRESS:
+        return "running"
+    return "unknown"
+
+
+def _render_ingestion_status_section(connection: ADMEConnection) -> None:
+    """Render the per-run ingestion status with a manual refresh.
+
+    A successful *submit* only means each manifest was accepted and a
+    workflow run started. This polls the Workflow Service for each run id so
+    operators can see ingestion actually reach ``finished`` (or ``failed``).
+    """
+    results: list[SubmitResult] = st.session_state.get(
+        BULK_SUBMIT_RESULTS_KEY, []
+    )
+    run_ids = [r.run_id for r in results if r.status == "success" and r.run_id]
+    if not run_ids:
+        return
+
+    st.markdown("### Ingestion status")
+    st.caption(
+        "Submitted manifests run asynchronously. A successful submit means "
+        "*accepted*, not *finished* — check that each workflow run reaches "
+        "✅ finished."
+    )
+
+    if st.button(
+        RUN_STATUS_BUTTON_LABEL,
+        key="bulk_run_status_button",
+        help="Polls the Workflow Service status for each submitted run id.",
+    ):
+        _check_ingestion_status(connection, run_ids)
+
+    statuses: dict[str, dict[str, str]] = st.session_state.get(
+        BULK_RUN_STATUS_KEY, {}
+    )
+    if not statuses:
+        st.caption("Click to poll the Workflow Service for each run.")
+        return
+
+    counts = {"finished": 0, "running": 0, "failed": 0, "unknown": 0}
+    for run_id in run_ids:
+        state = statuses.get(run_id, {}).get("state", "unknown")
+        counts[state] = counts.get(state, 0) + 1
+
+    rollup = (
+        f"✅ {counts['finished']} finished · 🟡 {counts['running']} running · "
+        f"❌ {counts['failed']} failed · ⚪ {counts['unknown']} unknown"
+    )
+    if counts["failed"] or counts["unknown"]:
+        st.warning(rollup)
+    elif counts["running"]:
+        st.info(rollup)
+    else:
+        st.success(rollup)
+
+    status_frame = pd.DataFrame(
+        [
+            {
+                "run_id": run_id,
+                "status": (
+                    f"{_RUN_STATE_ICON.get(state, '⚪')} {state}"
+                ),
+                "detail": statuses.get(run_id, {}).get("detail", ""),
+            }
+            for run_id in run_ids
+            for state in [statuses.get(run_id, {}).get("state", "unknown")]
+        ]
+    )
+    st.dataframe(status_frame, use_container_width=True, hide_index=True)
+
+
+def _check_ingestion_status(
+    connection: ADMEConnection, run_ids: list[str]
+) -> None:
+    """Poll the Workflow Service for each run id and store the states."""
+    token = _acquire_token(connection)
+    if token is None:
+        return
+
+    statuses: dict[str, dict[str, str]] = {}
+    total = len(run_ids)
+    progress = st.progress(0.0, text="Checking run status…")
+    for index, run_id in enumerate(run_ids, start=1):
+        try:
+            result = get_workflow_status(connection, token, run_id)
+        except Exception as exc:  # noqa: BLE001 - operator-safe summary
+            statuses[run_id] = {
+                "state": "unknown",
+                "detail": f"{type(exc).__name__}: {exc}",
+            }
+        else:
+            if result.ok:
+                statuses[run_id] = {
+                    "state": _workflow_state_label(result.status),
+                    "detail": result.raw_status or result.message or "",
+                }
+            else:
+                statuses[run_id] = {
+                    "state": "unknown",
+                    "detail": (
+                        result.error_message
+                        or f"HTTP {result.http_status}"
+                    ),
+                }
+        progress.progress(index / total, text=f"Checked {index} of {total}")
+
+    st.session_state[BULK_RUN_STATUS_KEY] = statuses
 
 
 # ===========================================================================
