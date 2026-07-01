@@ -359,6 +359,27 @@ class FileMetadataResult:
 
 
 @dataclass(frozen=True, slots=True)
+class FileUploadOutcome:
+    """Outcome of one file inside a bulk upload (upload_files).
+
+    Aggregates the three-call File Service flow for a single local file:
+    ``status`` is ``"success"`` only when the bytes uploaded AND the
+    metadata record registered. ``record_id`` / ``record_version`` are
+    the ADME-minted File.Generic identifiers used to wire the file into a
+    work-product manifest; ``file_source`` is the staged blob token.
+    """
+
+    source_path: Path
+    filename: str
+    status: str
+    record_id: str | None = None
+    record_version: int | None = None
+    file_source: str | None = None
+    bytes_uploaded: int = 0
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class DatasetTier:
     """One tier (reference-data / master-data / work-products) of a dataset.
 
