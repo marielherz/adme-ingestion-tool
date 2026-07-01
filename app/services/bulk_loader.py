@@ -50,6 +50,7 @@ __all__ = [
     "load_dataset",
     "make_load_prefix",
     "preview_tier",
+    "submit_manifest_paths",
     "submit_tier",
 ]
 
@@ -573,13 +574,51 @@ def submit_tier(
     section = _TIER_TO_SECTION.get(tier, "ReferenceData")
     manifests = _resolve_manifests(descriptor, tier_descriptor)
 
+    yield from submit_manifest_paths(
+        manifests,
+        section=section,
+        acl_owners=acl_owners,
+        acl_viewers=acl_viewers,
+        legal_tag=legal_tag,
+        data_partition_id=data_partition_id,
+        connection=connection,
+        token=token,
+        load_prefix=load_prefix,
+        overwrite_acl_legal=overwrite_acl_legal,
+        progress_callback=progress_callback,
+    )
+
+
+def submit_manifest_paths(
+    manifest_paths: Sequence[Path],
+    *,
+    section: str,
+    acl_owners: Sequence[str],
+    acl_viewers: Sequence[str],
+    legal_tag: str,
+    data_partition_id: str,
+    connection: ADMEConnection,
+    token: str,
+    load_prefix: str = "",
+    overwrite_acl_legal: bool = False,
+    progress_callback: Callable[[SubmitResult], None] | None = None,
+) -> Iterator[SubmitResult]:
+    """Yield one :class:`SubmitResult` per explicit manifest path.
+
+    The shared engine behind :func:`submit_tier` and the external
+    downloaded-dataset loader: builds the cross-file prefix map (when
+    ``load_prefix`` is set), stamps ACL/legal (``overwrite_acl_legal`` for
+    pre-generated manifests carrying placeholder groups), and submits each
+    list-section manifest. Sequential; a failure yields an error result and
+    the loop continues.
+    """
     # Pre-pass: build the cross-manifest prefix map. Read errors here are
     # ignored on purpose — the main loop re-reads each file and surfaces
     # any failure as an error result for that manifest.
     id_map: dict[tuple[str, str], str] = {}
     if load_prefix.strip():
         scanned: list[dict[str, Any]] = []
-        for manifest_path in manifests:
+        for manifest_path in manifest_paths:
             try:
                 scanned_body = json.loads(
                     manifest_path.read_text(encoding="utf-8")
@@ -592,7 +631,7 @@ def submit_tier(
             scanned, section=section, prefix=load_prefix
         )
 
-    for manifest_path in manifests:
+    for manifest_path in manifest_paths:
         submitted_at = datetime.now(UTC)
         run_id: str | None = None
         record_id: str | None = None
