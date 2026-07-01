@@ -113,6 +113,12 @@ BULK_ABORT_KEY = "bulk_abort_requested"  # bool — graceful mid-loop stop
 DOWNLOAD_ROOT_KEY = "bulk_download_root"  # str — local download folder
 DOWNLOAD_PART_KEY = "bulk_download_part"  # int — selected part index
 DOWNLOAD_LIMIT_KEY = "bulk_download_limit"  # int — manifest cap (0 = all)
+# Distinct ACL/legal/prefix widget keys so the download tab's inputs don't
+# collide with the Registered Datasets tab (both render in the same run).
+DOWNLOAD_LEGAL_TAG_KEY = "bulk_dl_legal_tag"
+DOWNLOAD_ACL_OWNERS_KEY = "bulk_dl_acl_owners"
+DOWNLOAD_ACL_VIEWERS_KEY = "bulk_dl_acl_viewers"
+DOWNLOAD_LOAD_PREFIX_KEY = "bulk_dl_load_prefix"
 
 
 # --- Generate-from-CSV session-state keys (prefixed gen_) ----------------
@@ -373,7 +379,14 @@ def _render_downloaded_dataset_tab(connection: ADMEConnection) -> None:
         "(the vendor manifests ship placeholder groups)."
     )
 
-    _render_input_form(connection)
+    _render_input_form(
+        connection,
+        legal_key=DOWNLOAD_LEGAL_TAG_KEY,
+        owners_key=DOWNLOAD_ACL_OWNERS_KEY,
+        viewers_key=DOWNLOAD_ACL_VIEWERS_KEY,
+        prefix_key=DOWNLOAD_LOAD_PREFIX_KEY,
+        refresh_key="bulk_dl_refresh_options",
+    )
 
     reason = _download_disabled_reason(manifests)
     is_disabled = reason is not None
@@ -397,11 +410,11 @@ def _download_disabled_reason(manifests: Sequence[Path]) -> str | None:
     """Return why the download Load button is disabled, or ``None``."""
     if not manifests:
         return "No manifests match the current selection."
-    if not str(st.session_state.get(BULK_LEGAL_TAG_KEY) or "").strip():
+    if not str(st.session_state.get(DOWNLOAD_LEGAL_TAG_KEY) or "").strip():
         return "Select a legal tag."
-    if not str(st.session_state.get(BULK_ACL_OWNERS_KEY) or "").strip():
+    if not str(st.session_state.get(DOWNLOAD_ACL_OWNERS_KEY) or "").strip():
         return "Fill ACL owners group."
-    if not str(st.session_state.get(BULK_ACL_VIEWERS_KEY) or "").strip():
+    if not str(st.session_state.get(DOWNLOAD_ACL_VIEWERS_KEY) or "").strip():
         return "Fill ACL viewers group."
     return None
 
@@ -417,12 +430,16 @@ def _run_download_load(
     if token is None:
         return
 
-    legal_tag = str(st.session_state.get(BULK_LEGAL_TAG_KEY) or "").strip()
-    acl_owners = [str(st.session_state.get(BULK_ACL_OWNERS_KEY) or "").strip()]
-    acl_viewers = [
-        str(st.session_state.get(BULK_ACL_VIEWERS_KEY) or "").strip()
+    legal_tag = str(st.session_state.get(DOWNLOAD_LEGAL_TAG_KEY) or "").strip()
+    acl_owners = [
+        str(st.session_state.get(DOWNLOAD_ACL_OWNERS_KEY) or "").strip()
     ]
-    load_prefix = str(st.session_state.get(BULK_LOAD_PREFIX_KEY) or "").strip()
+    acl_viewers = [
+        str(st.session_state.get(DOWNLOAD_ACL_VIEWERS_KEY) or "").strip()
+    ]
+    load_prefix = str(
+        st.session_state.get(DOWNLOAD_LOAD_PREFIX_KEY) or ""
+    ).strip()
 
     total = len(manifests)
     results: list[SubmitResult] = []
@@ -511,6 +528,10 @@ def _ensure_page_defaults() -> None:
     st.session_state.setdefault(BULK_LOAD_PREFIX_KEY, "")
     st.session_state.setdefault(DOWNLOAD_ROOT_KEY, "")
     st.session_state.setdefault(DOWNLOAD_LIMIT_KEY, 0)
+    st.session_state.setdefault(DOWNLOAD_LEGAL_TAG_KEY, "")
+    st.session_state.setdefault(DOWNLOAD_ACL_OWNERS_KEY, "")
+    st.session_state.setdefault(DOWNLOAD_ACL_VIEWERS_KEY, "")
+    st.session_state.setdefault(DOWNLOAD_LOAD_PREFIX_KEY, "")
     st.session_state.setdefault(BULK_PREVIEW_SEEN_KEY, None)
     st.session_state.setdefault(BULK_PREVIEW_RESULTS_KEY, [])
     st.session_state.setdefault(BULK_SUBMIT_RESULTS_KEY, [])
@@ -763,11 +784,24 @@ def _render_tier_selector(descriptor: DatasetDescriptor) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _render_input_form(connection: ADMEConnection) -> None:
-    """Render the legal-tag / ACL inputs."""
+def _render_input_form(
+    connection: ADMEConnection,
+    *,
+    legal_key: str = BULK_LEGAL_TAG_KEY,
+    owners_key: str = BULK_ACL_OWNERS_KEY,
+    viewers_key: str = BULK_ACL_VIEWERS_KEY,
+    prefix_key: str = BULK_LOAD_PREFIX_KEY,
+    refresh_key: str = "bulk_refresh_options",
+) -> None:
+    """Render the legal-tag / ACL inputs.
+
+    The widget/session keys are parametrized so this form can render in more
+    than one tab within the same run without colliding on Streamlit element
+    keys (each tab passes its own key set).
+    """
     refresh_clicked = st.button(
         REFRESH_OPTIONS_LABEL,
-        key="bulk_refresh_options",
+        key=refresh_key,
         help="Re-fetch legal tags and entitlement groups from ADME.",
     )
     if refresh_clicked:
@@ -784,7 +818,7 @@ def _render_input_form(connection: ADMEConnection) -> None:
     with cols[0]:
         _render_option_field(
             label="Legal tag name",
-            session_key=BULK_LEGAL_TAG_KEY,
+            session_key=legal_key,
             options=legal_options,
             placeholder="opendes-tno-data",
             help_text=(
@@ -796,7 +830,7 @@ def _render_input_form(connection: ADMEConnection) -> None:
     with cols[1]:
         _render_option_field(
             label="ACL owners group",
-            session_key=BULK_ACL_OWNERS_KEY,
+            session_key=owners_key,
             options=owner_options,
             placeholder="data.default.owners@opendes.dataservices.energy",
             help_text="Entitlements group that should own these records.",
@@ -805,17 +839,17 @@ def _render_input_form(connection: ADMEConnection) -> None:
     with cols[2]:
         _render_option_field(
             label="ACL viewers group",
-            session_key=BULK_ACL_VIEWERS_KEY,
+            session_key=viewers_key,
             options=viewer_options,
             placeholder="data.default.viewers@opendes.dataservices.energy",
             help_text="Entitlements group allowed to read these records.",
             empty_caption="⚠️ Couldn't load groups — enter manually",
         )
 
-    _render_load_prefix_field()
+    _render_load_prefix_field(prefix_key=prefix_key)
 
 
-def _render_load_prefix_field() -> None:
+def _render_load_prefix_field(prefix_key: str = BULK_LOAD_PREFIX_KEY) -> None:
     """Render the optional per-load id prefix input (Smart Tier copies).
 
     Leave blank for a normal idempotent reload (same ids → upsert). Set a
@@ -826,7 +860,7 @@ def _render_load_prefix_field() -> None:
     suggested = make_load_prefix()
     st.text_input(
         "Load prefix (optional)",
-        key=BULK_LOAD_PREFIX_KEY,
+        key=prefix_key,
         placeholder=f"e.g. {suggested}",
         help=(
             "Prepended to every record's unique id (and the references "

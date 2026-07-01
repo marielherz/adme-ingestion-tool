@@ -1986,6 +1986,9 @@ def test_workflow_state_label_maps_statuses(
 
 DOWNLOAD_ROOT_KEY = "bulk_download_root"
 DOWNLOAD_LIMIT_KEY = "bulk_download_limit"
+DOWNLOAD_LEGAL_TAG_KEY = "bulk_dl_legal_tag"
+DOWNLOAD_ACL_OWNERS_KEY = "bulk_dl_acl_owners"
+DOWNLOAD_ACL_VIEWERS_KEY = "bulk_dl_acl_viewers"
 DOWNLOAD_LOAD_LABEL = "🚀 Load selected part"
 
 
@@ -1994,9 +1997,9 @@ def _seed_download_inputs(
 ) -> None:
     recorder.session_state[CONNECTION_KEY] = _connection()
     recorder.session_state[DOWNLOAD_ROOT_KEY] = str(root)
-    recorder.session_state[LEGAL_TAG_KEY] = "opendes-tno"
-    recorder.session_state[ACL_OWNERS_KEY] = "data.x.owners@x"
-    recorder.session_state[ACL_VIEWERS_KEY] = "data.x.viewers@x"
+    recorder.session_state[DOWNLOAD_LEGAL_TAG_KEY] = "opendes-tno"
+    recorder.session_state[DOWNLOAD_ACL_OWNERS_KEY] = "data.x.owners@x"
+    recorder.session_state[DOWNLOAD_ACL_VIEWERS_KEY] = "data.x.viewers@x"
 
 
 def _patch_download_discovery(
