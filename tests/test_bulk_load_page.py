@@ -1978,3 +1978,156 @@ def test_workflow_state_label_maps_statuses(
     assert (
         page_module._workflow_state_label(WorkflowStatus.UNKNOWN) == "unknown"
     )
+
+
+# ===========================================================================
+# Downloaded-dataset tab (external TNO/Volve root)
+# ===========================================================================
+
+DOWNLOAD_ROOT_KEY = "bulk_download_root"
+DOWNLOAD_LIMIT_KEY = "bulk_download_limit"
+DOWNLOAD_LOAD_LABEL = "🚀 Load selected part"
+
+
+def _seed_download_inputs(
+    recorder: StreamlitRecorder, root: Path
+) -> None:
+    recorder.session_state[CONNECTION_KEY] = _connection()
+    recorder.session_state[DOWNLOAD_ROOT_KEY] = str(root)
+    recorder.session_state[LEGAL_TAG_KEY] = "opendes-tno"
+    recorder.session_state[ACL_OWNERS_KEY] = "data.x.owners@x"
+    recorder.session_state[ACL_VIEWERS_KEY] = "data.x.viewers@x"
+
+
+def _patch_download_discovery(
+    page_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    part: Any,
+    manifests: list[Path],
+) -> dict[str, list[Any]]:
+    spy: dict[str, list[Any]] = {"wp": [], "list": []}
+
+    monkeypatch.setattr(
+        page_module, "discover_parts", lambda root: [part]
+    )
+    monkeypatch.setattr(
+        page_module, "list_part_manifests", lambda p, limit=0: list(manifests)
+    )
+
+    def fake_wp(paths: Any, **kwargs: Any) -> Iterator[SubmitResult]:
+        spy["wp"].append((list(paths), kwargs))
+        yield from [_submit_row("a.json", ok=True, run_id="wp-1")]
+
+    def fake_list(paths: Any, **kwargs: Any) -> Iterator[SubmitResult]:
+        spy["list"].append((list(paths), kwargs))
+        yield from [_submit_row("a.json", ok=True, run_id="md-1")]
+
+    monkeypatch.setattr(page_module, "submit_work_products", fake_wp)
+    monkeypatch.setattr(page_module, "submit_manifest_paths", fake_list)
+    return spy
+
+
+def test_download_tab_loads_work_products(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Clicking Load on a work-products part calls submit_work_products."""
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+    streamlit_recorder.button_responses[DOWNLOAD_LOAD_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+
+    part = page_module.DownloadedPart(
+        key="work-products/documents",
+        label="work-products / documents (9)",
+        kind="work-products",
+        section=None,
+        is_work_product=True,
+        manifest_dir=tmp_path / "wp",
+        manifest_count=9,
+        datasets_root=tmp_path / "datasets",
+    )
+    manifests = [tmp_path / "wp" / "a.json"]
+    spy = _patch_download_discovery(
+        page_module, monkeypatch, part=part, manifests=manifests
+    )
+
+    page_module.main()
+
+    assert spy["wp"], "submit_work_products should be called"
+    assert spy["list"] == []
+    paths, kwargs = spy["wp"][0]
+    assert paths == manifests
+    assert kwargs["datasets_root"] == tmp_path / "datasets"
+    assert kwargs["legal_tag"] == "opendes-tno"
+    assert kwargs["acl_owners"] == ["data.x.owners@x"]
+
+
+def test_download_tab_loads_list_tier_with_overwrite(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A reference/master part calls submit_manifest_paths with overwrite."""
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+    streamlit_recorder.button_responses[DOWNLOAD_LOAD_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+
+    part = page_module.DownloadedPart(
+        key="master-data/Well",
+        label="master-data / Well (4947)",
+        kind="master-data",
+        section="MasterData",
+        is_work_product=False,
+        manifest_dir=tmp_path / "md",
+        manifest_count=4947,
+        datasets_root=tmp_path / "datasets",
+    )
+    manifests = [tmp_path / "md" / "w1.json", tmp_path / "md" / "w2.json"]
+    spy = _patch_download_discovery(
+        page_module, monkeypatch, part=part, manifests=manifests
+    )
+
+    page_module.main()
+
+    assert spy["list"], "submit_manifest_paths should be called"
+    assert spy["wp"] == []
+    paths, kwargs = spy["list"][0]
+    assert paths == manifests
+    assert kwargs["section"] == "MasterData"
+    assert kwargs["overwrite_acl_legal"] is True
+
+
+def test_download_tab_unknown_root_warns(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A root with no recognizable manifests warns and does not submit."""
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+    monkeypatch.setattr(page_module, "discover_parts", lambda root: [])
+    spy = _patch_download_discovery(
+        page_module, monkeypatch, part=None, manifests=[]
+    )
+    # discover_parts override above is replaced by the empty list; re-apply.
+    monkeypatch.setattr(page_module, "discover_parts", lambda root: [])
+
+    page_module.main()
+
+    assert spy["wp"] == []
+    assert spy["list"] == []
+    warnings = [
+        call.args[0]
+        for call in streamlit_recorder.calls_named("warning")
+        if call.args
+    ]
+    assert any("No loadable manifests" in w for w in warnings)
+

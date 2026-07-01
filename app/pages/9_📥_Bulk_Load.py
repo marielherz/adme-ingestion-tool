@@ -22,6 +22,7 @@ import io
 import json
 import sys
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -68,7 +69,13 @@ from app.services.bulk_loader import (  # noqa: E402
     list_datasets,
     make_load_prefix,
     preview_tier,
+    submit_manifest_paths,
     submit_tier,
+)
+from app.services.downloaded_dataset import (  # noqa: E402
+    DownloadedPart,
+    discover_parts,
+    list_part_manifests,
 )
 from app.services.entitlements import fetch_groups  # noqa: E402
 from app.services.ingestion import get_workflow_status, submit_manifest  # noqa: E402
@@ -81,6 +88,9 @@ from app.services.manifest_generator import (  # noqa: E402
     generate_manifests,
     list_schema_kinds,
     load_schema,
+)
+from app.services.work_product_loader import (  # noqa: E402
+    submit_work_products,
 )
 
 SETTINGS_PAGE_PATH = "pages/1_⚙️_Instance_Configuration.py"
@@ -98,6 +108,12 @@ BULK_SUBMIT_RESULTS_KEY = "bulk_submit_results"  # list[SubmitResult]
 BULK_RUN_STATUS_KEY = "bulk_run_status"  # dict[run_id, {state, detail}]
 BULK_LAST_ERROR_KEY = "bulk_last_error"  # str | None
 BULK_ABORT_KEY = "bulk_abort_requested"  # bool — graceful mid-loop stop
+
+# --- Downloaded-dataset (external TNO/Volve root) session keys ------------
+DOWNLOAD_ROOT_KEY = "bulk_download_root"  # str — local download folder
+DOWNLOAD_PART_KEY = "bulk_download_part"  # int — selected part index
+DOWNLOAD_LIMIT_KEY = "bulk_download_limit"  # int — manifest cap (0 = all)
+
 
 # --- Generate-from-CSV session-state keys (prefixed gen_) ----------------
 GEN_KIND_KEY = "gen_kind"
@@ -215,12 +231,20 @@ def main() -> None:
         f"Endpoint: `{connection.endpoint}`"
     )
 
-    tab_datasets, tab_csv, tab_queue = st.tabs(
-        ["📦 Registered Datasets", "📄 Generate from CSV", "📋 Queue"]
+    tab_datasets, tab_download, tab_csv, tab_queue = st.tabs(
+        [
+            "📦 Registered Datasets",
+            "📂 Downloaded Dataset",
+            "📄 Generate from CSV",
+            "📋 Queue",
+        ]
     )
 
     with tab_datasets:
         _render_registered_datasets_tab(connection)
+
+    with tab_download:
+        _render_downloaded_dataset_tab(connection)
 
     with tab_csv:
         _render_csv_generation_tab(connection)
@@ -268,6 +292,211 @@ def _render_registered_datasets_tab(connection: ADMEConnection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Downloaded dataset (external TNO/Volve root)
+# ---------------------------------------------------------------------------
+
+
+def _render_downloaded_dataset_tab(connection: ADMEConnection) -> None:
+    """Load a downloaded OSDU dataset (TNO/Volve) from a local folder.
+
+    Unlike the bundled registry this reads manifests straight from the
+    operator's download root, uploads work-product blobs, and overwrites the
+    placeholder ACL/legal the vendor manifests ship with.
+    """
+    _render_sticky_error()
+    st.markdown(
+        "Load a **downloaded** dataset (e.g. TNO or Volve from the Azure "
+        "`osdu-data-load-tno` tool) directly from a local folder. Point at "
+        "the download root — the folder that contains `TNO/` and `datasets/`."
+    )
+
+    root_str = str(
+        st.text_input(
+            "Download root folder",
+            key=DOWNLOAD_ROOT_KEY,
+            placeholder=r"C:\Users\you\osdu-data\tno",
+            help=(
+                "Local path to the downloaded dataset. Manifests are read "
+                "from `TNO/provided/**`; work-product blobs from `datasets/**`."
+            ),
+        )
+        or ""
+    ).strip()
+    if not root_str:
+        st.info("Enter the folder where you downloaded the dataset.")
+        return
+
+    root = Path(root_str)
+    if not root.is_dir():
+        st.error(f"Folder not found: `{root}`")
+        return
+
+    parts = discover_parts(root)
+    if not parts:
+        st.warning(
+            "No loadable manifests found. Expected "
+            "`TNO/provided/{reference-data,master-data,work-products}/`."
+        )
+        return
+
+    part_index = st.selectbox(
+        "Part to load",
+        options=range(len(parts)),
+        format_func=lambda i: parts[i].label,
+        key=DOWNLOAD_PART_KEY,
+    )
+    part = parts[int(part_index or 0)]
+
+    limit = int(
+        st.number_input(
+            "Limit (0 = all)",
+            min_value=0,
+            step=1,
+            key=DOWNLOAD_LIMIT_KEY,
+            help=(
+                "Cap the number of manifests — use a small value (e.g. 9 for "
+                "documents) for a smoke batch before the full load."
+            ),
+        )
+        or 0
+    )
+    manifests = list_part_manifests(part, limit=limit)
+
+    kind_note = (
+        "uploads each file blob, then submits"
+        if part.is_work_product
+        else "submits list-section manifests"
+    )
+    st.caption(
+        f"**{len(manifests)}** of {part.manifest_count} manifest(s) — "
+        f"{kind_note}. ACL/legal below are **overwritten** onto every record "
+        "(the vendor manifests ship placeholder groups)."
+    )
+
+    _render_input_form(connection)
+
+    reason = _download_disabled_reason(manifests)
+    is_disabled = reason is not None
+    clicked = st.button(
+        "🚀 Load selected part",
+        key="bulk_download_load_button",
+        type="primary",
+        disabled=is_disabled,
+        help="Uploads blobs (work-products) and submits each manifest.",
+    )
+    if is_disabled and reason is not None:
+        st.caption(f"⏸️ {reason}")
+
+    if clicked:
+        _run_download_load(connection, part, manifests)
+
+    _render_results_section(connection)
+
+
+def _download_disabled_reason(manifests: Sequence[Path]) -> str | None:
+    """Return why the download Load button is disabled, or ``None``."""
+    if not manifests:
+        return "No manifests match the current selection."
+    if not str(st.session_state.get(BULK_LEGAL_TAG_KEY) or "").strip():
+        return "Select a legal tag."
+    if not str(st.session_state.get(BULK_ACL_OWNERS_KEY) or "").strip():
+        return "Fill ACL owners group."
+    if not str(st.session_state.get(BULK_ACL_VIEWERS_KEY) or "").strip():
+        return "Fill ACL viewers group."
+    return None
+
+
+def _run_download_load(
+    connection: ADMEConnection,
+    part: DownloadedPart,
+    manifests: Sequence[Path],
+) -> None:
+    """Stream a downloaded-dataset load (list tier or work-products)."""
+    _clear_sticky_error()
+    token = _acquire_token(connection)
+    if token is None:
+        return
+
+    legal_tag = str(st.session_state.get(BULK_LEGAL_TAG_KEY) or "").strip()
+    acl_owners = [str(st.session_state.get(BULK_ACL_OWNERS_KEY) or "").strip()]
+    acl_viewers = [
+        str(st.session_state.get(BULK_ACL_VIEWERS_KEY) or "").strip()
+    ]
+    load_prefix = str(st.session_state.get(BULK_LOAD_PREFIX_KEY) or "").strip()
+
+    total = len(manifests)
+    results: list[SubmitResult] = []
+
+    st.write(f"Loading {total} manifest(s) from **{part.label}**…")
+    if load_prefix and part.is_work_product:
+        st.warning(
+            "⚠️ Work-products are already independent per load (server-minted "
+            "ids), but their master-data references aren't prefixed yet — "
+            "leave the prefix blank unless the matching master-data was also "
+            "loaded under it."
+        )
+    st.session_state[BULK_ABORT_KEY] = False
+    st.button(
+        "⏹️ Abort",
+        key="bulk_download_abort_btn",
+        on_click=_set_bulk_abort,
+        help="Stop after the current manifest finishes.",
+    )
+
+    aborted = False
+    try:
+        if part.is_work_product:
+            iterator = submit_work_products(
+                manifests,
+                datasets_root=part.datasets_root,
+                acl_owners=acl_owners,
+                acl_viewers=acl_viewers,
+                legal_tag=legal_tag,
+                data_partition_id=connection.data_partition_id,
+                connection=connection,
+                token=token,
+            )
+        else:
+            iterator = submit_manifest_paths(
+                manifests,
+                section=part.section or "ReferenceData",
+                acl_owners=acl_owners,
+                acl_viewers=acl_viewers,
+                legal_tag=legal_tag,
+                data_partition_id=connection.data_partition_id,
+                connection=connection,
+                token=token,
+                load_prefix=load_prefix,
+                overwrite_acl_legal=True,
+            )
+
+        for index, result in enumerate(iterator, start=1):
+            results.append(result)
+            st.session_state[BULK_SUBMIT_RESULTS_KEY] = list(results)
+            st.write(f"**{index} of {total}** — `{result.filename}`")
+            _render_submit_row(result)
+            if st.session_state.get(BULK_ABORT_KEY):
+                aborted = True
+                break
+    except ValueError as exc:
+        _set_sticky_error(f"Load aborted: {exc}")
+        st.session_state[BULK_SUBMIT_RESULTS_KEY] = results
+        st.rerun()
+        return
+    except Exception as exc:  # noqa: BLE001 - operator-safe summary
+        _set_sticky_error(
+            f"Unexpected error during load: {type(exc).__name__}: {exc}"
+        )
+        st.session_state[BULK_SUBMIT_RESULTS_KEY] = results
+        st.rerun()
+        return
+
+    st.session_state[BULK_SUBMIT_RESULTS_KEY] = results
+    if aborted:
+        st.warning(f"⏹️ Aborted after {len(results)} of {total} manifests.")
+
+
+# ---------------------------------------------------------------------------
 # Session bootstrap
 # ---------------------------------------------------------------------------
 
@@ -280,6 +509,8 @@ def _ensure_page_defaults() -> None:
     st.session_state.setdefault(BULK_ACL_OWNERS_KEY, "")
     st.session_state.setdefault(BULK_ACL_VIEWERS_KEY, "")
     st.session_state.setdefault(BULK_LOAD_PREFIX_KEY, "")
+    st.session_state.setdefault(DOWNLOAD_ROOT_KEY, "")
+    st.session_state.setdefault(DOWNLOAD_LIMIT_KEY, 0)
     st.session_state.setdefault(BULK_PREVIEW_SEEN_KEY, None)
     st.session_state.setdefault(BULK_PREVIEW_RESULTS_KEY, [])
     st.session_state.setdefault(BULK_SUBMIT_RESULTS_KEY, [])
