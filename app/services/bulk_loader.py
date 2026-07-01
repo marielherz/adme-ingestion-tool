@@ -279,35 +279,59 @@ def inject_acl_and_legal(
     acl_owners: Sequence[str],
     acl_viewers: Sequence[str],
     legal_tag: str,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
     """Return a deep copy of ``manifest_body`` with ACL/legal populated.
 
-    Only empty arrays are overwritten — operator-provided values stay
-    intact. We mutate the copy so the caller can keep the parsed body
-    for diagnostics.
+    By default only empty arrays are filled — operator-provided values
+    stay intact. Pass ``overwrite=True`` to force the operator's ACL /
+    legal onto every record regardless of existing content; this is
+    needed for the pre-generated TNO manifests, which ship placeholder
+    groups (``ownergroup@testcompany.com``) and legal tags that do not
+    exist in the target partition. We mutate the copy so the caller can
+    keep the parsed body for diagnostics.
     """
     out = copy.deepcopy(manifest_body)
     records = out.get(section)
     if not isinstance(records, list):
         return out
     for record in records:
-        if not isinstance(record, dict):
-            continue
-        acl = record.get("acl")
-        if not isinstance(acl, dict):
-            acl = {}
-            record["acl"] = acl
-        if not acl.get("owners"):
-            acl["owners"] = list(acl_owners)
-        if not acl.get("viewers"):
-            acl["viewers"] = list(acl_viewers)
-        legal = record.get("legal")
-        if not isinstance(legal, dict):
-            legal = {}
-            record["legal"] = legal
-        if not legal.get("legaltags"):
-            legal["legaltags"] = [legal_tag]
+        _stamp_record_acl_legal(
+            record,
+            acl_owners=acl_owners,
+            acl_viewers=acl_viewers,
+            legal_tag=legal_tag,
+            overwrite=overwrite,
+        )
     return out
+
+
+def _stamp_record_acl_legal(
+    record: Any,
+    *,
+    acl_owners: Sequence[str],
+    acl_viewers: Sequence[str],
+    legal_tag: str,
+    overwrite: bool = False,
+) -> None:
+    """Fill (or overwrite) the ``acl`` / ``legal`` blocks on one record."""
+    if not isinstance(record, dict):
+        return
+    acl = record.get("acl")
+    if not isinstance(acl, dict):
+        acl = {}
+        record["acl"] = acl
+    if overwrite or not acl.get("owners"):
+        acl["owners"] = list(acl_owners)
+    if overwrite or not acl.get("viewers"):
+        acl["viewers"] = list(acl_viewers)
+    legal = record.get("legal")
+    if not isinstance(legal, dict):
+        legal = {}
+        record["legal"] = legal
+    if overwrite or not legal.get("legaltags"):
+        legal["legaltags"] = [legal_tag]
+
 
 
 # Deprecated private name retained for one release while callers
@@ -528,6 +552,7 @@ def submit_tier(
     connection: ADMEConnection,
     token: str,
     load_prefix: str = "",
+    overwrite_acl_legal: bool = False,
     progress_callback: Callable[[SubmitResult], None] | None = None,
 ) -> Iterator[SubmitResult]:
     """Yield one :class:`SubmitResult` per manifest in this tier.
@@ -586,6 +611,7 @@ def submit_tier(
                 acl_owners=acl_owners,
                 acl_viewers=acl_viewers,
                 legal_tag=legal_tag,
+                overwrite=overwrite_acl_legal,
             )
             payload = {
                 "executionContext": {
