@@ -2183,3 +2183,59 @@ def test_download_tab_unknown_root_warns(
     ]
     assert any("No loadable manifests" in w for w in warnings)
 
+
+def test_full_page_render_has_no_duplicate_widget_keys(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Rendering all four tabs must not reuse any Streamlit widget key.
+
+    Definitive guard against cross-tab StreamlitDuplicateElementKey
+    regressions: every element with an explicit ``key`` across the whole
+    page render must be globally unique.
+    """
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+    # Seed a prior submit so BOTH results/ingestion-status sections render.
+    streamlit_recorder.session_state[SUBMIT_RESULTS_KEY] = [
+        _submit_row("load_a.json", ok=True, run_id="run-xyz"),
+    ]
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    tno = _tno_descriptor(tmp_path)
+    # A bundled dataset so the Registered Datasets tab renders in full.
+    _patch_service(page_module, monkeypatch, datasets=[tno])
+    monkeypatch.setattr(
+        page_module,
+        "list_schema_kinds",
+        lambda: ["osdu:wks:master-data--Well:1.0.0"],
+    )
+
+    part = page_module.DownloadedPart(
+        key="work-products/documents",
+        label="work-products / documents (9)",
+        kind="work-products",
+        section=None,
+        is_work_product=True,
+        manifest_dir=tmp_path / "wp",
+        manifest_count=9,
+        datasets_root=tmp_path / "datasets",
+    )
+    _patch_download_discovery(
+        page_module,
+        monkeypatch,
+        part=part,
+        manifests=[tmp_path / "wp" / "a.json"],
+    )
+
+    # Must render all tabs without raising StreamlitDuplicateElementKey.
+    page_module.main()
+
+    keys = [
+        call.kwargs.get("key")
+        for call in streamlit_recorder.calls
+        if call.kwargs.get("key") is not None
+    ]
+    duplicates = sorted({k for k in keys if keys.count(k) > 1})
+    assert not duplicates, f"Duplicate widget keys across tabs: {duplicates}"
+
