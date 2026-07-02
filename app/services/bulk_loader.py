@@ -515,6 +515,23 @@ def apply_load_prefix(
     return [apply_prefix_to_body(body, id_map) for body in manifest_bodies]
 
 
+def _resolve_active_token(
+    token: str, token_provider: Callable[[], str] | None
+) -> str:
+    """Return a current token, converting provider failures to ``ValueError``.
+
+    A ``token_provider`` (e.g. an Azure-CLI refresher) may raise if it cannot
+    mint a token; we normalize that to ``ValueError`` so the submit loops
+    surface it as a per-manifest error result rather than crashing.
+    """
+    if token_provider is None:
+        return token
+    try:
+        return token_provider()
+    except Exception as exc:  # noqa: BLE001 - providers may raise anything
+        raise ValueError(f"token refresh failed: {exc}") from exc
+
+
 def _extract_record_id(result: Any) -> str | None:
     raw = getattr(result, "raw_response", None)
     if isinstance(raw, dict):
@@ -641,6 +658,7 @@ def submit_manifest_paths(
     token: str,
     load_prefix: str = "",
     overwrite_acl_legal: bool = False,
+    token_provider: Callable[[], str] | None = None,
     progress_callback: Callable[[SubmitResult], None] | None = None,
 ) -> Iterator[SubmitResult]:
     """Yield one :class:`SubmitResult` per explicit manifest path.
@@ -651,6 +669,10 @@ def submit_manifest_paths(
     pre-generated manifests carrying placeholder groups), and submits each
     list-section manifest. Sequential; a failure yields an error result and
     the loop continues.
+
+    When ``token_provider`` is given it is called once per manifest to obtain
+    a current token (refreshing near expiry) so a load that outlives a single
+    token keeps going; otherwise the fixed ``token`` is used.
     """
     # Pre-pass: build the cross-manifest prefix map. Read errors here are
     # ignored on purpose — the main loop re-reads each file and surfaces
@@ -679,6 +701,7 @@ def submit_manifest_paths(
         error: str | None = None
 
         try:
+            active_token = _resolve_active_token(token, token_provider)
             body = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(body, dict):
                 raise ValueError("manifest body is not a JSON object")
@@ -702,7 +725,7 @@ def submit_manifest_paths(
                 },
             }
 
-            workflow_result = submit_manifest(connection, token, payload)
+            workflow_result = submit_manifest(connection, active_token, payload)
             if getattr(workflow_result, "ok", False):
                 status = "success"
                 run_id = getattr(workflow_result, "run_id", None)

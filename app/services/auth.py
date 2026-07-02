@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import shutil
+import subprocess
 import time
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Protocol, cast
 
@@ -236,6 +238,97 @@ def get_token(
         raise AuthenticationError("Azure AD returned an empty access token.")
 
     return access_token.token
+
+
+_CLI_TOKEN_TIMEOUT_SECONDS = 30
+_REFRESH_SKEW_SECONDS = 300
+
+
+def acquire_cli_token(
+    resource: str | None = None, *, timeout: int = _CLI_TOKEN_TIMEOUT_SECONDS
+) -> str:
+    """Return a fresh access token from the Azure CLI (``az``).
+
+    Mirrors ``az account get-access-token --query accessToken -o tsv`` (the
+    same command an operator runs by hand), so a long-running load can keep
+    minting valid tokens without manual re-pasting. ``az`` must be installed
+    and signed in (``az login``). Raises :class:`AuthenticationError` on any
+    failure. Args are passed as a list (no shell) so ``resource`` cannot
+    inject a command.
+    """
+    az_path = shutil.which("az")
+    if az_path is None:
+        raise AuthenticationError(
+            "Azure CLI ('az') was not found on PATH. Install it and run "
+            "'az login' to enable CLI token auto-refresh."
+        )
+    args = [
+        az_path,
+        "account",
+        "get-access-token",
+        "--query",
+        "accessToken",
+        "-o",
+        "tsv",
+    ]
+    if resource:
+        args += ["--resource", resource]
+    try:
+        result = subprocess.run(  # noqa: S603 - fixed args, no shell
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            check=False,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise AuthenticationError(
+            f"Azure CLI token request timed out after {timeout}s."
+        ) from exc
+    except OSError as exc:
+        raise AuthenticationError(
+            f"Could not run the Azure CLI: {exc}"
+        ) from exc
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        raise AuthenticationError(
+            "Azure CLI token request failed. Run 'az login' and try again."
+            + (f" Details: {detail[:200]}" if detail else "")
+        )
+    token = (result.stdout or "").strip()
+    if not token:
+        raise AuthenticationError("Azure CLI returned an empty token.")
+    return token
+
+
+class RefreshingTokenProvider:
+    """A callable that returns a valid token, refreshing near expiry.
+
+    Wraps an ``acquire`` callable (e.g. :func:`acquire_cli_token`) and caches
+    the token until it is missing or within ``skew_seconds`` of its ``exp``
+    claim, at which point it re-acquires. Designed to be passed to the bulk
+    loaders so a load that outlives a single token keeps going.
+    """
+
+    def __init__(
+        self,
+        acquire: Callable[[], str],
+        *,
+        skew_seconds: int = _REFRESH_SKEW_SECONDS,
+    ) -> None:
+        self._acquire = acquire
+        self._skew = skew_seconds
+        self._token: str | None = None
+        self._expires_at: float = 0.0
+
+    def __call__(self) -> str:
+        now = time.time()
+        if self._token is None or now >= self._expires_at - self._skew:
+            self._token = self._acquire()
+            exp = token_utils.extract_expiry(self._token)
+            # Fall back to a conservative ~50 min lifetime when exp is absent.
+            self._expires_at = float(exp) if exp else now + 3000
+        return self._token
 
 
 def _build_msal_app(connection: ADMEConnection) -> _MsalPublicClient:

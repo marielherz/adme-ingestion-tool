@@ -164,3 +164,135 @@ def test_get_token_uses_client_secret_for_service_principal(
         "scope": custom_scope,
         "closed": True,
     }
+
+
+# ---------------------------------------------------------------------------
+# Azure CLI token provider + refreshing wrapper
+# ---------------------------------------------------------------------------
+
+
+def _fake_completed(returncode: int, stdout: str = "", stderr: str = "") -> object:
+    return SimpleNamespace(returncode=returncode, stdout=stdout, stderr=stderr)
+
+
+def test_acquire_cli_token_returns_trimmed_stdout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: dict[str, object] = {}
+
+    monkeypatch.setattr(auth_module.shutil, "which", lambda _n: "C:/az.cmd")
+
+    def fake_run(args: list[str], **kwargs: object) -> object:
+        calls["args"] = args
+        return _fake_completed(0, stdout="  the-token\n")
+
+    monkeypatch.setattr(auth_module.subprocess, "run", fake_run)
+
+    assert auth_module.acquire_cli_token() == "the-token"
+    # Mirrors the manual command; no --resource by default.
+    assert calls["args"][:4] == [
+        "C:/az.cmd",
+        "account",
+        "get-access-token",
+        "--query",
+    ]
+    assert "--resource" not in calls["args"]
+
+
+def test_acquire_cli_token_passes_resource(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(auth_module.shutil, "which", lambda _n: "az")
+    captured: dict[str, object] = {}
+
+    def fake_run(args: list[str], **kwargs: object) -> object:
+        captured["args"] = args
+        return _fake_completed(0, stdout="tok")
+
+    monkeypatch.setattr(auth_module.subprocess, "run", fake_run)
+
+    auth_module.acquire_cli_token("api://the-app")
+    assert captured["args"][-2:] == ["--resource", "api://the-app"]
+
+
+def test_acquire_cli_token_missing_cli_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(auth_module.shutil, "which", lambda _n: None)
+    with pytest.raises(auth_module.AuthenticationError, match="was not found"):
+        auth_module.acquire_cli_token()
+
+
+def test_acquire_cli_token_nonzero_exit_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(auth_module.shutil, "which", lambda _n: "az")
+    monkeypatch.setattr(
+        auth_module.subprocess,
+        "run",
+        lambda *a, **k: _fake_completed(1, stderr="Please run 'az login'"),
+    )
+    with pytest.raises(auth_module.AuthenticationError, match="az login"):
+        auth_module.acquire_cli_token()
+
+
+def test_acquire_cli_token_empty_output_raises(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(auth_module.shutil, "which", lambda _n: "az")
+    monkeypatch.setattr(
+        auth_module.subprocess, "run", lambda *a, **k: _fake_completed(0, stdout="  \n")
+    )
+    with pytest.raises(auth_module.AuthenticationError, match="empty token"):
+        auth_module.acquire_cli_token()
+
+
+def _jwt_with_exp(exp: int) -> str:
+    import base64
+    import json
+
+    payload = base64.urlsafe_b64encode(
+        json.dumps({"exp": exp}).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    return f"header.{payload}.sig"
+
+
+def test_refreshing_token_provider_caches_until_near_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 1_000_000
+    monkeypatch.setattr(auth_module.time, "time", lambda: now)
+
+    minted: list[str] = []
+
+    def acquire() -> str:
+        token = _jwt_with_exp(now + 3600)  # expires in 1h
+        minted.append(token)
+        return token
+
+    provider = auth_module.RefreshingTokenProvider(acquire, skew_seconds=300)
+
+    first = provider()
+    second = provider()
+    assert first == second
+    assert len(minted) == 1  # cached — not re-acquired while far from expiry
+
+
+def test_refreshing_token_provider_refreshes_when_expiring(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = {"now": 1_000_000}
+    monkeypatch.setattr(auth_module.time, "time", lambda: clock["now"])
+
+    count = {"n": 0}
+
+    def acquire() -> str:
+        count["n"] += 1
+        # each token expires 100s out — always within the 300s skew.
+        return _jwt_with_exp(clock["now"] + 100)
+
+    provider = auth_module.RefreshingTokenProvider(acquire, skew_seconds=300)
+    provider()
+    provider()
+    assert count["n"] == 2  # re-acquired because within the skew window
+

@@ -54,7 +54,12 @@ from app.models.osdu import (  # noqa: E402
     SubmitResult,
     WorkflowStatus,
 )
-from app.services.auth import AuthenticationError, get_token  # noqa: E402
+from app.services.auth import (  # noqa: E402
+    AuthenticationError,
+    RefreshingTokenProvider,
+    acquire_cli_token,
+    get_token,
+)
 from app.services.bulk_ingestion import (  # noqa: E402
     MAX_QUEUE_SIZE,
     build_queue_from_files,
@@ -114,6 +119,7 @@ DOWNLOAD_ROOT_KEY = "bulk_download_root"  # str — local download folder
 DOWNLOAD_PART_KEY = "bulk_download_part"  # int — selected part index
 DOWNLOAD_LIMIT_KEY = "bulk_download_limit"  # int — manifest cap (0 = all)
 DOWNLOAD_OFFSET_KEY = "bulk_download_offset"  # int — 1-based start manifest #
+DOWNLOAD_AUTO_REFRESH_KEY = "bulk_dl_auto_refresh"  # bool — az CLI token refresh
 # Distinct ACL/legal/prefix widget keys so the download tab's inputs don't
 # collide with the Registered Datasets tab (both render in the same run).
 DOWNLOAD_LEGAL_TAG_KEY = "bulk_dl_legal_tag"
@@ -413,6 +419,16 @@ def _render_downloaded_dataset_tab(connection: ADMEConnection) -> None:
         refresh_key="bulk_dl_refresh_options",
     )
 
+    st.checkbox(
+        "🔄 Auto-refresh token via Azure CLI (recommended for long loads)",
+        key=DOWNLOAD_AUTO_REFRESH_KEY,
+        help=(
+            "Runs `az account get-access-token` as needed so a long load "
+            "keeps a valid token instead of failing partway with 'Jwt is "
+            "expired'. Requires the Azure CLI installed and `az login`."
+        ),
+    )
+
     reason = _download_disabled_reason(manifests)
     is_disabled = reason is not None
     clicked = st.button(
@@ -466,6 +482,17 @@ def _run_download_load(
         st.session_state.get(DOWNLOAD_LOAD_PREFIX_KEY) or ""
     ).strip()
 
+    token_provider = None
+    if st.session_state.get(DOWNLOAD_AUTO_REFRESH_KEY):
+        provider = RefreshingTokenProvider(acquire=acquire_cli_token)
+        try:
+            token = provider()  # prove az works + mint an initial fresh token
+        except AuthenticationError as exc:
+            _set_sticky_error(f"Azure CLI auto-refresh unavailable: {exc}")
+            st.rerun()
+            return
+        token_provider = provider
+
     total = len(manifests)
     results: list[SubmitResult] = []
 
@@ -497,6 +524,7 @@ def _run_download_load(
                 connection=connection,
                 token=token,
                 load_prefix=load_prefix,
+                token_provider=token_provider,
             )
         else:
             iterator = submit_manifest_paths(
@@ -510,6 +538,7 @@ def _run_download_load(
                 token=token,
                 load_prefix=load_prefix,
                 overwrite_acl_legal=True,
+                token_provider=token_provider,
             )
 
         for index, result in enumerate(iterator, start=1):
@@ -554,6 +583,7 @@ def _ensure_page_defaults() -> None:
     st.session_state.setdefault(DOWNLOAD_ROOT_KEY, "")
     st.session_state.setdefault(DOWNLOAD_LIMIT_KEY, 0)
     st.session_state.setdefault(DOWNLOAD_OFFSET_KEY, 1)
+    st.session_state.setdefault(DOWNLOAD_AUTO_REFRESH_KEY, False)
     st.session_state.setdefault(DOWNLOAD_LEGAL_TAG_KEY, "")
     st.session_state.setdefault(DOWNLOAD_ACL_OWNERS_KEY, "")
     st.session_state.setdefault(DOWNLOAD_ACL_VIEWERS_KEY, "")

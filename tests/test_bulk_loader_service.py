@@ -707,6 +707,79 @@ def test_submit_tier_with_load_prefix_rewrites_record_ids(
     ]
 
 
+def test_submit_manifest_paths_uses_token_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _build_synthetic_tno(tmp_path, monkeypatch, file_count=2)
+    paths = sorted((tmp_path / "data" / "manifests").glob("load_*.json"))
+
+    seen_tokens: list[str] = []
+
+    def fake_submit(
+        connection: ADMEConnection,
+        token: str,
+        manifest_payload: dict[str, Any],
+    ) -> WorkflowRunResult:
+        seen_tokens.append(token)
+        return _ok_result(run_id=f"run-{len(seen_tokens)}")
+
+    monkeypatch.setattr(bulk_loader, "submit_manifest", fake_submit)
+
+    tokens = iter(["fresh-1", "fresh-2"])
+
+    list(
+        bulk_loader.submit_manifest_paths(
+            paths,
+            section="ReferenceData",
+            acl_owners=["o@x"],
+            acl_viewers=["v@x"],
+            legal_tag="t",
+            data_partition_id="p",
+            connection=_connection(),
+            token="stale-fixed",
+            token_provider=lambda: next(tokens),
+        )
+    )
+
+    # The provider's token was used per submit, not the fixed one.
+    assert seen_tokens == ["fresh-1", "fresh-2"]
+
+
+def test_submit_manifest_paths_token_provider_failure_is_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _build_synthetic_tno(tmp_path, monkeypatch, file_count=1)
+    paths = sorted((tmp_path / "data" / "manifests").glob("load_*.json"))
+
+    monkeypatch.setattr(
+        bulk_loader,
+        "submit_manifest",
+        lambda *a, **k: _ok_result(),
+    )
+
+    def boom() -> str:
+        raise RuntimeError("az login expired")
+
+    results = list(
+        bulk_loader.submit_manifest_paths(
+            paths,
+            section="ReferenceData",
+            acl_owners=["o@x"],
+            acl_viewers=["v@x"],
+            legal_tag="t",
+            data_partition_id="p",
+            connection=_connection(),
+            token="tok",
+            token_provider=boom,
+        )
+    )
+
+    assert results[0].status == "error"
+    assert "token refresh failed" in (results[0].error or "")
+
+
 def test_submit_tier_without_prefix_leaves_ids_untouched(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

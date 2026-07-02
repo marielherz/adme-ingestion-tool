@@ -1986,6 +1986,7 @@ def test_workflow_state_label_maps_statuses(
 
 DOWNLOAD_ROOT_KEY = "bulk_download_root"
 DOWNLOAD_LIMIT_KEY = "bulk_download_limit"
+DOWNLOAD_AUTO_REFRESH_KEY = "bulk_dl_auto_refresh"
 DOWNLOAD_LEGAL_TAG_KEY = "bulk_dl_legal_tag"
 DOWNLOAD_ACL_OWNERS_KEY = "bulk_dl_acl_owners"
 DOWNLOAD_ACL_VIEWERS_KEY = "bulk_dl_acl_viewers"
@@ -2111,6 +2112,83 @@ def test_download_tab_loads_list_tier_with_overwrite(
     assert paths == manifests
     assert kwargs["section"] == "MasterData"
     assert kwargs["overwrite_acl_legal"] is True
+
+
+def test_download_tab_auto_refresh_passes_token_provider(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Enabling Azure CLI auto-refresh passes a token_provider to the loader."""
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+    streamlit_recorder.session_state[DOWNLOAD_AUTO_REFRESH_KEY] = True
+    streamlit_recorder.button_responses[DOWNLOAD_LOAD_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+    # Avoid shelling out to az; the real RefreshingTokenProvider wraps this.
+    monkeypatch.setattr(
+        page_module, "acquire_cli_token", lambda *a, **k: "fresh-cli-token"
+    )
+
+    part = page_module.DownloadedPart(
+        key="work-products/documents",
+        label="work-products / documents (9)",
+        kind="work-products",
+        section=None,
+        is_work_product=True,
+        manifest_dir=tmp_path / "wp",
+        manifest_count=9,
+        datasets_root=tmp_path / "datasets",
+    )
+    spy = _patch_download_discovery(
+        page_module,
+        monkeypatch,
+        part=part,
+        manifests=[tmp_path / "wp" / "a.json"],
+    )
+
+    page_module.main()
+
+    assert spy["wp"], "submit_work_products should be called"
+    _, kwargs = spy["wp"][0]
+    assert kwargs["token_provider"] is not None
+
+
+def test_download_tab_no_auto_refresh_passes_none_provider(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Without auto-refresh the loader gets token_provider=None (fixed token)."""
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+    streamlit_recorder.button_responses[DOWNLOAD_LOAD_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+
+    part = page_module.DownloadedPart(
+        key="work-products/documents",
+        label="work-products / documents (9)",
+        kind="work-products",
+        section=None,
+        is_work_product=True,
+        manifest_dir=tmp_path / "wp",
+        manifest_count=9,
+        datasets_root=tmp_path / "datasets",
+    )
+    spy = _patch_download_discovery(
+        page_module,
+        monkeypatch,
+        part=part,
+        manifests=[tmp_path / "wp" / "a.json"],
+    )
+
+    page_module.main()
+
+    assert spy["wp"], "submit_work_products should be called"
+    _, kwargs = spy["wp"][0]
+    assert kwargs["token_provider"] is None
 
 
 def test_download_tab_forwards_start_offset(

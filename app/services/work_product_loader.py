@@ -37,6 +37,7 @@ from app.models.connection import ADMEConnection
 from app.models.osdu import SubmitResult
 from app.services.bulk_loader import (
     SUBMIT_SOURCE,
+    _resolve_active_token,
     _stamp_record_acl_legal,
     apply_prefix_to_body,
     build_reference_prefix_map,
@@ -254,6 +255,7 @@ def submit_work_products(
     connection: ADMEConnection,
     token: str,
     load_prefix: str = "",
+    token_provider: Callable[[], str] | None = None,
     progress_callback: Callable[[SubmitResult], None] | None = None,
 ) -> Iterator[SubmitResult]:
     """Yield one :class:`SubmitResult` per work-product manifest.
@@ -263,6 +265,11 @@ def submit_work_products(
     for an independent load (``load_prefix`` — must match the prefix the
     master-data tier was loaded under), then submit. Sequential; a failure
     yields an error result and the loop continues to the next manifest.
+
+    When ``token_provider`` is given it is called once per manifest to obtain
+    a current token (refreshing near expiry) so a long blob-upload load does
+    not die when a single token expires; otherwise the fixed ``token`` is
+    used.
     """
     for manifest_path in manifest_paths:
         submitted_at = datetime.now(UTC)
@@ -272,12 +279,13 @@ def submit_work_products(
         error: str | None = None
 
         try:
+            active_token = _resolve_active_token(token, token_provider)
             body = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(body, dict):
                 raise ValueError("manifest body is not a JSON object")
 
             tokens, stage_error = _stage_dataset_files(
-                connection, token, body, datasets_root=datasets_root
+                connection, active_token, body, datasets_root=datasets_root
             )
             if stage_error is not None:
                 raise ValueError(stage_error)
@@ -308,7 +316,7 @@ def submit_work_products(
                     "manifest": body,
                 },
             }
-            workflow_result = submit_manifest(connection, token, payload)
+            workflow_result = submit_manifest(connection, active_token, payload)
             if getattr(workflow_result, "ok", False):
                 status = "success"
                 run_id = getattr(workflow_result, "run_id", None)

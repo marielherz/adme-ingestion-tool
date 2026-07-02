@@ -387,6 +387,50 @@ def test_submit_work_products_load_prefix_rewrites_wellbore_ref(
     )
 
 
+def test_submit_work_products_uses_token_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A token_provider supplies the token for blob staging and submit."""
+    spy = _patch_ok(monkeypatch)
+    url_tokens: list[str] = []
+
+    def fake_url(connection: ADMEConnection, token: str) -> UploadURLResult:
+        url_tokens.append(token)
+        return _ok_url(file_source=f"staged-{len(url_tokens)}")
+
+    monkeypatch.setattr(wpl, "get_upload_url", fake_url)
+
+    datasets_root = tmp_path / "datasets"
+    (datasets_root / "well-logs").mkdir(parents=True)
+    (datasets_root / "well-logs" / "a.las").write_bytes(b"x")
+    manifests_dir = tmp_path / "wp"
+    manifests_dir.mkdir()
+    path = _write_manifest(
+        manifests_dir,
+        "load_log.json",
+        _wp_manifest("s3://bucket/provided/well-logs/a.las"),
+    )
+
+    results = list(
+        wpl.submit_work_products(
+            [path],
+            datasets_root=datasets_root,
+            acl_owners=["o"],
+            acl_viewers=["v"],
+            legal_tag="lt",
+            data_partition_id="p",
+            connection=_connection(),
+            token="stale-fixed",
+            token_provider=lambda: "fresh-token",
+        )
+    )
+
+    assert results[0].status == "success"
+    # The blob-staging upload-URL call used the provider's fresh token.
+    assert url_tokens == ["fresh-token"]
+    assert spy["submit"], "submit_manifest should have been called"
+
+
 def test_submit_work_products_no_prefix_leaves_refs_untouched(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
