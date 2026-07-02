@@ -53,9 +53,15 @@ __all__ = [
     "preview_tier",
     "submit_manifest_paths",
     "submit_tier",
+    "substitute_partition",
 ]
 
 SUBMIT_SOURCE = "bulk_load"
+
+# Default legal ``otherRelevantDataCountries`` stamped onto records that ship
+# with an empty list — OSDU Storage requires at least one. Matches the File
+# Service metadata default.
+_DEFAULT_RELEVANT_COUNTRIES: tuple[str, ...] = ("US",)
 
 # ``app/data/`` is the security boundary: every resolved manifest path
 # MUST live underneath it, no exceptions.
@@ -333,6 +339,14 @@ def _stamp_record_acl_legal(
         record["legal"] = legal
     if overwrite or not legal.get("legaltags"):
         legal["legaltags"] = [legal_tag]
+    # OSDU Storage rejects records whose legal block has an empty
+    # ``otherRelevantDataCountries`` or missing ``status`` — the vendor TNO
+    # manifests ship both empty, which makes the ingestion DAG "finish" while
+    # persisting nothing. Fill sane defaults so records actually land.
+    if overwrite or not legal.get("otherRelevantDataCountries"):
+        legal["otherRelevantDataCountries"] = list(_DEFAULT_RELEVANT_COUNTRIES)
+    if not legal.get("status"):
+        legal["status"] = "compliant"
 
 
 
@@ -493,6 +507,53 @@ def apply_prefix_to_body(
     out = copy.deepcopy(manifest_body)
     if id_map:
         _rewrite_node(out, id_map)
+    return out
+
+
+def _substitute_partition_string(value: str, data_partition_id: str) -> str:
+    parsed = _split_osdu_id(value)
+    if parsed is None:
+        return value
+    _lead, entity_type, unique, rest = parsed
+    return f"{data_partition_id}:{entity_type}:{unique}{rest}"
+
+
+def _substitute_partition_node(node: Any, data_partition_id: str) -> None:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, str):
+                node[key] = _substitute_partition_string(
+                    value, data_partition_id
+                )
+            else:
+                _substitute_partition_node(value, data_partition_id)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            if isinstance(value, str):
+                node[index] = _substitute_partition_string(
+                    value, data_partition_id
+                )
+            else:
+                _substitute_partition_node(value, data_partition_id)
+
+
+def substitute_partition(
+    manifest_body: dict[str, Any], data_partition_id: str
+) -> dict[str, Any]:
+    """Return a deep copy with every id-shaped token's partition rewritten.
+
+    The vendored TNO manifests ship record ids under the ``osdu`` authority
+    and references under the ``<namespace>`` placeholder. OSDU Storage
+    rejects a record whose id partition does not match the target
+    data-partition-id, so the workflow "finishes" but persists nothing. This
+    rewrites the leading partition token of every id-shaped string (record
+    ``id`` fields and references alike) to ``data_partition_id``, while
+    leaving schema ``kind`` values (``osdu:wks:...`` — second segment has no
+    ``--``) and surrogate keys untouched. A blank partition is a no-op.
+    """
+    out = copy.deepcopy(manifest_body)
+    if data_partition_id.strip():
+        _substitute_partition_node(out, data_partition_id)
     return out
 
 
@@ -707,6 +768,7 @@ def submit_manifest_paths(
                 raise ValueError("manifest body is not a JSON object")
             if id_map:
                 body = apply_prefix_to_body(body, id_map)
+            body = substitute_partition(body, data_partition_id)
             shaped = inject_acl_and_legal(
                 body,
                 section=section,

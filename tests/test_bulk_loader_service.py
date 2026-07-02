@@ -412,8 +412,10 @@ def test_submit_tier_injects_acl_and_legal_into_records(
     assert record["acl"]["owners"] == ["owner-a@example", "owner-b@example"]
     assert record["acl"]["viewers"] == ["viewer-a@example"]
     assert record["legal"]["legaltags"] == ["example-legal-tag"]
-    # otherRelevantDataCountries is untouched (not populated by injector)
-    assert record["legal"]["otherRelevantDataCountries"] == []
+    # An empty otherRelevantDataCountries / missing status makes OSDU Storage
+    # silently drop the record, so the injector fills sane defaults.
+    assert record["legal"]["otherRelevantDataCountries"] == ["US"]
+    assert record["legal"]["status"] == "compliant"
 
 
 def test_submit_tier_does_not_overwrite_populated_acl(
@@ -471,6 +473,10 @@ def test_submit_tier_does_not_overwrite_populated_acl(
     assert record["acl"]["owners"] == ["preset-owner@example"]
     assert record["acl"]["viewers"] == ["preset-viewer@example"]
     assert record["legal"]["legaltags"] == ["preset-tag"]
+    # Populated fields stay, but an *empty* countries / missing status are
+    # still filled — those defaults are required for the record to persist.
+    assert record["legal"]["otherRelevantDataCountries"] == ["US"]
+    assert record["legal"]["status"] == "compliant"
 
 
 def test_submit_tier_continues_past_failure(
@@ -702,8 +708,8 @@ def test_submit_tier_with_load_prefix_rewrites_record_ids(
         for payload in payloads
     ]
     assert ids == [
-        "osdu:reference-data--Foo:20260630-item-0",
-        "osdu:reference-data--Foo:20260630-item-1",
+        "p:reference-data--Foo:20260630-item-0",
+        "p:reference-data--Foo:20260630-item-1",
     ]
 
 
@@ -780,7 +786,7 @@ def test_submit_manifest_paths_token_provider_failure_is_error(
     assert "token refresh failed" in (results[0].error or "")
 
 
-def test_submit_tier_without_prefix_leaves_ids_untouched(
+def test_submit_tier_without_prefix_leaves_unique_id_untouched(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -811,7 +817,79 @@ def test_submit_tier_without_prefix_leaves_ids_untouched(
         )
     )
 
+    # No load prefix, so the unique-id portion is untouched; the partition
+    # token is still rewritten from ``osdu`` to the target ``p``.
     assert (
         payloads[0]["executionContext"]["manifest"]["ReferenceData"][0]["id"]
-        == "osdu:reference-data--Foo:item-0"
+        == "p:reference-data--Foo:item-0"
     )
+
+
+# ---------------------------------------------------------------------------
+# substitute_partition (rewrite hardwired partition token to the target)
+# ---------------------------------------------------------------------------
+
+
+def _partition_sample_body() -> dict[str, Any]:
+    return {
+        "kind": "osdu:wks:Manifest:1.0.0",
+        "MasterData": [
+            {
+                "id": "osdu:master-data--Well:1001",
+                "kind": "osdu:wks:master-data--Well:1.0.0",
+                "data": {
+                    "FacilityName": "AHM-01",
+                    "OperatorID": (
+                        "osdu:master-data--Organisation:Foo%20Bar:"
+                    ),
+                    "ExistenceKind": (
+                        "<namespace>:reference-data--ExistenceKind:Active:"
+                    ),
+                    "SurrogateRef": "surrogate-key:wpc-1",
+                    "PlainString": "not-an-id",
+                },
+            }
+        ],
+    }
+
+
+def test_substitute_partition_rewrites_record_id_lead_token() -> None:
+    out = bulk_loader.substitute_partition(_partition_sample_body(), "opendes")
+    assert out["MasterData"][0]["id"] == "opendes:master-data--Well:1001"
+
+
+def test_substitute_partition_rewrites_reference_lead_tokens() -> None:
+    out = bulk_loader.substitute_partition(_partition_sample_body(), "opendes")
+    data = out["MasterData"][0]["data"]
+    # Both the literal ``osdu`` authority and the ``<namespace>`` placeholder
+    # references collapse onto the target partition, keeping the trailing
+    # version colon and any URL-encoded characters intact.
+    assert data["OperatorID"] == "opendes:master-data--Organisation:Foo%20Bar:"
+    assert (
+        data["ExistenceKind"]
+        == "opendes:reference-data--ExistenceKind:Active:"
+    )
+
+
+def test_substitute_partition_leaves_kind_and_non_ids_untouched() -> None:
+    out = bulk_loader.substitute_partition(_partition_sample_body(), "opendes")
+    record = out["MasterData"][0]
+    # Schema kinds (second segment lacks ``--``) stay on the osdu authority.
+    assert record["kind"] == "osdu:wks:master-data--Well:1.0.0"
+    assert out["kind"] == "osdu:wks:Manifest:1.0.0"
+    # Surrogate keys and plain strings are not id-shaped and pass through.
+    assert record["data"]["SurrogateRef"] == "surrogate-key:wpc-1"
+    assert record["data"]["PlainString"] == "not-an-id"
+
+
+def test_substitute_partition_blank_is_noop_deep_copy() -> None:
+    body = _partition_sample_body()
+    out = bulk_loader.substitute_partition(body, "   ")
+    assert out == body
+    # A deep copy is returned so callers can mutate without aliasing.
+    assert out is not body
+    assert out["MasterData"][0] is not body["MasterData"][0]
+
+
+def test_substitute_partition_is_exported() -> None:
+    assert "substitute_partition" in bulk_loader.__all__

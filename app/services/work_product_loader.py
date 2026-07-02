@@ -41,6 +41,7 @@ from app.services.bulk_loader import (
     _stamp_record_acl_legal,
     apply_prefix_to_body,
     build_reference_prefix_map,
+    substitute_partition,
 )
 from app.services.file_uploader import (
     UPLOAD_BYTES_TIMEOUT_SECONDS,
@@ -306,6 +307,8 @@ def submit_work_products(
                 )
                 if master_map:
                     body = apply_prefix_to_body(body, master_map)
+
+            body = substitute_partition(body, data_partition_id)
 
             payload = {
                 "executionContext": {

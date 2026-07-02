@@ -382,8 +382,9 @@ def test_submit_work_products_load_prefix_rewrites_wellbore_ref(
 
     submitted = spy["submit"][0]["executionContext"]["manifest"]
     wpc = submitted["Data"]["WorkProductComponents"][0]
+    # Partition token rewritten to the target ``p`` and the prefix applied.
     assert wpc["data"]["WellboreID"] == (
-        "osdu:master-data--Wellbore:20260730-1013:"
+        "p:master-data--Wellbore:20260730-1013:"
     )
 
 
@@ -461,7 +462,8 @@ def test_submit_work_products_no_prefix_leaves_refs_untouched(
 
     submitted = spy["submit"][0]["executionContext"]["manifest"]
     wpc = submitted["Data"]["WorkProductComponents"][0]
-    assert wpc["data"]["WellboreID"] == "osdu:master-data--Wellbore:1013:"
+    # No prefix, but the partition token is still rewritten to ``p``.
+    assert wpc["data"]["WellboreID"] == "p:master-data--Wellbore:1013:"
 
 
 def test_submit_work_products_continues_after_failure(
