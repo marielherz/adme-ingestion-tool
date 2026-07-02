@@ -349,7 +349,7 @@ def test_submit_work_products_upload_failure_errors(
     assert spy["submit"] == []
 
 
-def test_submit_work_products_master_id_map_rewrites_wellbore_ref(
+def test_submit_work_products_load_prefix_rewrites_wellbore_ref(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     spy = _patch_ok(monkeypatch)
@@ -364,9 +364,43 @@ def test_submit_work_products_master_id_map_rewrites_wellbore_ref(
         _wp_manifest("s3://bucket/provided/well-logs/a.las"),
     )
 
-    # Simulate the master-data tier having loaded Wellbore 1013 under a
-    # date prefix, so the WP reference must follow.
-    master_id_map = {("master-data--Wellbore", "1013"): "20260730-1013"}
+    # An independent (prefixed) load: the master-data tier was loaded under
+    # this prefix, so the WP's Wellbore reference must follow.
+    list(
+        wpl.submit_work_products(
+            [path],
+            datasets_root=datasets_root,
+            acl_owners=["o"],
+            acl_viewers=["v"],
+            legal_tag="lt",
+            data_partition_id="p",
+            connection=_connection(),
+            token="tok",
+            load_prefix="20260730-",
+        )
+    )
+
+    submitted = spy["submit"][0]["executionContext"]["manifest"]
+    wpc = submitted["Data"]["WorkProductComponents"][0]
+    assert wpc["data"]["WellboreID"] == (
+        "osdu:master-data--Wellbore:20260730-1013:"
+    )
+
+
+def test_submit_work_products_no_prefix_leaves_refs_untouched(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    spy = _patch_ok(monkeypatch)
+    datasets_root = tmp_path / "datasets"
+    (datasets_root / "well-logs").mkdir(parents=True)
+    (datasets_root / "well-logs" / "a.las").write_bytes(b"x")
+    manifests_dir = tmp_path / "wp"
+    manifests_dir.mkdir()
+    path = _write_manifest(
+        manifests_dir,
+        "load_log.json",
+        _wp_manifest("s3://bucket/provided/well-logs/a.las"),
+    )
 
     list(
         wpl.submit_work_products(
@@ -378,15 +412,12 @@ def test_submit_work_products_master_id_map_rewrites_wellbore_ref(
             data_partition_id="p",
             connection=_connection(),
             token="tok",
-            master_id_map=master_id_map,
         )
     )
 
     submitted = spy["submit"][0]["executionContext"]["manifest"]
     wpc = submitted["Data"]["WorkProductComponents"][0]
-    assert wpc["data"]["WellboreID"] == (
-        "osdu:master-data--Wellbore:20260730-1013:"
-    )
+    assert wpc["data"]["WellboreID"] == "osdu:master-data--Wellbore:1013:"
 
 
 def test_submit_work_products_continues_after_failure(

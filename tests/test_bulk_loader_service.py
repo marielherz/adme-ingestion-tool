@@ -626,6 +626,45 @@ def test_build_prefix_id_map_blank_prefix_is_empty() -> None:
     )
 
 
+def test_build_reference_prefix_map_targets_entity_prefix() -> None:
+    # A work-product-shaped body referencing master-data + reference-data.
+    body = {
+        "Data": {
+            "WorkProductComponents": [
+                {
+                    "id": "surrogate-key:wpc-1",
+                    "data": {
+                        "WellboreID": "osdu:master-data--Wellbore:1013:",
+                        "OperatorID": "<namespace>:master-data--Organisation:EBN:",
+                        "ExistenceKind": (
+                            "<namespace>:reference-data--ExistenceKind:Active:"
+                        ),
+                    },
+                }
+            ]
+        }
+    }
+    ref_map = bulk_loader.build_reference_prefix_map(
+        body, prefix="20260730-", entity_prefix="master-data--"
+    )
+    assert ref_map == {
+        ("master-data--Wellbore", "1013"): "20260730-1013",
+        ("master-data--Organisation", "EBN"): "20260730-EBN",
+    }
+    # reference-data refs and surrogate-keys are excluded.
+    assert ("reference-data--ExistenceKind", "Active") not in ref_map
+
+
+def test_build_reference_prefix_map_blank_prefix_is_empty() -> None:
+    body = {"data": {"WellboreID": "osdu:master-data--Wellbore:1013:"}}
+    assert (
+        bulk_loader.build_reference_prefix_map(
+            body, prefix="  ", entity_prefix="master-data--"
+        )
+        == {}
+    )
+
+
 def test_submit_tier_with_load_prefix_rewrites_record_ids(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

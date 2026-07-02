@@ -45,6 +45,7 @@ __all__ = [
     "apply_load_prefix",
     "apply_prefix_to_body",
     "build_prefix_id_map",
+    "build_reference_prefix_map",
     "inject_acl_and_legal",
     "list_datasets",
     "load_dataset",
@@ -372,6 +373,45 @@ def _split_osdu_id(value: Any) -> tuple[str, str, str, str] | None:
         return None
     rest = "" if len(parts) == 3 else ":" + ":".join(parts[3:])
     return lead, entity_type, unique, rest
+
+
+def build_reference_prefix_map(
+    node: Any,
+    *,
+    prefix: str,
+    entity_prefix: str,
+) -> dict[tuple[str, str], str]:
+    """Map ``(entity_type, unique) -> prefixed_unique`` for every id-shaped
+    *reference* anywhere in ``node`` whose entity type starts with
+    ``entity_prefix``.
+
+    Unlike :func:`build_prefix_id_map` (which reads record ``id`` fields in a
+    known section), this walks arbitrary nested structures and keys off the
+    references themselves — used to rewrite the master-data references inside
+    a work-product manifest so an independent (prefixed) load links to that
+    load's prefixed master-data. A blank ``prefix`` yields an empty map.
+    """
+    out: dict[tuple[str, str], str] = {}
+    cleaned = prefix.strip()
+    if not cleaned:
+        return out
+
+    def _walk(current: Any) -> None:
+        if isinstance(current, dict):
+            for value in current.values():
+                _walk(value)
+        elif isinstance(current, list):
+            for value in current:
+                _walk(value)
+        elif isinstance(current, str):
+            parsed = _split_osdu_id(current)
+            if parsed is not None:
+                _lead, entity_type, unique, _rest = parsed
+                if entity_type.startswith(entity_prefix):
+                    out[(entity_type, unique)] = f"{cleaned}{unique}"
+
+    _walk(node)
+    return out
 
 
 def build_prefix_id_map(

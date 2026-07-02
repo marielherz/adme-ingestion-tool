@@ -39,6 +39,7 @@ from app.services.bulk_loader import (
     SUBMIT_SOURCE,
     _stamp_record_acl_legal,
     apply_prefix_to_body,
+    build_reference_prefix_map,
 )
 from app.services.file_uploader import (
     UPLOAD_BYTES_TIMEOUT_SECONDS,
@@ -252,16 +253,16 @@ def submit_work_products(
     data_partition_id: str,
     connection: ADMEConnection,
     token: str,
-    master_id_map: dict[tuple[str, str], str] | None = None,
+    load_prefix: str = "",
     progress_callback: Callable[[SubmitResult], None] | None = None,
 ) -> Iterator[SubmitResult]:
     """Yield one :class:`SubmitResult` per work-product manifest.
 
     Per manifest: stage every referenced blob, swap the FileSource tokens,
     stamp ACL/legal (overwrite), optionally rewrite master-data references
-    for an independent load (``master_id_map`` from the master-data tier),
-    then submit. Sequential; a failure yields an error result and the loop
-    continues to the next manifest.
+    for an independent load (``load_prefix`` — must match the prefix the
+    master-data tier was loaded under), then submit. Sequential; a failure
+    yields an error result and the loop continues to the next manifest.
     """
     for manifest_path in manifest_paths:
         submitted_at = datetime.now(UTC)
@@ -289,8 +290,14 @@ def submit_work_products(
                 legal_tag=legal_tag,
                 overwrite=True,
             )
-            if master_id_map:
-                body = apply_prefix_to_body(body, master_id_map)
+            if load_prefix.strip():
+                master_map = build_reference_prefix_map(
+                    body,
+                    prefix=load_prefix,
+                    entity_prefix="master-data--",
+                )
+                if master_map:
+                    body = apply_prefix_to_body(body, master_map)
 
             payload = {
                 "executionContext": {

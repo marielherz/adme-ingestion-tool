@@ -446,11 +446,10 @@ def _run_download_load(
 
     st.write(f"Loading {total} manifest(s) from **{part.label}**…")
     if load_prefix and part.is_work_product:
-        st.warning(
-            "⚠️ Work-products are already independent per load (server-minted "
-            "ids), but their master-data references aren't prefixed yet — "
-            "leave the prefix blank unless the matching master-data was also "
-            "loaded under it."
+        st.caption(
+            f"🔁 Independent copy — master-data references prefixed with "
+            f"`{load_prefix}`. The matching master-data must have been loaded "
+            "under the same prefix."
         )
     st.session_state[BULK_ABORT_KEY] = False
     st.button(
@@ -472,6 +471,7 @@ def _run_download_load(
                 data_partition_id=connection.data_partition_id,
                 connection=connection,
                 token=token,
+                load_prefix=load_prefix,
             )
         else:
             iterator = submit_manifest_paths(
