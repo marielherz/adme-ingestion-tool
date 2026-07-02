@@ -138,13 +138,19 @@ def discover_parts(root: Path) -> list[DownloadedPart]:
     return parts
 
 
-def list_part_manifests(part: DownloadedPart, *, limit: int = 0) -> list[Path]:
+def list_part_manifests(
+    part: DownloadedPart, *, limit: int = 0, offset: int = 0
+) -> list[Path]:
     """Return the sorted ``*.json`` manifest paths for a part.
 
-    ``limit`` caps the count (``0`` = all) so the page can run a small smoke
-    batch before turning loose the full set.
+    ``offset`` skips that many manifests from the start (0-based) so a load
+    can resume after an interruption — e.g. ``offset=1736`` starts at the
+    1737th file. ``limit`` then caps the count (``0`` = to the end), which
+    lets the page run a small smoke batch or a token-sized chunk.
     """
     manifests = sorted(part.manifest_dir.glob("*.json"))
+    if offset > 0:
+        manifests = manifests[offset:]
     if limit > 0:
         return manifests[:limit]
     return manifests

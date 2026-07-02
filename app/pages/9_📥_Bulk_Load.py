@@ -113,6 +113,7 @@ BULK_ABORT_KEY = "bulk_abort_requested"  # bool — graceful mid-loop stop
 DOWNLOAD_ROOT_KEY = "bulk_download_root"  # str — local download folder
 DOWNLOAD_PART_KEY = "bulk_download_part"  # int — selected part index
 DOWNLOAD_LIMIT_KEY = "bulk_download_limit"  # int — manifest cap (0 = all)
+DOWNLOAD_OFFSET_KEY = "bulk_download_offset"  # int — 1-based start manifest #
 # Distinct ACL/legal/prefix widget keys so the download tab's inputs don't
 # collide with the Registered Datasets tab (both render in the same run).
 DOWNLOAD_LEGAL_TAG_KEY = "bulk_dl_legal_tag"
@@ -353,30 +354,54 @@ def _render_downloaded_dataset_tab(connection: ADMEConnection) -> None:
     )
     part = parts[int(part_index or 0)]
 
-    limit = int(
-        st.number_input(
-            "Limit (0 = all)",
-            min_value=0,
-            step=1,
-            key=DOWNLOAD_LIMIT_KEY,
-            help=(
-                "Cap the number of manifests — use a small value (e.g. 9 for "
-                "documents) for a smoke batch before the full load."
-            ),
+    controls = st.columns(2)
+    with controls[0]:
+        start_at = int(
+            st.number_input(
+                "Start at manifest # (1 = first)",
+                min_value=1,
+                value=1,
+                step=1,
+                key=DOWNLOAD_OFFSET_KEY,
+                help=(
+                    "Resume an interrupted load without redoing earlier "
+                    "manifests — set this to the number shown next to the "
+                    "first failed row (e.g. 1737). Re-loading already-loaded "
+                    "records is safe (they upsert)."
+                ),
+            )
+            or 1
         )
-        or 0
-    )
-    manifests = list_part_manifests(part, limit=limit)
+    with controls[1]:
+        limit = int(
+            st.number_input(
+                "Limit (0 = all)",
+                min_value=0,
+                step=1,
+                key=DOWNLOAD_LIMIT_KEY,
+                help=(
+                    "Cap the number of manifests from the start point — use a "
+                    "small value for a smoke batch, or a token-sized chunk "
+                    "(e.g. ~1500) so a long load finishes before the token "
+                    "expires."
+                ),
+            )
+            or 0
+        )
+    offset = max(start_at - 1, 0)
+    manifests = list_part_manifests(part, limit=limit, offset=offset)
 
     kind_note = (
         "uploads each file blob, then submits"
         if part.is_work_product
         else "submits list-section manifests"
     )
+    end_at = offset + len(manifests)
     st.caption(
-        f"**{len(manifests)}** of {part.manifest_count} manifest(s) — "
-        f"{kind_note}. ACL/legal below are **overwritten** onto every record "
-        "(the vendor manifests ship placeholder groups)."
+        f"**{len(manifests)}** manifest(s) — #{start_at}–{end_at} of "
+        f"{part.manifest_count}. {kind_note}. ACL/legal below are "
+        "**overwritten** onto every record (the vendor manifests ship "
+        "placeholder groups)."
     )
 
     _render_input_form(
@@ -528,6 +553,7 @@ def _ensure_page_defaults() -> None:
     st.session_state.setdefault(BULK_LOAD_PREFIX_KEY, "")
     st.session_state.setdefault(DOWNLOAD_ROOT_KEY, "")
     st.session_state.setdefault(DOWNLOAD_LIMIT_KEY, 0)
+    st.session_state.setdefault(DOWNLOAD_OFFSET_KEY, 1)
     st.session_state.setdefault(DOWNLOAD_LEGAL_TAG_KEY, "")
     st.session_state.setdefault(DOWNLOAD_ACL_OWNERS_KEY, "")
     st.session_state.setdefault(DOWNLOAD_ACL_VIEWERS_KEY, "")

@@ -84,3 +84,19 @@ def test_list_part_manifests_limit(tmp_path: Path) -> None:
     assert len(list_part_manifests(well)) == 3
     assert len(list_part_manifests(well, limit=2)) == 2
     assert len(list_part_manifests(well, limit=0)) == 3
+
+
+def test_list_part_manifests_offset_resumes(tmp_path: Path) -> None:
+    root = _build_download(tmp_path)
+    well = next(
+        p for p in discover_parts(root) if p.key == "master-data/Wellbore"
+    )
+    full = list_part_manifests(well)
+    assert len(full) == 3
+
+    # offset skips from the start (0-based); combined with limit it slices.
+    assert list_part_manifests(well, offset=1) == full[1:]
+    assert list_part_manifests(well, offset=2) == full[2:]
+    assert list_part_manifests(well, offset=1, limit=1) == full[1:2]
+    # offset past the end yields nothing (idempotent no-op).
+    assert list_part_manifests(well, offset=99) == []

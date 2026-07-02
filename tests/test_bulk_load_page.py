@@ -2009,13 +2009,20 @@ def _patch_download_discovery(
     part: Any,
     manifests: list[Path],
 ) -> dict[str, list[Any]]:
-    spy: dict[str, list[Any]] = {"wp": [], "list": []}
+    spy: dict[str, list[Any]] = {"wp": [], "list": [], "manifests": []}
 
     monkeypatch.setattr(
         page_module, "discover_parts", lambda root: [part]
     )
+
+    def fake_list_part_manifests(
+        p: Any, *, limit: int = 0, offset: int = 0
+    ) -> list[Path]:
+        spy["manifests"].append({"limit": limit, "offset": offset})
+        return list(manifests)
+
     monkeypatch.setattr(
-        page_module, "list_part_manifests", lambda p, limit=0: list(manifests)
+        page_module, "list_part_manifests", fake_list_part_manifests
     )
 
     def fake_wp(paths: Any, **kwargs: Any) -> Iterator[SubmitResult]:
@@ -2104,6 +2111,43 @@ def test_download_tab_loads_list_tier_with_overwrite(
     assert paths == manifests
     assert kwargs["section"] == "MasterData"
     assert kwargs["overwrite_acl_legal"] is True
+
+
+def test_download_tab_forwards_start_offset(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The 'Start at #' field resumes a load via list_part_manifests offset."""
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+    # The recorder's number_input resolves by label.
+    streamlit_recorder.widget_values["Start at manifest # (1 = first)"] = 1737
+    streamlit_recorder.button_responses[DOWNLOAD_LOAD_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+    part = page_module.DownloadedPart(
+        key="master-data/Well",
+        label="master-data / Well (4947)",
+        kind="master-data",
+        section="MasterData",
+        is_work_product=False,
+        manifest_dir=tmp_path / "md",
+        manifest_count=4947,
+        datasets_root=tmp_path / "datasets",
+    )
+    spy = _patch_download_discovery(
+        page_module,
+        monkeypatch,
+        part=part,
+        manifests=[tmp_path / "md" / "w.json"],
+    )
+
+    page_module.main()
+
+    assert spy["manifests"], "list_part_manifests should be called"
+    # start_at 1737 -> 0-based offset 1736.
+    assert any(m["offset"] == 1736 for m in spy["manifests"])
 
 
 def test_download_tab_results_section_no_duplicate_keys(
