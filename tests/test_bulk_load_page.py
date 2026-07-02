@@ -2106,6 +2106,55 @@ def test_download_tab_loads_list_tier_with_overwrite(
     assert kwargs["overwrite_acl_legal"] is True
 
 
+def test_download_tab_results_section_no_duplicate_keys(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Both tabs render the results/ingestion-status section without a
+    StreamlitDuplicateElementKey collision (regression)."""
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+    streamlit_recorder.session_state[SUBMIT_RESULTS_KEY] = [
+        _submit_row("load_a.json", ok=True, run_id="run-xyz"),
+    ]
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    tno = _tno_descriptor(tmp_path)
+    # datasets=[tno] so the Registered Datasets tab renders its own results
+    # section too, exercising the cross-tab key collision.
+    _patch_service(page_module, monkeypatch, datasets=[tno])
+
+    part = page_module.DownloadedPart(
+        key="work-products/documents",
+        label="work-products / documents (9)",
+        kind="work-products",
+        section=None,
+        is_work_product=True,
+        manifest_dir=tmp_path / "wp",
+        manifest_count=9,
+        datasets_root=tmp_path / "datasets",
+    )
+    _patch_download_discovery(
+        page_module,
+        monkeypatch,
+        part=part,
+        manifests=[tmp_path / "wp" / "a.json"],
+    )
+
+    # Must not raise StreamlitDuplicateElementKey.
+    page_module.main()
+
+    status_button_keys = {
+        call.kwargs.get("key")
+        for call in streamlit_recorder.calls_named("button")
+        if str(call.kwargs.get("key", "")).startswith("bulk_run_status_button")
+    }
+    assert status_button_keys == {
+        "bulk_run_status_button",
+        "bulk_run_status_button_dl",
+    }
+
+
 def test_download_tab_unknown_root_warns(
     streamlit_recorder: StreamlitRecorder,
     monkeypatch: pytest.MonkeyPatch,

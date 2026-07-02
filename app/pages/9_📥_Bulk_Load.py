@@ -309,7 +309,7 @@ def _render_downloaded_dataset_tab(connection: ADMEConnection) -> None:
     operator's download root, uploads work-product blobs, and overwrites the
     placeholder ACL/legal the vendor manifests ship with.
     """
-    _render_sticky_error()
+    _render_sticky_error(key_suffix="_dl")
     st.markdown(
         "Load a **downloaded** dataset (e.g. TNO or Volve from the Azure "
         "`osdu-data-load-tno` tool) directly from a local folder. Point at "
@@ -403,7 +403,7 @@ def _render_downloaded_dataset_tab(connection: ADMEConnection) -> None:
     if clicked:
         _run_download_load(connection, part, manifests)
 
-    _render_results_section(connection)
+    _render_results_section(connection, key_suffix="_dl")
 
 
 def _download_disabled_reason(manifests: Sequence[Path]) -> str | None:
@@ -673,12 +673,12 @@ def _clear_sticky_error() -> None:
     st.session_state[BULK_LAST_ERROR_KEY] = None
 
 
-def _render_sticky_error() -> None:
+def _render_sticky_error(key_suffix: str = "") -> None:
     message = st.session_state.get(BULK_LAST_ERROR_KEY)
     if not message:
         return
     st.error(message)
-    if st.button(DISMISS_BUTTON_LABEL, key="bulk_dismiss_error"):
+    if st.button(DISMISS_BUTTON_LABEL, key=f"bulk_dismiss_error{key_suffix}"):
         _clear_sticky_error()
         st.rerun()
 
@@ -1180,7 +1180,9 @@ def _render_submit_row(result: SubmitResult) -> None:
         )
 
 
-def _render_results_section(connection: ADMEConnection) -> None:
+def _render_results_section(
+    connection: ADMEConnection, *, key_suffix: str = ""
+) -> None:
     """Render the persistent summary of the last submit batch."""
     results: list[SubmitResult] = st.session_state.get(
         BULK_SUBMIT_RESULTS_KEY, []
@@ -1227,7 +1229,7 @@ def _render_results_section(connection: ADMEConnection) -> None:
     )
     st.dataframe(frame, use_container_width=True, hide_index=True)
 
-    _render_ingestion_status_section(connection)
+    _render_ingestion_status_section(connection, key_suffix=key_suffix)
 
 
 # ---------------------------------------------------------------------------
@@ -1253,7 +1255,9 @@ def _workflow_state_label(status: WorkflowStatus) -> str:
     return "unknown"
 
 
-def _render_ingestion_status_section(connection: ADMEConnection) -> None:
+def _render_ingestion_status_section(
+    connection: ADMEConnection, *, key_suffix: str = ""
+) -> None:
     """Render the per-run ingestion status with a manual refresh.
 
     A successful *submit* only means each manifest was accepted and a
@@ -1276,7 +1280,7 @@ def _render_ingestion_status_section(connection: ADMEConnection) -> None:
 
     if st.button(
         RUN_STATUS_BUTTON_LABEL,
-        key="bulk_run_status_button",
+        key=f"bulk_run_status_button{key_suffix}",
         help="Polls the Workflow Service status for each submitted run id.",
     ):
         _check_ingestion_status(connection, run_ids)
