@@ -22,6 +22,8 @@ import io
 import json
 import sys
 import tempfile
+import time
+import uuid
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -59,6 +61,16 @@ from app.services.auth import (  # noqa: E402
     RefreshingTokenProvider,
     acquire_cli_token,
     get_token,
+)
+from app.services.background_jobs import (  # noqa: E402
+    STATUS_ABORTED,
+    STATUS_ERROR,
+    STATUS_RUNNING,
+    LoadJob,
+    clear_job,
+    get_job,
+    request_abort,
+    start_job,
 )
 from app.services.bulk_ingestion import (  # noqa: E402
     MAX_QUEUE_SIZE,
@@ -120,6 +132,10 @@ DOWNLOAD_PART_KEY = "bulk_download_part"  # int — selected part index
 DOWNLOAD_LIMIT_KEY = "bulk_download_limit"  # int — manifest cap (0 = all)
 DOWNLOAD_OFFSET_KEY = "bulk_download_offset"  # int — 1-based start manifest #
 DOWNLOAD_AUTO_REFRESH_KEY = "bulk_dl_auto_refresh"  # bool — az CLI token refresh
+DOWNLOAD_JOB_ID_KEY = "bulk_dl_job_id"  # str — active background load job id
+
+# Seconds between background-load progress polls (page reruns).
+_JOB_POLL_SECONDS = 1.5
 # Distinct ACL/legal/prefix widget keys so the download tab's inputs don't
 # collide with the Registered Datasets tab (both render in the same run).
 DOWNLOAD_LEGAL_TAG_KEY = "bulk_dl_legal_tag"
@@ -442,9 +458,9 @@ def _render_downloaded_dataset_tab(connection: ADMEConnection) -> None:
         st.caption(f"⏸️ {reason}")
 
     if clicked:
-        _run_download_load(connection, part, manifests)
+        _start_download_job(connection, part, manifests)
 
-    _render_results_section(connection, key_suffix="_dl")
+    _render_download_job_status()
 
 
 def _download_disabled_reason(manifests: Sequence[Path]) -> str | None:
@@ -460,12 +476,17 @@ def _download_disabled_reason(manifests: Sequence[Path]) -> str | None:
     return None
 
 
-def _run_download_load(
+def _start_download_job(
     connection: ADMEConnection,
     part: DownloadedPart,
     manifests: Sequence[Path],
 ) -> None:
-    """Stream a downloaded-dataset load (list tier or work-products)."""
+    """Kick off a downloaded-dataset load on a background thread.
+
+    Running off the Streamlit script thread means the load keeps going even
+    if the operator switches tabs or pages — progress is read back from the
+    :mod:`app.services.background_jobs` registry on each render.
+    """
     _clear_sticky_error()
     token = _acquire_token(connection)
     if token is None:
@@ -493,29 +514,12 @@ def _run_download_load(
             return
         token_provider = provider
 
-    total = len(manifests)
-    results: list[SubmitResult] = []
+    manifest_list = list(manifests)
 
-    st.write(f"Loading {total} manifest(s) from **{part.label}**…")
-    if load_prefix and part.is_work_product:
-        st.caption(
-            f"🔁 Independent copy — master-data references prefixed with "
-            f"`{load_prefix}`. The matching master-data must have been loaded "
-            "under the same prefix."
-        )
-    st.session_state[BULK_ABORT_KEY] = False
-    st.button(
-        "⏹️ Abort",
-        key="bulk_download_abort_btn",
-        on_click=_set_bulk_abort,
-        help="Stop after the current manifest finishes.",
-    )
-
-    aborted = False
-    try:
+    def work(job: LoadJob) -> None:
         if part.is_work_product:
             iterator = submit_work_products(
-                manifests,
+                manifest_list,
                 datasets_root=part.datasets_root,
                 acl_owners=acl_owners,
                 acl_viewers=acl_viewers,
@@ -528,7 +532,7 @@ def _run_download_load(
             )
         else:
             iterator = submit_manifest_paths(
-                manifests,
+                manifest_list,
                 section=part.section or "ReferenceData",
                 acl_owners=acl_owners,
                 acl_viewers=acl_viewers,
@@ -540,31 +544,83 @@ def _run_download_load(
                 overwrite_acl_legal=True,
                 token_provider=token_provider,
             )
-
-        for index, result in enumerate(iterator, start=1):
-            results.append(result)
-            st.session_state[BULK_SUBMIT_RESULTS_KEY] = list(results)
-            st.write(f"**{index} of {total}** — `{result.filename}`")
-            _render_submit_row(result)
-            if st.session_state.get(BULK_ABORT_KEY):
-                aborted = True
+        for result in iterator:
+            job.record(result)
+            if job.aborting:
                 break
-    except ValueError as exc:
-        _set_sticky_error(f"Load aborted: {exc}")
-        st.session_state[BULK_SUBMIT_RESULTS_KEY] = results
-        st.rerun()
+
+    job_id = f"dl-{part.key}-{uuid.uuid4().hex[:8]}"
+    start_job(job_id, label=part.label, total=len(manifest_list), work=work)
+    st.session_state[DOWNLOAD_JOB_ID_KEY] = job_id
+    st.rerun()
+
+
+def _clear_download_job(job_id: str) -> None:
+    clear_job(job_id)
+    st.session_state[DOWNLOAD_JOB_ID_KEY] = None
+
+
+def _render_download_job_status() -> None:
+    """Render the active background load's progress (survives navigation)."""
+    job_id = st.session_state.get(DOWNLOAD_JOB_ID_KEY)
+    if not job_id:
         return
-    except Exception as exc:  # noqa: BLE001 - operator-safe summary
-        _set_sticky_error(
-            f"Unexpected error during load: {type(exc).__name__}: {exc}"
-        )
-        st.session_state[BULK_SUBMIT_RESULTS_KEY] = results
-        st.rerun()
+    job = get_job(job_id)
+    if job is None:
+        st.session_state[DOWNLOAD_JOB_ID_KEY] = None
         return
 
-    st.session_state[BULK_SUBMIT_RESULTS_KEY] = results
-    if aborted:
-        st.warning(f"⏹️ Aborted after {len(results)} of {total} manifests.")
+    snap = job.snapshot()
+    st.subheader("Load progress")
+    fraction = snap.submitted / snap.total if snap.total else 0.0
+    st.progress(min(max(fraction, 0.0), 1.0))
+    st.caption(
+        f"**{snap.submitted} of {snap.total}** — ✅ {snap.succeeded} · "
+        f"❌ {snap.failed} — {snap.label}"
+    )
+
+    if snap.status == STATUS_RUNNING:
+        st.info(
+            "⏳ Running in the background — you can switch tabs or pages and "
+            "it will keep going. Come back here to watch progress."
+        )
+        st.button(
+            "⏹️ Abort",
+            key="bulk_dl_job_abort",
+            on_click=request_abort,
+            args=(job_id,),
+            help="Stop after the current manifest finishes.",
+        )
+    elif snap.status == STATUS_ERROR:
+        st.error(f"Load failed: {snap.error}")
+    elif snap.status == STATUS_ABORTED:
+        st.warning(
+            f"⏹️ Aborted after {snap.submitted} of {snap.total} manifests."
+        )
+    elif snap.failed:
+        st.warning(
+            f"Finished — {snap.succeeded} succeeded, {snap.failed} failed."
+        )
+    else:
+        st.success(
+            f"✅ Finished — {snap.succeeded} of {snap.total} submitted."
+        )
+
+    for result in snap.recent:
+        _render_submit_row(result)
+
+    if snap.status == STATUS_RUNNING:
+        # Poll for live progress. The worker thread keeps running regardless,
+        # so navigating away simply pauses these updates until you return.
+        time.sleep(_JOB_POLL_SECONDS)
+        st.rerun()
+    else:
+        st.button(
+            "Clear",
+            key="bulk_dl_job_clear",
+            on_click=_clear_download_job,
+            args=(job_id,),
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -584,6 +640,7 @@ def _ensure_page_defaults() -> None:
     st.session_state.setdefault(DOWNLOAD_LIMIT_KEY, 0)
     st.session_state.setdefault(DOWNLOAD_OFFSET_KEY, 1)
     st.session_state.setdefault(DOWNLOAD_AUTO_REFRESH_KEY, False)
+    st.session_state.setdefault(DOWNLOAD_JOB_ID_KEY, None)
     st.session_state.setdefault(DOWNLOAD_LEGAL_TAG_KEY, "")
     st.session_state.setdefault(DOWNLOAD_ACL_OWNERS_KEY, "")
     st.session_state.setdefault(DOWNLOAD_ACL_VIEWERS_KEY, "")

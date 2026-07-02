@@ -23,6 +23,7 @@ from app.models.osdu import (
     SchemaField,
     SubmitResult,
 )
+from app.services import background_jobs as bj_module
 from tests.support.streamlit_recorder import StreamlitRecorder
 
 BULK_LOAD_PAGE_PATH = (
@@ -2012,6 +2013,11 @@ def _patch_download_discovery(
 ) -> dict[str, list[Any]]:
     spy: dict[str, list[Any]] = {"wp": [], "list": [], "manifests": []}
 
+    # Run background load jobs inline so the load is observable within the
+    # single test render, and start from a clean registry.
+    bj_module.reset()
+    monkeypatch.setattr(bj_module, "_RUN_SYNC", True)
+
     monkeypatch.setattr(
         page_module, "discover_parts", lambda root: [part]
     )
@@ -2155,6 +2161,46 @@ def test_download_tab_auto_refresh_passes_token_provider(
     assert kwargs["token_provider"] is not None
 
 
+def test_download_tab_starts_background_job_and_renders_progress(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Clicking Load starts a background job (id stored) and its progress
+    renders — the load runs off the render path so navigation can't kill it."""
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+    streamlit_recorder.button_responses[DOWNLOAD_LOAD_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+
+    part = page_module.DownloadedPart(
+        key="work-products/documents",
+        label="work-products / documents (9)",
+        kind="work-products",
+        section=None,
+        is_work_product=True,
+        manifest_dir=tmp_path / "wp",
+        manifest_count=9,
+        datasets_root=tmp_path / "datasets",
+    )
+    spy = _patch_download_discovery(
+        page_module,
+        monkeypatch,
+        part=part,
+        manifests=[tmp_path / "wp" / "a.json"],
+    )
+
+    page_module.main()
+
+    job_id = streamlit_recorder.session_state.get("bulk_dl_job_id")
+    assert job_id, "a background job id should be stored"
+    snap = bj_module.get_job(job_id).snapshot()
+    assert snap.status == bj_module.STATUS_DONE
+    assert snap.submitted == 1
+    assert spy["wp"], "the loader ran inside the background job"
+
+
 def test_download_tab_no_auto_refresh_passes_none_provider(
     streamlit_recorder: StreamlitRecorder,
     monkeypatch: pytest.MonkeyPatch,
@@ -2266,15 +2312,15 @@ def test_download_tab_results_section_no_duplicate_keys(
     # Must not raise StreamlitDuplicateElementKey.
     page_module.main()
 
+    # The Registered Datasets tab still renders its ingestion-status button;
+    # the Downloaded Dataset tab now shows a background-job panel instead, so
+    # there is exactly one such button (no cross-tab collision).
     status_button_keys = {
         call.kwargs.get("key")
         for call in streamlit_recorder.calls_named("button")
         if str(call.kwargs.get("key", "")).startswith("bulk_run_status_button")
     }
-    assert status_button_keys == {
-        "bulk_run_status_button",
-        "bulk_run_status_button_dl",
-    }
+    assert status_button_keys == {"bulk_run_status_button"}
 
 
 def test_download_tab_unknown_root_warns(
