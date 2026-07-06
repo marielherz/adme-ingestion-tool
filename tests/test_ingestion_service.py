@@ -17,12 +17,14 @@ from app.models.osdu import (
 from app.services import ingestion as ingestion_module
 from app.services.ingestion import (
     INGESTION_TIMEOUT_SECONDS,
-    LEGAL_TAGS_PATH,
+    STORAGE_MAX_RECORDS_PER_CALL,
+    STORAGE_RECORDS_PATH,
     TNO_SAMPLE_MANIFEST,
     WORKFLOW_INGEST_RUN_PATH,
     WORKFLOW_RUN_STATUS_PATH_TEMPLATE,
     check_legal_tag,
     get_workflow_status,
+    put_records,
     submit_manifest,
     substitute_manifest_placeholders,
     validate_manifest_json,
@@ -94,6 +96,20 @@ def _patch_post(
         return response_factory(**kwargs)
 
     monkeypatch.setattr(ingestion_module.requests, "post", fake_post)
+    return captured
+
+
+def _patch_put(
+    monkeypatch: pytest.MonkeyPatch,
+    response_factory: Any,
+) -> list[dict[str, Any]]:
+    captured: list[dict[str, Any]] = []
+
+    def fake_put(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+        return response_factory(**kwargs)
+
+    monkeypatch.setattr(ingestion_module.requests, "put", fake_put)
     return captured
 
 
@@ -769,6 +785,131 @@ def test_submit_manifest_connection_error(
     assert result.ok is False
     assert result.http_status is None
     assert "ConnectionError" in (result.error_message or "")
+
+
+# ---------------------------------------------------------------------------
+# put_records (Storage API PUT /records)
+# ---------------------------------------------------------------------------
+
+
+def _storage_record(record_id: str = "opendes:master-data--Well:1") -> dict[str, Any]:
+    return {
+        "id": record_id,
+        "kind": "osdu:wks:master-data--Well:1.0.0",
+        "acl": {"owners": ["o@x"], "viewers": ["v@x"]},
+        "legal": {
+            "legaltags": ["opendes-public-usa-dataset"],
+            "otherRelevantDataCountries": ["US"],
+        },
+        "data": {"FacilityName": "W1"},
+    }
+
+
+def test_put_records_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    records = [_storage_record("opendes:master-data--Well:1")]
+    captured = _patch_put(
+        monkeypatch,
+        lambda **_: _FakeResponse(
+            status_code=201,
+            headers={"correlation-id": "corr-put-1"},
+            json_payload={
+                "recordCount": 1,
+                "recordIds": ["opendes:master-data--Well:1"],
+                "skippedRecordIds": [],
+            },
+        ),
+    )
+
+    result = put_records(_connection(), token="t", records=records)
+
+    assert result.ok is True
+    assert result.http_status == 201
+    assert result.record_count == 1
+    assert result.record_ids == ["opendes:master-data--Well:1"]
+    assert result.skipped_record_ids == []
+    assert result.error_message is None
+    assert result.correlation_id == "corr-put-1"
+    # The PUT targets the Storage records endpoint with the records array.
+    assert captured[0]["url"].endswith(STORAGE_RECORDS_PATH)
+    assert captured[0]["json"] == records
+
+
+def test_put_records_surfaces_skipped_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_put(
+        monkeypatch,
+        lambda **_: _FakeResponse(
+            status_code=200,
+            json_payload={
+                "recordCount": 1,
+                "recordIds": ["opendes:master-data--Well:1"],
+                "skippedRecordIds": ["opendes:master-data--Well:2"],
+            },
+        ),
+    )
+
+    result = put_records(
+        _connection(),
+        token="t",
+        records=[_storage_record("opendes:master-data--Well:1")],
+    )
+
+    assert result.ok is True
+    assert result.skipped_record_ids == ["opendes:master-data--Well:2"]
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 409, 500])
+def test_put_records_http_errors(
+    monkeypatch: pytest.MonkeyPatch, status_code: int
+) -> None:
+    _patch_put(
+        monkeypatch,
+        lambda **_: _FakeResponse(
+            status_code=status_code,
+            json_payload={"message": f"boom {status_code}"},
+        ),
+    )
+
+    result = put_records(
+        _connection(), token="t", records=[_storage_record()]
+    )
+
+    assert result.ok is False
+    assert result.http_status == status_code
+    assert result.record_ids == []
+    assert f"boom {status_code}" in (result.error_message or "")
+
+
+def test_put_records_rejects_empty_list() -> None:
+    with pytest.raises(ValueError, match="non-empty list"):
+        put_records(_connection(), token="t", records=[])
+
+
+def test_put_records_rejects_over_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = [
+        _storage_record(f"opendes:master-data--Well:{i}")
+        for i in range(STORAGE_MAX_RECORDS_PER_CALL + 1)
+    ]
+    with pytest.raises(ValueError, match="at most"):
+        put_records(_connection(), token="t", records=records)
+
+
+def test_put_records_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_put(**_: Any) -> Any:
+        raise requests.exceptions.Timeout("slow")
+
+    monkeypatch.setattr(ingestion_module.requests, "put", fake_put)
+
+    result = put_records(
+        _connection(), token="t", records=[_storage_record()]
+    )
+
+    assert result.ok is False
+    assert result.http_status is None
+    assert "timed out" in (result.error_message or "").lower()
 
 
 def test_submit_manifest_outgoing_headers(

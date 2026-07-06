@@ -17,6 +17,7 @@ import pytest
 from app.models.connection import ADMEConnection, AuthMethod
 from app.models.osdu import (
     ManifestPreview,
+    StorageRecordsResult,
     SubmitResult,
     WorkflowRunResult,
     WorkflowStatus,
@@ -893,3 +894,247 @@ def test_substitute_partition_blank_is_noop_deep_copy() -> None:
 
 def test_substitute_partition_is_exported() -> None:
     assert "substitute_partition" in bulk_loader.__all__
+
+
+# ---------------------------------------------------------------------------
+# Storage-API load path (put_records / submit_records_from_paths)
+# ---------------------------------------------------------------------------
+
+
+def _write_records_manifest(
+    directory: Path, name: str, section: str, count: int, *, start: int = 0
+) -> Path:
+    records = [
+        {
+            "id": f"osdu:master-data--Well:{start + i}",
+            "kind": "osdu:wks:master-data--Well:1.0.0",
+            "data": {"FacilityName": f"W{start + i}"},
+            "acl": {"owners": [], "viewers": []},
+            "legal": {"legaltags": [], "otherRelevantDataCountries": []},
+        }
+        for i in range(count)
+    ]
+    body = {"kind": "osdu:wks:Manifest:1.0.0", section: records}
+    path = directory / name
+    path.write_text(json.dumps(body), encoding="utf-8")
+    return path
+
+
+def _ok_storage(record_ids: list[str]) -> StorageRecordsResult:
+    return StorageRecordsResult(
+        ok=True,
+        http_status=201,
+        record_count=len(record_ids),
+        record_ids=record_ids,
+        skipped_record_ids=[],
+        error_message=None,
+        correlation_id=None,
+        latency_ms=1.0,
+    )
+
+
+def test_extract_section_records_returns_dicts_only() -> None:
+    body = {
+        "MasterData": [
+            {"id": "a", "kind": "k"},
+            "not-a-dict",
+            {"id": "b", "kind": "k"},
+        ]
+    }
+    records = bulk_loader.extract_section_records(body, "MasterData")
+    assert [r["id"] for r in records] == ["a", "b"]
+    assert bulk_loader.extract_section_records(body, "Missing") == []
+
+
+def test_chunk_records_respects_batch_size() -> None:
+    records = [{"id": str(i)} for i in range(5)]
+    batches = list(bulk_loader.chunk_records(records, 2))
+    assert [len(b) for b in batches] == [2, 2, 1]
+
+
+def test_chunk_records_clamps_batch_size() -> None:
+    records = [{"id": str(i)} for i in range(3)]
+    # Below 1 clamps to 1 (one record per batch).
+    assert [len(b) for b in bulk_loader.chunk_records(records, 0)] == [1, 1, 1]
+    # Above 500 clamps to 500 (all three fit in one batch).
+    assert [len(b) for b in bulk_loader.chunk_records(records, 999)] == [3]
+
+
+def test_count_section_records_sums_across_files(tmp_path: Path) -> None:
+    p1 = _write_records_manifest(tmp_path, "a.json", "MasterData", 3)
+    p2 = _write_records_manifest(tmp_path, "b.json", "MasterData", 2, start=3)
+    missing = tmp_path / "nope.json"
+    assert bulk_loader.count_section_records([p1, p2, missing], "MasterData") == 5
+
+
+def test_submit_records_from_paths_batches_and_yields_per_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p1 = _write_records_manifest(tmp_path, "a.json", "MasterData", 3)
+    p2 = _write_records_manifest(tmp_path, "b.json", "MasterData", 2, start=3)
+
+    batches: list[list[dict[str, Any]]] = []
+
+    def fake_put(connection: Any, token: str, records: list[dict]):
+        batches.append(records)
+        return _ok_storage([r["id"] for r in records])
+
+    monkeypatch.setattr(bulk_loader, "put_records", fake_put)
+
+    results = list(
+        bulk_loader.submit_records_from_paths(
+            [p1, p2],
+            section="MasterData",
+            acl_owners=["o@x"],
+            acl_viewers=["v@x"],
+            legal_tag="lt",
+            data_partition_id="opendes",
+            connection=_connection(),
+            token="tok",
+            batch_size=2,
+        )
+    )
+
+    # 5 records across two files -> batches of 2, 2, 1 (streamed across files).
+    assert [len(b) for b in batches] == [2, 2, 1]
+    # One SubmitResult per record, all successful.
+    assert len(results) == 5
+    assert all(r.status == "success" for r in results)
+    assert {r.record_id for r in results} == {
+        f"opendes:master-data--Well:{i}" for i in range(5)
+    }
+
+
+def test_submit_records_from_paths_applies_partition_and_legal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_records_manifest(tmp_path, "a.json", "MasterData", 1)
+    seen: list[dict[str, Any]] = []
+
+    def fake_put(connection: Any, token: str, records: list[dict]):
+        seen.extend(records)
+        return _ok_storage([r["id"] for r in records])
+
+    monkeypatch.setattr(bulk_loader, "put_records", fake_put)
+
+    list(
+        bulk_loader.submit_records_from_paths(
+            [path],
+            section="MasterData",
+            acl_owners=["owner@x"],
+            acl_viewers=["viewer@x"],
+            legal_tag="opendes-legal",
+            data_partition_id="opendes",
+            connection=_connection(),
+            token="tok",
+            overwrite_acl_legal=True,
+        )
+    )
+
+    record = seen[0]
+    # Partition rewritten from osdu -> opendes on the record id.
+    assert record["id"] == "opendes:master-data--Well:0"
+    # ACL/legal stamped, including the required storage defaults.
+    assert record["acl"]["owners"] == ["owner@x"]
+    assert record["legal"]["legaltags"] == ["opendes-legal"]
+    assert record["legal"]["otherRelevantDataCountries"] == ["US"]
+    assert record["legal"]["status"] == "compliant"
+
+
+def test_submit_records_from_paths_bad_manifest_yields_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    good = _write_records_manifest(tmp_path, "good.json", "MasterData", 1)
+    bad = tmp_path / "bad.json"
+    bad.write_text("{ not json", encoding="utf-8")
+
+    monkeypatch.setattr(
+        bulk_loader,
+        "put_records",
+        lambda c, t, records: _ok_storage([r["id"] for r in records]),
+    )
+
+    results = list(
+        bulk_loader.submit_records_from_paths(
+            [bad, good],
+            section="MasterData",
+            acl_owners=["o@x"],
+            acl_viewers=["v@x"],
+            legal_tag="lt",
+            data_partition_id="opendes",
+            connection=_connection(),
+            token="tok",
+            batch_size=10,
+        )
+    )
+
+    statuses = {r.filename: r.status for r in results}
+    assert statuses["bad.json"] == "error"
+    assert statuses["good.json"] == "success"
+
+
+def test_submit_records_from_paths_batch_error_marks_all_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_records_manifest(tmp_path, "a.json", "MasterData", 2)
+
+    def fail_put(connection: Any, token: str, records: list[dict]):
+        return StorageRecordsResult(
+            ok=False,
+            http_status=400,
+            record_count=0,
+            record_ids=[],
+            skipped_record_ids=[],
+            error_message="validation error",
+            correlation_id=None,
+            latency_ms=1.0,
+        )
+
+    monkeypatch.setattr(bulk_loader, "put_records", fail_put)
+
+    results = list(
+        bulk_loader.submit_records_from_paths(
+            [path],
+            section="MasterData",
+            acl_owners=["o@x"],
+            acl_viewers=["v@x"],
+            legal_tag="lt",
+            data_partition_id="opendes",
+            connection=_connection(),
+            token="tok",
+            batch_size=10,
+        )
+    )
+
+    assert len(results) == 2
+    assert all(r.status == "error" for r in results)
+    assert all(r.error == "validation error" for r in results)
+
+
+def test_submit_records_from_paths_uses_token_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_records_manifest(tmp_path, "a.json", "MasterData", 1)
+    tokens: list[str] = []
+
+    def fake_put(connection: Any, token: str, records: list[dict]):
+        tokens.append(token)
+        return _ok_storage([r["id"] for r in records])
+
+    monkeypatch.setattr(bulk_loader, "put_records", fake_put)
+
+    list(
+        bulk_loader.submit_records_from_paths(
+            [path],
+            section="MasterData",
+            acl_owners=["o@x"],
+            acl_viewers=["v@x"],
+            legal_tag="lt",
+            data_partition_id="opendes",
+            connection=_connection(),
+            token="fixed",
+            token_provider=lambda: "refreshed",
+        )
+    )
+
+    assert tokens == ["refreshed"]

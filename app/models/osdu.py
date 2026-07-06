@@ -447,6 +447,26 @@ class SubmitResult:
 
 
 @dataclass(frozen=True, slots=True)
+class StorageRecordsResult:
+    """Outcome of one ``PUT /api/storage/v2/records`` batch call.
+
+    ``ok`` is True on a 2xx response. ``record_ids`` are the ids created
+    or updated; ``skipped_record_ids`` are those the service skipped
+    (e.g. an identical version already existed). ``error_message`` carries
+    a curated reason on failure.
+    """
+
+    ok: bool
+    http_status: int | None
+    record_count: int
+    record_ids: list[str]
+    skipped_record_ids: list[str]
+    error_message: str | None
+    correlation_id: str | None
+    latency_ms: float
+
+
+@dataclass(frozen=True, slots=True)
 class RunRow:
     """One row from ``workflow_runs`` in the local run-history DB.
 

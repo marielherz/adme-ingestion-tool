@@ -82,11 +82,14 @@ from app.services.bulk_ingestion import (  # noqa: E402
 )
 from app.services.bulk_loader import (  # noqa: E402
     DATA_ROOT,
+    DEFAULT_STORAGE_BATCH_SIZE,
+    STORAGE_MAX_RECORDS_PER_CALL,
     _clear_cache,
+    count_section_records,
     list_datasets,
     make_load_prefix,
     preview_tier,
-    submit_manifest_paths,
+    submit_records_from_paths,
     submit_tier,
 )
 from app.services.downloaded_dataset import (  # noqa: E402
@@ -133,6 +136,7 @@ DOWNLOAD_LIMIT_KEY = "bulk_download_limit"  # int — manifest cap (0 = all)
 DOWNLOAD_OFFSET_KEY = "bulk_download_offset"  # int — 1-based start manifest #
 DOWNLOAD_AUTO_REFRESH_KEY = "bulk_dl_auto_refresh"  # bool — az CLI token refresh
 DOWNLOAD_JOB_ID_KEY = "bulk_dl_job_id"  # str — active background load job id
+DOWNLOAD_BATCH_SIZE_KEY = "bulk_dl_batch_size"  # int — records per Storage PUT
 
 # Seconds between background-load progress polls (page reruns).
 _JOB_POLL_SECONDS = 1.5
@@ -416,7 +420,7 @@ def _render_downloaded_dataset_tab(connection: ADMEConnection) -> None:
     kind_note = (
         "uploads each file blob, then submits"
         if part.is_work_product
-        else "submits list-section manifests"
+        else "writes records via the Storage API (PUT /records)"
     )
     end_at = offset + len(manifests)
     st.caption(
@@ -444,6 +448,21 @@ def _render_downloaded_dataset_tab(connection: ADMEConnection) -> None:
             "expired'. Requires the Azure CLI installed and `az login`."
         ),
     )
+
+    if not part.is_work_product:
+        st.number_input(
+            "Records per Storage call (batch size)",
+            min_value=1,
+            max_value=STORAGE_MAX_RECORDS_PER_CALL,
+            step=1,
+            key=DOWNLOAD_BATCH_SIZE_KEY,
+            help=(
+                "List-section manifests load via the Storage API "
+                "`PUT /records`, which accepts up to "
+                f"{STORAGE_MAX_RECORDS_PER_CALL} records per call. Start "
+                "small for a smoke run, then raise it to load faster."
+            ),
+        )
 
     reason = _download_disabled_reason(manifests)
     is_disabled = reason is not None
@@ -515,6 +534,11 @@ def _start_download_job(
         token_provider = provider
 
     manifest_list = list(manifests)
+    section = part.section or "ReferenceData"
+    batch_size = int(
+        st.session_state.get(DOWNLOAD_BATCH_SIZE_KEY)
+        or DEFAULT_STORAGE_BATCH_SIZE
+    )
 
     def work(job: LoadJob) -> None:
         if part.is_work_product:
@@ -531,15 +555,16 @@ def _start_download_job(
                 token_provider=token_provider,
             )
         else:
-            iterator = submit_manifest_paths(
+            iterator = submit_records_from_paths(
                 manifest_list,
-                section=part.section or "ReferenceData",
+                section=section,
                 acl_owners=acl_owners,
                 acl_viewers=acl_viewers,
                 legal_tag=legal_tag,
                 data_partition_id=connection.data_partition_id,
                 connection=connection,
                 token=token,
+                batch_size=batch_size,
                 load_prefix=load_prefix,
                 overwrite_acl_legal=True,
                 token_provider=token_provider,
@@ -549,8 +574,15 @@ def _start_download_job(
             if job.aborting:
                 break
 
+    # Storage path reports per record, so the progress total is the record
+    # count (work-products stay per-manifest on the DAG path).
+    total = (
+        len(manifest_list)
+        if part.is_work_product
+        else count_section_records(manifest_list, section)
+    )
     job_id = f"dl-{part.key}-{uuid.uuid4().hex[:8]}"
-    start_job(job_id, label=part.label, total=len(manifest_list), work=work)
+    start_job(job_id, label=part.label, total=total, work=work)
     st.session_state[DOWNLOAD_JOB_ID_KEY] = job_id
     st.rerun()
 
@@ -641,6 +673,7 @@ def _ensure_page_defaults() -> None:
     st.session_state.setdefault(DOWNLOAD_OFFSET_KEY, 1)
     st.session_state.setdefault(DOWNLOAD_AUTO_REFRESH_KEY, False)
     st.session_state.setdefault(DOWNLOAD_JOB_ID_KEY, None)
+    st.session_state.setdefault(DOWNLOAD_BATCH_SIZE_KEY, DEFAULT_STORAGE_BATCH_SIZE)
     st.session_state.setdefault(DOWNLOAD_LEGAL_TAG_KEY, "")
     st.session_state.setdefault(DOWNLOAD_ACL_OWNERS_KEY, "")
     st.session_state.setdefault(DOWNLOAD_ACL_VIEWERS_KEY, "")

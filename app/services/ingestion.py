@@ -26,11 +26,12 @@ import requests  # type: ignore[import-untyped]
 from app.models.connection import ADMEConnection
 from app.models.osdu import (
     LegalTagCheckResult,
+    StorageRecordsResult,
     WorkflowRunResult,
     WorkflowStatus,
     parse_workflow_status,
 )
-from app.services.legal_tags import LEGAL_TAGS_PATH, LEGAL_TAG_VALIDATE_PATH
+from app.services.legal_tags import LEGAL_TAG_VALIDATE_PATH, LEGAL_TAGS_PATH
 
 logger = logging.getLogger(__name__)
 
@@ -48,10 +49,13 @@ __all__ = [
     "SAMPLE_PLACEHOLDER_LEGAL_TAG",
     "TNO_SAMPLE_DESCRIPTION",
     "TNO_SAMPLE_MANIFEST",
+    "STORAGE_MAX_RECORDS_PER_CALL",
+    "STORAGE_RECORDS_PATH",
     "WORKFLOW_INGEST_RUN_PATH",
     "WORKFLOW_RUN_STATUS_PATH_TEMPLATE",
     "check_legal_tag",
     "get_workflow_status",
+    "put_records",
     "submit_manifest",
     "substitute_manifest_placeholders",
     "validate_manifest_json",
@@ -63,6 +67,10 @@ WORKFLOW_INGEST_RUN_PATH = (
 WORKFLOW_RUN_STATUS_PATH_TEMPLATE = (
     "/api/workflow/v1/workflow/Osdu_ingest/workflowRun/{run_id}"
 )
+# OSDU Storage service: create-or-update records (PUT accepts up to 500
+# records per call). Used by the Storage-API bulk load path.
+STORAGE_RECORDS_PATH = "/api/storage/v2/records"
+STORAGE_MAX_RECORDS_PER_CALL = 500
 
 # Placeholder tokens substituted by ``substitute_manifest_placeholders``.
 SAMPLE_PLACEHOLDER_DATA_PARTITION_ID = "{{DATA_PARTITION_ID}}"
@@ -519,6 +527,70 @@ def submit_manifest(
     )
 
 
+def put_records(
+    connection: ADMEConnection,
+    token: str,
+    records: list[dict],
+) -> StorageRecordsResult:
+    """Create or update a batch of records via ``PUT /storage/v2/records``.
+
+    Bypasses the ingestion workflow/DAG entirely: the records are written
+    straight to the Storage service, which validates ACL/legal/schema and
+    persists them synchronously. ``records`` must already be storage-shaped
+    (``id``, ``kind``, ``acl``, ``legal``, ``data``) and number no more than
+    :data:`STORAGE_MAX_RECORDS_PER_CALL` (500). The Storage response body
+    (``recordCount`` / ``recordIds`` / ``skippedRecordIds``) is surfaced on
+    the result.
+    """
+    if not isinstance(records, list) or not records:
+        raise ValueError("A non-empty list of records is required.")
+    if len(records) > STORAGE_MAX_RECORDS_PER_CALL:
+        raise ValueError(
+            f"A single Storage call accepts at most "
+            f"{STORAGE_MAX_RECORDS_PER_CALL} records; got {len(records)}."
+        )
+
+    parsed_body, http_status, correlation_id, latency_ms, error_message = (
+        _call(
+            connection=connection,
+            token=token,
+            method="PUT",
+            path=STORAGE_RECORDS_PATH,
+            json_body=records,
+        )
+    )
+
+    body = parsed_body if isinstance(parsed_body, dict) else {}
+    record_ids_raw = body.get("recordIds")
+    record_ids = (
+        [r for r in record_ids_raw if isinstance(r, str)]
+        if isinstance(record_ids_raw, list)
+        else []
+    )
+    skipped_raw = body.get("skippedRecordIds")
+    skipped = (
+        [r for r in skipped_raw if isinstance(r, str)]
+        if isinstance(skipped_raw, list)
+        else []
+    )
+    count_raw = body.get("recordCount")
+    record_count = (
+        count_raw if isinstance(count_raw, int) else len(record_ids)
+    )
+    ok = http_status is not None and 200 <= http_status < 300
+
+    return StorageRecordsResult(
+        ok=ok,
+        http_status=http_status,
+        record_count=record_count,
+        record_ids=record_ids,
+        skipped_record_ids=skipped,
+        error_message=None if ok else error_message,
+        correlation_id=correlation_id,
+        latency_ms=latency_ms,
+    )
+
+
 def get_workflow_status(
     connection: ADMEConnection,
     token: str,
@@ -656,7 +728,7 @@ def _call(
     *,
     method: str,
     path: str,
-    json_body: dict | None,
+    json_body: dict | list | None,
 ) -> tuple[dict | str | None, int | None, str | None, float, str | None]:
     if not connection.is_valid():
         raise ValueError(
@@ -690,6 +762,14 @@ def _call(
             )
         elif method == "POST":
             response = requests.post(
+                url=url,
+                headers=headers,
+                json=json_body,
+                timeout=INGESTION_TIMEOUT_SECONDS,
+                allow_redirects=False,
+            )
+        elif method == "PUT":
+            response = requests.put(
                 url=url,
                 headers=headers,
                 json=json_body,

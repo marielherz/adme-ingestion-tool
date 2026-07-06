@@ -2041,7 +2041,10 @@ def _patch_download_discovery(
         yield from [_submit_row("a.json", ok=True, run_id="md-1")]
 
     monkeypatch.setattr(page_module, "submit_work_products", fake_wp)
-    monkeypatch.setattr(page_module, "submit_manifest_paths", fake_list)
+    monkeypatch.setattr(page_module, "submit_records_from_paths", fake_list)
+    monkeypatch.setattr(
+        page_module, "count_section_records", lambda paths, section: len(paths)
+    )
     return spy
 
 
@@ -2088,7 +2091,7 @@ def test_download_tab_loads_list_tier_with_overwrite(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A reference/master part calls submit_manifest_paths with overwrite."""
+    """A reference/master part calls submit_records_from_paths w/ overwrite."""
     _seed_download_inputs(streamlit_recorder, tmp_path)
     streamlit_recorder.button_responses[DOWNLOAD_LOAD_LABEL] = True
 
@@ -2112,12 +2115,13 @@ def test_download_tab_loads_list_tier_with_overwrite(
 
     page_module.main()
 
-    assert spy["list"], "submit_manifest_paths should be called"
+    assert spy["list"], "submit_records_from_paths should be called"
     assert spy["wp"] == []
     paths, kwargs = spy["list"][0]
     assert paths == manifests
     assert kwargs["section"] == "MasterData"
     assert kwargs["overwrite_acl_legal"] is True
+    assert kwargs["batch_size"] >= 1
 
 
 def test_download_tab_auto_refresh_passes_token_provider(

@@ -29,7 +29,11 @@ from app.models.osdu import (
     SubmitResult,
     WorkflowStatus,
 )
-from app.services.ingestion import submit_manifest
+from app.services.ingestion import (
+    STORAGE_MAX_RECORDS_PER_CALL,
+    put_records,
+    submit_manifest,
+)
 from app.services.run_history import (
     RUN_HISTORY_WRITE_ERRORS,
     record_workflow_finish,
@@ -41,22 +45,32 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DATASETS_ROOT",
     "DATA_ROOT",
+    "DEFAULT_STORAGE_BATCH_SIZE",
+    "STORAGE_MAX_RECORDS_PER_CALL",
     "SUBMIT_SOURCE",
     "apply_load_prefix",
     "apply_prefix_to_body",
     "build_prefix_id_map",
     "build_reference_prefix_map",
+    "chunk_records",
+    "count_section_records",
+    "extract_section_records",
     "inject_acl_and_legal",
     "list_datasets",
     "load_dataset",
     "make_load_prefix",
     "preview_tier",
     "submit_manifest_paths",
+    "submit_records_from_paths",
     "submit_tier",
     "substitute_partition",
 ]
 
 SUBMIT_SOURCE = "bulk_load"
+
+# Default batch size for the Storage-API load path. Small by default for a
+# smoke run; the operator can raise it toward STORAGE_MAX_RECORDS_PER_CALL.
+DEFAULT_STORAGE_BATCH_SIZE = 25
 
 # Default legal ``otherRelevantDataCountries`` stamped onto records that ship
 # with an empty list — OSDU Storage requires at least one. Matches the File
@@ -824,3 +838,212 @@ def submit_manifest_paths(
             except Exception:  # pragma: no cover - UI callback never fatal
                 logger.exception("bulk_loader progress_callback failed")
         yield result
+
+
+# ---------------------------------------------------------------------------
+# Storage-API load path (PUT /storage/v2/records) — bypasses the DAG
+# ---------------------------------------------------------------------------
+
+
+def extract_section_records(
+    manifest_body: dict[str, Any], section: str
+) -> list[dict[str, Any]]:
+    """Return the storage-shaped records from ``manifest_body[section]``.
+
+    The list-section manifests (``ReferenceData`` / ``MasterData``) hold
+    records already carrying ``id`` / ``kind`` / ``acl`` / ``legal`` /
+    ``data`` — exactly the Storage ``PUT /records`` shape. Non-dict entries
+    are dropped. Returns an empty list when the section is absent.
+    """
+    records = manifest_body.get(section)
+    if not isinstance(records, list):
+        return []
+    return [r for r in records if isinstance(r, dict)]
+
+
+def chunk_records(
+    records: Sequence[dict[str, Any]], batch_size: int
+) -> Iterator[list[dict[str, Any]]]:
+    """Yield ``records`` in lists of at most ``batch_size`` (>=1, <=500)."""
+    size = _clamp_batch_size(batch_size)
+    for start in range(0, len(records), size):
+        yield list(records[start : start + size])
+
+
+def _clamp_batch_size(batch_size: int) -> int:
+    """Clamp a requested batch size into ``[1, STORAGE_MAX_RECORDS_PER_CALL]``."""
+    if batch_size < 1:
+        return 1
+    if batch_size > STORAGE_MAX_RECORDS_PER_CALL:
+        return STORAGE_MAX_RECORDS_PER_CALL
+    return batch_size
+
+
+def count_section_records(
+    manifest_paths: Sequence[Path], section: str
+) -> int:
+    """Count storage records across ``manifest_paths`` for progress totals.
+
+    Best-effort: unreadable / malformed manifests contribute zero. Reads
+    each file once; the leading-token and prefix rewrites don't change the
+    record count, so this is a faithful denominator for the load.
+    """
+    total = 0
+    for manifest_path in manifest_paths:
+        try:
+            body = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(body, dict):
+            total += len(extract_section_records(body, section))
+    return total
+
+
+def submit_records_from_paths(
+    manifest_paths: Sequence[Path],
+    *,
+    section: str,
+    acl_owners: Sequence[str],
+    acl_viewers: Sequence[str],
+    legal_tag: str,
+    data_partition_id: str,
+    connection: ADMEConnection,
+    token: str,
+    batch_size: int = DEFAULT_STORAGE_BATCH_SIZE,
+    load_prefix: str = "",
+    overwrite_acl_legal: bool = False,
+    token_provider: Callable[[], str] | None = None,
+    progress_callback: Callable[[SubmitResult], None] | None = None,
+) -> Iterator[SubmitResult]:
+    """Load list-section manifests via the Storage API, yielding per record.
+
+    Storage counterpart to :func:`submit_manifest_paths`: instead of posting
+    each manifest to the ingestion DAG, it flattens the section's records
+    across all files, applies the same prefix / partition / ACL-legal
+    transforms, and writes them to ``PUT /storage/v2/records`` in batches of
+    at most ``batch_size`` (capped at 500). One :class:`SubmitResult` is
+    yielded per record so the UI keeps per-item progress; every record in a
+    batch shares that batch's success/error outcome.
+
+    Records are streamed: a batch is flushed as soon as ``batch_size`` are
+    buffered, so memory stays flat over large tiers. ``token_provider`` (when
+    given) is consulted once per batch so a long load survives token expiry.
+    A manifest that fails to read yields a single error result and the load
+    continues.
+    """
+    size = _clamp_batch_size(batch_size)
+
+    id_map: dict[tuple[str, str], str] = {}
+    if load_prefix.strip():
+        scanned: list[dict[str, Any]] = []
+        for manifest_path in manifest_paths:
+            try:
+                scanned_body = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(scanned_body, dict):
+                scanned.append(scanned_body)
+        id_map = build_prefix_id_map(
+            scanned, section=section, prefix=load_prefix
+        )
+
+    # Buffer of (record, origin_path) so each record's result names its file.
+    buffer: list[tuple[dict[str, Any], Path]] = []
+
+    def _flush() -> Iterator[SubmitResult]:
+        while len(buffer) >= size:
+            batch = buffer[:size]
+            del buffer[:size]
+            yield from _submit_batch(batch)
+
+    def _drain() -> Iterator[SubmitResult]:
+        if buffer:
+            batch = list(buffer)
+            buffer.clear()
+            yield from _submit_batch(batch)
+
+    def _submit_batch(
+        batch: list[tuple[dict[str, Any], Path]],
+    ) -> Iterator[SubmitResult]:
+        submitted_at = datetime.now(UTC)
+        records = [rec for rec, _ in batch]
+        status = "error"
+        error: str | None = None
+        try:
+            active_token = _resolve_active_token(token, token_provider)
+            result = put_records(connection, active_token, records)
+            if result.ok:
+                status = "success"
+            else:
+                error = (
+                    result.error_message
+                    or f"Storage returned HTTP {result.http_status}"
+                )
+        except ValueError as exc:
+            error = str(exc) or exc.__class__.__name__
+            logger.warning("Storage batch failed: %s", exc)
+
+        for record, origin in batch:
+            item = SubmitResult(
+                manifest_path=origin,
+                filename=origin.name,
+                status=status,
+                run_id=None,
+                record_id=(
+                    record.get("id") if isinstance(record.get("id"), str)
+                    else None
+                ),
+                error=error,
+                submitted_at=submitted_at,
+            )
+            if progress_callback is not None:
+                try:
+                    progress_callback(item)
+                except Exception:  # pragma: no cover - UI callback safe
+                    logger.exception("bulk_loader progress_callback failed")
+            yield item
+
+    for manifest_path in manifest_paths:
+        try:
+            body = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("manifest body is not a JSON object")
+            if id_map:
+                body = apply_prefix_to_body(body, id_map)
+            body = substitute_partition(body, data_partition_id)
+            shaped = inject_acl_and_legal(
+                body,
+                section=section,
+                acl_owners=acl_owners,
+                acl_viewers=acl_viewers,
+                legal_tag=legal_tag,
+                overwrite=overwrite_acl_legal,
+            )
+            for record in extract_section_records(shaped, section):
+                buffer.append((record, manifest_path))
+            yield from _flush()
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            error = str(exc) or exc.__class__.__name__
+            logger.warning(
+                "Manifest %s failed to load: %s", manifest_path, exc
+            )
+            item = SubmitResult(
+                manifest_path=manifest_path,
+                filename=manifest_path.name,
+                status="error",
+                run_id=None,
+                record_id=None,
+                error=error,
+                submitted_at=datetime.now(UTC),
+            )
+            if progress_callback is not None:
+                try:
+                    progress_callback(item)
+                except Exception:  # pragma: no cover - UI callback safe
+                    logger.exception("bulk_loader progress_callback failed")
+            yield item
+
+    yield from _drain()
+
