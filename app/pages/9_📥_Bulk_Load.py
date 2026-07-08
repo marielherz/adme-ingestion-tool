@@ -99,7 +99,12 @@ from app.services.downloaded_dataset import (  # noqa: E402
 )
 from app.services.entitlements import fetch_groups  # noqa: E402
 from app.services.ingestion import get_workflow_status, submit_manifest  # noqa: E402
+from app.services.interval_loader import (  # noqa: E402
+    plan_interval,
+    run_interval,
+)
 from app.services.legal_tags import list_legal_tags  # noqa: E402
+from app.services.load_progress import ResumableProgress  # noqa: E402
 from app.services.manifest_generator import (  # noqa: E402
     MappingError,
     SchemaNotFoundError,
@@ -146,6 +151,22 @@ DOWNLOAD_LEGAL_TAG_KEY = "bulk_dl_legal_tag"
 DOWNLOAD_ACL_OWNERS_KEY = "bulk_dl_acl_owners"
 DOWNLOAD_ACL_VIEWERS_KEY = "bulk_dl_acl_viewers"
 DOWNLOAD_LOAD_PREFIX_KEY = "bulk_dl_load_prefix"
+
+# --- Smart Tier interval-load session keys (the recommended one-click flow)
+SMART_ROOT_KEY = "smart_root"  # str — downloaded dataset root
+SMART_INTERVAL_KEY = "smart_interval_label"  # str — date prefix = interval clock
+SMART_INCLUDE_WP_KEY = "smart_include_wp"  # bool — also load work-products (DAG)
+SMART_BATCH_KEY = "smart_batch_size"  # int — Storage records per PUT
+SMART_AUTO_REFRESH_KEY = "smart_auto_refresh"  # bool — az CLI token refresh
+SMART_JOB_ID_KEY = "smart_job_id"  # str — active interval-load job id
+SMART_LEGAL_TAG_KEY = "smart_legal_tag"
+SMART_ACL_OWNERS_KEY = "smart_acl_owners"
+SMART_ACL_VIEWERS_KEY = "smart_acl_viewers"
+
+# Where per-interval resumable progress is persisted (survives restarts).
+_INTERVAL_PROGRESS_DIR = (
+    Path.home() / ".adme-ingestion-tool" / "interval_progress"
+)
 
 
 # --- Generate-from-CSV session-state keys (prefixed gen_) ----------------
@@ -242,9 +263,9 @@ def main() -> None:
     )
     st.title("📥 Bulk Load")
     st.markdown(
-        "Submit a registered OSDU dataset (reference-data, master-data, or "
-        "work-products) to your ADME instance, or generate manifests from a "
-        "CSV file. **v1 supports reference-data only.**"
+        "Load a downloaded OSDU dataset into your ADME instance. The "
+        "**Smart Tier Load** tab runs the whole dataset in the right order "
+        "with one click; **Advanced** holds the manual per-tier loaders."
     )
 
     ensure_session_defaults(st.session_state)
@@ -264,26 +285,43 @@ def main() -> None:
         f"Endpoint: `{connection.endpoint}`"
     )
 
-    tab_datasets, tab_download, tab_csv, tab_queue = st.tabs(
-        [
-            "📦 Registered Datasets",
-            "📂 Downloaded Dataset",
-            "📄 Generate from CSV",
-            "📋 Queue",
-        ]
+    tab_smart, tab_advanced = st.tabs(
+        ["🎯 Smart Tier Load", "🛠️ Advanced"]
     )
 
-    with tab_datasets:
-        _render_registered_datasets_tab(connection)
+    with tab_smart:
+        _render_smart_tier_tab(connection)
 
-    with tab_download:
-        _render_downloaded_dataset_tab(connection)
+    with tab_advanced:
+        st.caption(
+            "Manual loaders — prefer the **Smart Tier Load** tab, which runs "
+            "these tiers in the correct dependency order automatically."
+        )
+        (
+            adv_datasets,
+            adv_download,
+            adv_csv,
+            adv_queue,
+        ) = st.tabs(
+            [
+                "📦 Registered Datasets",
+                "📂 Downloaded Dataset",
+                "📄 Generate from CSV",
+                "📋 Queue",
+            ]
+        )
 
-    with tab_csv:
-        _render_csv_generation_tab(connection)
+        with adv_datasets:
+            _render_registered_datasets_tab(connection)
 
-    with tab_queue:
-        _render_queue_tab(connection)
+        with adv_download:
+            _render_downloaded_dataset_tab(connection)
+
+        with adv_csv:
+            _render_csv_generation_tab(connection)
+
+        with adv_queue:
+            _render_queue_tab(connection)
 
 
 def _render_registered_datasets_tab(connection: ADMEConnection) -> None:
@@ -587,19 +625,23 @@ def _start_download_job(
     st.rerun()
 
 
-def _clear_download_job(job_id: str) -> None:
+def _clear_background_job(job_id: str, job_id_key: str) -> None:
     clear_job(job_id)
-    st.session_state[DOWNLOAD_JOB_ID_KEY] = None
+    st.session_state[job_id_key] = None
 
 
-def _render_download_job_status() -> None:
-    """Render the active background load's progress (survives navigation)."""
-    job_id = st.session_state.get(DOWNLOAD_JOB_ID_KEY)
+def _render_job_panel(job_id_key: str, *, key_prefix: str) -> None:
+    """Render a background load's live progress (survives navigation).
+
+    Generic over the session key holding the job id and a widget-key prefix,
+    so both the Downloaded Dataset and Smart Tier flows share one renderer.
+    """
+    job_id = st.session_state.get(job_id_key)
     if not job_id:
         return
     job = get_job(job_id)
     if job is None:
-        st.session_state[DOWNLOAD_JOB_ID_KEY] = None
+        st.session_state[job_id_key] = None
         return
 
     snap = job.snapshot()
@@ -618,16 +660,16 @@ def _render_download_job_status() -> None:
         )
         st.button(
             "⏹️ Abort",
-            key="bulk_dl_job_abort",
+            key=f"{key_prefix}_abort",
             on_click=request_abort,
             args=(job_id,),
-            help="Stop after the current manifest finishes.",
+            help="Stop after the in-flight items finish.",
         )
     elif snap.status == STATUS_ERROR:
         st.error(f"Load failed: {snap.error}")
     elif snap.status == STATUS_ABORTED:
         st.warning(
-            f"⏹️ Aborted after {snap.submitted} of {snap.total} manifests."
+            f"⏹️ Aborted after {snap.submitted} of {snap.total} items."
         )
     elif snap.failed:
         st.warning(
@@ -649,10 +691,213 @@ def _render_download_job_status() -> None:
     else:
         st.button(
             "Clear",
-            key="bulk_dl_job_clear",
-            on_click=_clear_download_job,
-            args=(job_id,),
+            key=f"{key_prefix}_clear",
+            on_click=_clear_background_job,
+            args=(job_id, job_id_key),
         )
+
+
+def _render_download_job_status() -> None:
+    """Render the Downloaded Dataset background load's progress."""
+    _render_job_panel(DOWNLOAD_JOB_ID_KEY, key_prefix="bulk_dl_job")
+
+
+# ---------------------------------------------------------------------------
+# Smart Tier interval load (the recommended one-click flow)
+# ---------------------------------------------------------------------------
+
+
+def _smart_disabled_reason(plans: Sequence[Any]) -> str | None:
+    """Return why the Smart Tier load button is disabled, or ``None``."""
+    if not str(st.session_state.get(SMART_ROOT_KEY) or "").strip():
+        return "Enter the downloaded dataset root folder."
+    if not plans:
+        return "No loadable tiers found under that root."
+    if not str(st.session_state.get(SMART_LEGAL_TAG_KEY) or "").strip():
+        return "Select a legal tag."
+    if not str(st.session_state.get(SMART_ACL_OWNERS_KEY) or "").strip():
+        return "Fill ACL owners group."
+    if not str(st.session_state.get(SMART_ACL_VIEWERS_KEY) or "").strip():
+        return "Fill ACL viewers group."
+    return None
+
+
+def _render_smart_tier_tab(connection: ADMEConnection) -> None:
+    """One-click, dependency-ordered load of a whole dataset interval."""
+    _render_sticky_error()
+    st.markdown(
+        "Load an entire downloaded dataset as one **Smart Tier interval** — "
+        "reference-data → master-data → work-products, in dependency order, "
+        "each stamped with the interval label so it ages as an independent "
+        "copy. Reference/master-data load via the fast **Storage API**; "
+        "work-products via the throttled ingestion DAG."
+    )
+
+    st.text_input(
+        "Downloaded dataset root",
+        key=SMART_ROOT_KEY,
+        placeholder=r"C:\Users\you\osdu-data\tno",
+        help="The folder that contains `TNO/provided` and `datasets/`.",
+    )
+
+    cols = st.columns(3)
+    with cols[0]:
+        st.text_input(
+            "Interval label",
+            key=SMART_INTERVAL_KEY,
+            help=(
+                "Prefix stamped on every record id so this interval is an "
+                "independent Smart Tier copy. Use a date — today's is "
+                "pre-filled."
+            ),
+        )
+    with cols[1]:
+        st.number_input(
+            "Storage batch size",
+            min_value=1,
+            max_value=STORAGE_MAX_RECORDS_PER_CALL,
+            step=1,
+            key=SMART_BATCH_KEY,
+            help="Records per Storage PUT for the reference/master-data tiers.",
+        )
+    with cols[2]:
+        st.checkbox(
+            "Include work-products",
+            key=SMART_INCLUDE_WP_KEY,
+            help=(
+                "Also load documents / well logs / markers / trajectories via "
+                "the DAG (adds file-blob uploads — can take a while)."
+            ),
+        )
+
+    _render_input_form(
+        connection,
+        legal_key=SMART_LEGAL_TAG_KEY,
+        owners_key=SMART_ACL_OWNERS_KEY,
+        viewers_key=SMART_ACL_VIEWERS_KEY,
+        refresh_key="smart_refresh_options",
+        show_prefix=False,
+    )
+    st.checkbox(
+        "🔄 Auto-refresh token via Azure CLI (recommended for long loads)",
+        key=SMART_AUTO_REFRESH_KEY,
+        help=(
+            "Keeps the load authenticated via `az account get-access-token` "
+            "so it survives token expiry."
+        ),
+    )
+
+    # Plan preview — a guardrail that shows exactly what will load, in order.
+    root_str = str(st.session_state.get(SMART_ROOT_KEY) or "").strip()
+    plans: list[Any] = []
+    if root_str:
+        try:
+            plans = plan_interval(
+                Path(root_str),
+                include_work_products=bool(
+                    st.session_state.get(SMART_INCLUDE_WP_KEY)
+                ),
+            )
+        except (OSError, ValueError):
+            plans = []
+    if plans:
+        rows = "\n".join(
+            f"{i + 1}. **{p.part.key}** — {p.part.manifest_count} "
+            f"manifests · _{p.method}_"
+            for i, p in enumerate(plans)
+        )
+        st.markdown("**Load plan (runs in this order):**\n\n" + rows)
+
+    reason = _smart_disabled_reason(plans)
+    clicked = st.button(
+        "🚀 Kick off interval load",
+        key="smart_load_button",
+        type="primary",
+        disabled=reason is not None,
+        help="Loads every tier in dependency order on a background job.",
+    )
+    if reason is not None:
+        st.caption(f"⏸️ {reason}")
+    if clicked:
+        _start_smart_tier_job(connection)
+
+    _render_job_panel(SMART_JOB_ID_KEY, key_prefix="smart_job")
+
+
+def _start_smart_tier_job(connection: ADMEConnection) -> None:
+    """Start the interval load on a background job (survives navigation)."""
+    _clear_sticky_error()
+    root = Path(str(st.session_state.get(SMART_ROOT_KEY) or "").strip())
+    interval = str(st.session_state.get(SMART_INTERVAL_KEY) or "").strip()
+    include_wp = bool(st.session_state.get(SMART_INCLUDE_WP_KEY))
+    batch = int(
+        st.session_state.get(SMART_BATCH_KEY) or DEFAULT_STORAGE_BATCH_SIZE
+    )
+    legal_tag = str(st.session_state.get(SMART_LEGAL_TAG_KEY) or "").strip()
+    acl_owners = [str(st.session_state.get(SMART_ACL_OWNERS_KEY) or "").strip()]
+    acl_viewers = [
+        str(st.session_state.get(SMART_ACL_VIEWERS_KEY) or "").strip()
+    ]
+
+    token = _acquire_token(connection)
+    if token is None:
+        return
+    token_provider = None
+    if st.session_state.get(SMART_AUTO_REFRESH_KEY):
+        provider = RefreshingTokenProvider(acquire=acquire_cli_token)
+        try:
+            token = provider()
+        except AuthenticationError as exc:
+            _set_sticky_error(f"Azure CLI auto-refresh unavailable: {exc}")
+            st.rerun()
+            return
+        token_provider = provider
+
+    safe = interval.strip("-") or "default"
+    progress = ResumableProgress(_INTERVAL_PROGRESS_DIR / f"{safe}.json")
+
+    # Precompute the progress total: Storage tiers report per record,
+    # work-product tiers per (remaining) manifest.
+    total = 0
+    for plan in plan_interval(root, include_work_products=include_wp):
+        manifests = list_part_manifests(plan.part)
+        if plan.method == "storage":
+            total += count_section_records(
+                manifests, plan.part.section or "ReferenceData"
+            )
+        else:
+            done = progress.completed(plan.part.key)
+            total += sum(1 for m in manifests if m.name not in done)
+
+    def work(job: LoadJob) -> None:
+        for event in run_interval(
+            root,
+            interval_label=interval,
+            connection=connection,
+            acl_owners=acl_owners,
+            acl_viewers=acl_viewers,
+            legal_tag=legal_tag,
+            token=token,
+            token_provider=token_provider,
+            include_work_products=include_wp,
+            storage_batch_size=batch,
+            progress=progress,
+            should_abort=lambda: job.aborting,
+        ):
+            if event.phase == "item" and event.result is not None:
+                job.record(event.result)
+            if job.aborting:
+                break
+
+    job_id = f"smart-{safe}-{uuid.uuid4().hex[:8]}"
+    start_job(
+        job_id,
+        label=f"Interval {interval or '(no prefix)'}",
+        total=total,
+        work=work,
+    )
+    st.session_state[SMART_JOB_ID_KEY] = job_id
+    st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -674,6 +919,15 @@ def _ensure_page_defaults() -> None:
     st.session_state.setdefault(DOWNLOAD_AUTO_REFRESH_KEY, False)
     st.session_state.setdefault(DOWNLOAD_JOB_ID_KEY, None)
     st.session_state.setdefault(DOWNLOAD_BATCH_SIZE_KEY, DEFAULT_STORAGE_BATCH_SIZE)
+    st.session_state.setdefault(SMART_ROOT_KEY, "")
+    st.session_state.setdefault(SMART_INTERVAL_KEY, make_load_prefix())
+    st.session_state.setdefault(SMART_INCLUDE_WP_KEY, True)
+    st.session_state.setdefault(SMART_BATCH_KEY, 100)
+    st.session_state.setdefault(SMART_AUTO_REFRESH_KEY, True)
+    st.session_state.setdefault(SMART_JOB_ID_KEY, None)
+    st.session_state.setdefault(SMART_LEGAL_TAG_KEY, "")
+    st.session_state.setdefault(SMART_ACL_OWNERS_KEY, "")
+    st.session_state.setdefault(SMART_ACL_VIEWERS_KEY, "")
     st.session_state.setdefault(DOWNLOAD_LEGAL_TAG_KEY, "")
     st.session_state.setdefault(DOWNLOAD_ACL_OWNERS_KEY, "")
     st.session_state.setdefault(DOWNLOAD_ACL_VIEWERS_KEY, "")
@@ -938,12 +1192,15 @@ def _render_input_form(
     viewers_key: str = BULK_ACL_VIEWERS_KEY,
     prefix_key: str = BULK_LOAD_PREFIX_KEY,
     refresh_key: str = "bulk_refresh_options",
+    show_prefix: bool = True,
 ) -> None:
     """Render the legal-tag / ACL inputs.
 
     The widget/session keys are parametrized so this form can render in more
     than one tab within the same run without colliding on Streamlit element
-    keys (each tab passes its own key set).
+    keys (each tab passes its own key set). Pass ``show_prefix=False`` when
+    the caller supplies its own load-prefix field (e.g. the Smart Tier tab's
+    interval label).
     """
     refresh_clicked = st.button(
         REFRESH_OPTIONS_LABEL,
@@ -992,7 +1249,8 @@ def _render_input_form(
             empty_caption="⚠️ Couldn't load groups — enter manually",
         )
 
-    _render_load_prefix_field(prefix_key=prefix_key)
+    if show_prefix:
+        _render_load_prefix_field(prefix_key=prefix_key)
 
 
 def _render_load_prefix_field(prefix_key: str = BULK_LOAD_PREFIX_KEY) -> None:

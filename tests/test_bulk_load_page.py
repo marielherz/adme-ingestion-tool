@@ -7,7 +7,7 @@ import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -2410,4 +2410,107 @@ def test_full_page_render_has_no_duplicate_widget_keys(
     ]
     duplicates = sorted({k for k in keys if keys.count(k) > 1})
     assert not duplicates, f"Duplicate widget keys across tabs: {duplicates}"
+
+
+# ---------------------------------------------------------------------------
+# Smart Tier interval load tab
+# ---------------------------------------------------------------------------
+
+SMART_ROOT_KEY = "smart_root"
+SMART_INTERVAL_KEY = "smart_interval_label"
+SMART_INCLUDE_WP_KEY = "smart_include_wp"
+SMART_AUTO_REFRESH_KEY = "smart_auto_refresh"
+SMART_LEGAL_TAG_KEY = "smart_legal_tag"
+SMART_ACL_OWNERS_KEY = "smart_acl_owners"
+SMART_ACL_VIEWERS_KEY = "smart_acl_viewers"
+SMART_JOB_ID_KEY = "smart_job_id"
+SMART_LOAD_LABEL = "🚀 Kick off interval load"
+
+
+def _seed_smart_inputs(recorder: StreamlitRecorder, root: Path) -> None:
+    recorder.session_state[CONNECTION_KEY] = _connection()
+    recorder.session_state[SMART_ROOT_KEY] = str(root)
+    recorder.session_state[SMART_INTERVAL_KEY] = "20260908-"
+    recorder.session_state[SMART_INCLUDE_WP_KEY] = True
+    recorder.session_state[SMART_AUTO_REFRESH_KEY] = False  # no az CLI in tests
+    recorder.session_state[SMART_LEGAL_TAG_KEY] = "opendes-tno"
+    recorder.session_state[SMART_ACL_OWNERS_KEY] = "data.x.owners@x"
+    recorder.session_state[SMART_ACL_VIEWERS_KEY] = "data.x.viewers@x"
+
+
+def _fake_plan(key: str, method: str, section: str | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        part=SimpleNamespace(key=key, manifest_count=2, section=section),
+        method=method,
+    )
+
+
+def test_smart_tier_tab_kicks_off_interval_load(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Clicking the Smart Tier button runs run_interval on a background job."""
+    _seed_smart_inputs(streamlit_recorder, tmp_path)
+    streamlit_recorder.button_responses[SMART_LOAD_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+    bj_module.reset()
+    monkeypatch.setattr(bj_module, "_RUN_SYNC", True)
+    monkeypatch.setattr(page_module, "_INTERVAL_PROGRESS_DIR", tmp_path / "prog")
+
+    plans = [_fake_plan("reference-data", "storage", "ReferenceData")]
+    monkeypatch.setattr(page_module, "plan_interval", lambda root, **k: plans)
+    monkeypatch.setattr(
+        page_module,
+        "list_part_manifests",
+        lambda p, **k: [tmp_path / "a.json", tmp_path / "b.json"],
+    )
+    monkeypatch.setattr(
+        page_module, "count_section_records", lambda paths, section: len(paths)
+    )
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_interval(root: Any, **kwargs: Any) -> Iterator[Any]:
+        calls.append(kwargs)
+        yield SimpleNamespace(phase="tier_start", result=None)
+        yield SimpleNamespace(phase="item", result=_submit_row("r1", ok=True))
+        yield SimpleNamespace(phase="item", result=_submit_row("r2", ok=True))
+        yield SimpleNamespace(phase="tier_done", result=None)
+
+    monkeypatch.setattr(page_module, "run_interval", fake_run_interval)
+
+    page_module.main()
+
+    assert calls, "run_interval should be called"
+    assert calls[0]["interval_label"] == "20260908-"
+    assert calls[0]["include_work_products"] is True
+    job_id = streamlit_recorder.session_state.get(SMART_JOB_ID_KEY)
+    assert job_id, "a background job id should be stored"
+    snap = bj_module.get_job(job_id).snapshot()
+    assert snap.status == bj_module.STATUS_DONE
+    assert snap.succeeded == 2  # only 'item' events are recorded
+
+
+def test_smart_tier_button_disabled_without_root(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no dataset root the load button is disabled (guardrail)."""
+    streamlit_recorder.session_state[CONNECTION_KEY] = _connection()
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+    monkeypatch.setattr(page_module, "plan_interval", lambda root, **k: [])
+
+    page_module.main()
+
+    btns = [
+        c
+        for c in streamlit_recorder.calls_named("button")
+        if c.kwargs.get("key") == "smart_load_button"
+    ]
+    assert btns, "the Smart Tier load button should render"
+    assert btns[0].kwargs.get("disabled") is True
 
