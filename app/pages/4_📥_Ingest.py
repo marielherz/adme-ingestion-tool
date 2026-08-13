@@ -27,6 +27,8 @@ from app.models.connection import ADMEConnection, AuthMethod  # noqa: E402
 SETTINGS_PAGE_PATH = "pages/1_⚙️_Instance_Configuration.py"
 MANIFEST_PAGE_PATH = "pages/5_📄_Manifest.py"
 FILE_PAGE_PATH = "pages/6_📂_File.py"
+VOLVE_PAGE_PATH = "pages/7_🌊_Volve_Dataset.py"
+TNO_PAGE_PATH = "pages/11_📦_TNO_Dataset.py"
 
 
 def main() -> None:
@@ -112,10 +114,11 @@ def _preflight_ok(connection: ADMEConnection | None) -> bool:
 
 
 def _render_method_cards() -> None:
-    """Render three side-by-side method cards."""
+    """Render side-by-side method cards."""
     st.subheader("Choose a method")
 
-    manifest_col, file_col, csv_col = st.columns(3, gap="large")
+    # Row 1: Generic methods
+    manifest_col, file_col, bulk_col = st.columns(3, gap="large")
 
     with manifest_col:
         st.markdown("### 📄 Manifest")
@@ -141,11 +144,46 @@ def _render_method_cards() -> None:
             icon="📂",
         )
 
-    with csv_col:
-        st.markdown("### 📊 CSV")
-        st.caption("Coming soon")
+    with bulk_col:
+        st.markdown("### 📥 Bulk Load")
         st.markdown(
-            ":grey[Bulk-load tabular data from a CSV. Not yet available.]"
+            "Batch-load manifests with concurrency control and progress tracking."
+        )
+        st.page_link(
+            "pages/9_📥_Bulk_Load.py",
+            label="Open Bulk Load",
+            icon="📥",
+        )
+
+    # Row 2: Dataset-specific orchestrators
+    st.markdown("---")
+    st.subheader("Complete Dataset Ingestion")
+    
+    volve_col, tno_col = st.columns(2, gap="large")
+
+    with volve_col:
+        st.markdown("### ⏱️ ~25 min | 🌊 Volve Dataset")
+        st.markdown(
+            "Complete ingestion of the Volve dataset across seismic (SDMS), "
+            "metadata (Storage), and wellbores (DDMS). Runs three parallel "
+            "tracks with validation and resumability."
+        )
+        st.page_link(
+            VOLVE_PAGE_PATH,
+            label="Open Volve ingestion",
+            icon="🌊",
+        )
+
+    with tno_col:
+        st.markdown("### ⏱️ ~20 min | 📦 TNO Dataset")
+        st.markdown(
+            "Complete ingestion of the TNO dataset: master-data generation from CSVs, "
+            "Storage ingestion, and work-product loading via DAG. Async and resumable."
+        )
+        st.page_link(
+            TNO_PAGE_PATH,
+            label="Open TNO ingestion",
+            icon="📦",
         )
 
 
@@ -153,15 +191,17 @@ def _render_help_expander() -> None:
     """Render a short 'when to use which' explainer."""
     with st.expander("What's the difference?"):
         st.markdown(
-            "- **📄 Manifest** — you already have an OSDU manifest JSON "
-            "(or want to use a curated sample). The Workflow Service "
-            "validates it, creates the records, and you can poll the run "
-            "status.\n"
-            "- **📂 File** — you have a single data file (PDF, LAS, "
-            "image, etc.). The File Service issues a signed URL, you push "
-            "the bytes to Azure Blob, then register the file metadata. "
-            "Returns a record id you can reference from a manifest.\n"
-            "- **📊 CSV** — bulk-load tabular data. Coming soon."
+            "**Generic Methods:**\n"
+            "- **📄 Manifest** — you already have an OSDU manifest JSON. "
+            "The Workflow Service validates it and creates records.\n"
+            "- **📂 File** — you have a single data file. Issues a signed URL for "
+            "blob upload, then registers file metadata.\n"
+            "- **📥 Bulk Load** — batch-load manifests with concurrency control.\n\n"
+            "**Complete Dataset Orchestrators:**\n"
+            "- **🌊 Volve** (~25 min) — Seismic + metadata + wellbores. Runs three "
+            "parallel tracks with validation and resumability.\n"
+            "- **📦 TNO** (~20 min) — Master-data generation, Storage ingestion, "
+            "and work-product loading via DAG. Async and resumable."
         )
 
 
