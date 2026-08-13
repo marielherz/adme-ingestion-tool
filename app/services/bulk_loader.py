@@ -16,8 +16,8 @@ from __future__ import annotations
 import copy
 import json
 import logging
-from collections.abc import Callable, Iterator, Sequence
-from datetime import UTC, datetime
+from collections.abc import Callable, Iterable, Iterator, Sequence
+from datetime import UTC, date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -29,7 +29,11 @@ from app.models.osdu import (
     SubmitResult,
     WorkflowStatus,
 )
-from app.services.ingestion import submit_manifest
+from app.services.ingestion import (
+    STORAGE_MAX_RECORDS_PER_CALL,
+    put_records,
+    submit_manifest,
+)
 from app.services.run_history import (
     RUN_HISTORY_WRITE_ERRORS,
     record_workflow_finish,
@@ -41,14 +45,37 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DATASETS_ROOT",
     "DATA_ROOT",
+    "DEFAULT_STORAGE_BATCH_SIZE",
+    "STORAGE_MAX_RECORDS_PER_CALL",
     "SUBMIT_SOURCE",
+    "apply_load_prefix",
+    "apply_prefix_to_body",
+    "build_prefix_id_map",
+    "build_reference_prefix_map",
+    "chunk_records",
+    "count_section_records",
+    "extract_section_records",
+    "inject_acl_and_legal",
     "list_datasets",
     "load_dataset",
+    "make_load_prefix",
     "preview_tier",
+    "submit_manifest_paths",
+    "submit_records_from_paths",
     "submit_tier",
+    "substitute_partition",
 ]
 
 SUBMIT_SOURCE = "bulk_load"
+
+# Default batch size for the Storage-API load path. Small by default for a
+# smoke run; the operator can raise it toward STORAGE_MAX_RECORDS_PER_CALL.
+DEFAULT_STORAGE_BATCH_SIZE = 25
+
+# Default legal ``otherRelevantDataCountries`` stamped onto records that ship
+# with an empty list — OSDU Storage requires at least one. Matches the File
+# Service metadata default.
+_DEFAULT_RELEVANT_COUNTRIES: tuple[str, ...] = ("US",)
 
 # ``app/data/`` is the security boundary: every resolved manifest path
 # MUST live underneath it, no exceptions.
@@ -267,42 +294,317 @@ def preview_tier(dataset_id: str, tier: str) -> list[ManifestPreview]:
     return previews
 
 
-def _inject_acl_and_legal(
+def inject_acl_and_legal(
     manifest_body: dict[str, Any],
     *,
     section: str,
     acl_owners: Sequence[str],
     acl_viewers: Sequence[str],
     legal_tag: str,
+    overwrite: bool = False,
 ) -> dict[str, Any]:
     """Return a deep copy of ``manifest_body`` with ACL/legal populated.
 
-    Only empty arrays are overwritten — operator-provided values stay
-    intact. We mutate the copy so the caller can keep the parsed body
-    for diagnostics.
+    By default only empty arrays are filled — operator-provided values
+    stay intact. Pass ``overwrite=True`` to force the operator's ACL /
+    legal onto every record regardless of existing content; this is
+    needed for the pre-generated TNO manifests, which ship placeholder
+    groups (``ownergroup@testcompany.com``) and legal tags that do not
+    exist in the target partition. We mutate the copy so the caller can
+    keep the parsed body for diagnostics.
     """
     out = copy.deepcopy(manifest_body)
     records = out.get(section)
     if not isinstance(records, list):
         return out
     for record in records:
-        if not isinstance(record, dict):
-            continue
-        acl = record.get("acl")
-        if not isinstance(acl, dict):
-            acl = {}
-            record["acl"] = acl
-        if not acl.get("owners"):
-            acl["owners"] = list(acl_owners)
-        if not acl.get("viewers"):
-            acl["viewers"] = list(acl_viewers)
-        legal = record.get("legal")
-        if not isinstance(legal, dict):
-            legal = {}
-            record["legal"] = legal
-        if not legal.get("legaltags"):
-            legal["legaltags"] = [legal_tag]
+        _stamp_record_acl_legal(
+            record,
+            acl_owners=acl_owners,
+            acl_viewers=acl_viewers,
+            legal_tag=legal_tag,
+            overwrite=overwrite,
+        )
     return out
+
+
+def _stamp_record_acl_legal(
+    record: Any,
+    *,
+    acl_owners: Sequence[str],
+    acl_viewers: Sequence[str],
+    legal_tag: str,
+    overwrite: bool = False,
+) -> None:
+    """Fill (or overwrite) the ``acl`` / ``legal`` blocks on one record."""
+    if not isinstance(record, dict):
+        return
+    acl = record.get("acl")
+    if not isinstance(acl, dict):
+        acl = {}
+        record["acl"] = acl
+    if overwrite or not acl.get("owners"):
+        acl["owners"] = list(acl_owners)
+    if overwrite or not acl.get("viewers"):
+        acl["viewers"] = list(acl_viewers)
+    legal = record.get("legal")
+    if not isinstance(legal, dict):
+        legal = {}
+        record["legal"] = legal
+    if overwrite or not legal.get("legaltags"):
+        legal["legaltags"] = [legal_tag]
+    # OSDU Storage rejects records whose legal block has an empty
+    # ``otherRelevantDataCountries`` or missing ``status`` — the vendor TNO
+    # manifests ship both empty, which makes the ingestion DAG "finish" while
+    # persisting nothing. Fill sane defaults so records actually land.
+    if overwrite or not legal.get("otherRelevantDataCountries"):
+        legal["otherRelevantDataCountries"] = list(_DEFAULT_RELEVANT_COUNTRIES)
+    if not legal.get("status"):
+        legal["status"] = "compliant"
+
+
+
+# Deprecated private name retained for one release while callers
+# migrate to the public ``inject_acl_and_legal``. See
+# decisions: kevin-bulk-ingest-contract-2026-05-19.md \u00a72.
+_inject_acl_and_legal = inject_acl_and_legal
+
+
+def make_load_prefix(load_date: date | None = None) -> str:
+    """Return a date-based load prefix such as ``"20260630-"``.
+
+    Each Smart Tier load needs its own prefix so the three copies live as
+    independent records that age on their own clock. Defaults to today's
+    UTC date.
+    """
+    chosen = load_date or datetime.now(UTC).date()
+    return f"{chosen:%Y%m%d}-"
+
+
+def _split_osdu_id(value: Any) -> tuple[str, str, str, str] | None:
+    """Split an OSDU id/reference into ``(lead, entity_type, unique, rest)``.
+
+    Recognises the ``<lead>:<entity-type>:<unique>[:<version>]`` shape where
+    the entity type carries the ``--`` group marker (e.g.
+    ``master-data--Well``). ``lead`` keeps the partition or ``<namespace>``
+    placeholder token; ``rest`` is the trailing version portion (including
+    its leading colon) or ``""``. Returns ``None`` for anything that is not
+    id-shaped (plain strings, schema ``kind`` values, etc.).
+    """
+    if not isinstance(value, str):
+        return None
+    parts = value.split(":")
+    if len(parts) < 3:
+        return None
+    lead, entity_type, unique = parts[0], parts[1], parts[2]
+    if "--" not in entity_type or not unique:
+        return None
+    rest = "" if len(parts) == 3 else ":" + ":".join(parts[3:])
+    return lead, entity_type, unique, rest
+
+
+def build_reference_prefix_map(
+    node: Any,
+    *,
+    prefix: str,
+    entity_prefix: str,
+) -> dict[tuple[str, str], str]:
+    """Map ``(entity_type, unique) -> prefixed_unique`` for every id-shaped
+    *reference* anywhere in ``node`` whose entity type starts with
+    ``entity_prefix``.
+
+    Unlike :func:`build_prefix_id_map` (which reads record ``id`` fields in a
+    known section), this walks arbitrary nested structures and keys off the
+    references themselves — used to rewrite the master-data references inside
+    a work-product manifest so an independent (prefixed) load links to that
+    load's prefixed master-data. A blank ``prefix`` yields an empty map.
+    """
+    out: dict[tuple[str, str], str] = {}
+    cleaned = prefix.strip()
+    if not cleaned:
+        return out
+
+    def _walk(current: Any) -> None:
+        if isinstance(current, dict):
+            for value in current.values():
+                _walk(value)
+        elif isinstance(current, list):
+            for value in current:
+                _walk(value)
+        elif isinstance(current, str):
+            parsed = _split_osdu_id(current)
+            if parsed is not None:
+                _lead, entity_type, unique, _rest = parsed
+                if entity_type.startswith(entity_prefix):
+                    out[(entity_type, unique)] = f"{cleaned}{unique}"
+
+    _walk(node)
+    return out
+
+
+def build_prefix_id_map(
+    manifest_bodies: Iterable[dict[str, Any]],
+    *,
+    section: str,
+    prefix: str,
+) -> dict[tuple[str, str], str]:
+    """Map ``(entity_type, unique_id) -> prefixed_unique_id`` for every
+    record in ``section`` across the given manifest bodies.
+
+    Keyed on ``(entity_type, unique_id)`` rather than the full id so that a
+    record id (which uses the literal ``osdu:`` token) and the references
+    that point at it (which use the ``<namespace>:`` placeholder and a
+    trailing version colon) both resolve to the same entry. An empty or
+    blank ``prefix`` yields an empty map (no-op).
+    """
+    id_map: dict[tuple[str, str], str] = {}
+    cleaned = prefix.strip()
+    if not cleaned:
+        return id_map
+    for body in manifest_bodies:
+        records = body.get(section)
+        if not isinstance(records, list):
+            continue
+        for record in records:
+            if not isinstance(record, dict):
+                continue
+            parsed = _split_osdu_id(record.get("id"))
+            if parsed is None:
+                continue
+            _lead, entity_type, unique, _rest = parsed
+            id_map[(entity_type, unique)] = f"{cleaned}{unique}"
+    return id_map
+
+
+def _rewrite_id_string(
+    value: str, id_map: dict[tuple[str, str], str]
+) -> str:
+    parsed = _split_osdu_id(value)
+    if parsed is None:
+        return value
+    lead, entity_type, unique, rest = parsed
+    new_unique = id_map.get((entity_type, unique))
+    if new_unique is None:
+        return value
+    return f"{lead}:{entity_type}:{new_unique}{rest}"
+
+
+def _rewrite_node(node: Any, id_map: dict[tuple[str, str], str]) -> None:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, str):
+                node[key] = _rewrite_id_string(value, id_map)
+            else:
+                _rewrite_node(value, id_map)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            if isinstance(value, str):
+                node[index] = _rewrite_id_string(value, id_map)
+            else:
+                _rewrite_node(value, id_map)
+
+
+def apply_prefix_to_body(
+    manifest_body: dict[str, Any],
+    id_map: dict[tuple[str, str], str],
+) -> dict[str, Any]:
+    """Return a deep copy of ``manifest_body`` with every id-shaped string
+    whose ``(entity_type, unique)`` is in ``id_map`` rewritten so its
+    unique-id portion carries the load prefix.
+
+    The partition / ``<namespace>`` token and any trailing version are left
+    untouched, and references to records outside this load (e.g. shared
+    reference-data) are ignored — only links to records that are part of the
+    same prefixed load are rewritten, preserving referential integrity.
+    An empty ``id_map`` returns an untouched deep copy.
+    """
+    out = copy.deepcopy(manifest_body)
+    if id_map:
+        _rewrite_node(out, id_map)
+    return out
+
+
+def _substitute_partition_string(value: str, data_partition_id: str) -> str:
+    parsed = _split_osdu_id(value)
+    if parsed is None:
+        return value
+    _lead, entity_type, unique, rest = parsed
+    return f"{data_partition_id}:{entity_type}:{unique}{rest}"
+
+
+def _substitute_partition_node(node: Any, data_partition_id: str) -> None:
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if isinstance(value, str):
+                node[key] = _substitute_partition_string(
+                    value, data_partition_id
+                )
+            else:
+                _substitute_partition_node(value, data_partition_id)
+    elif isinstance(node, list):
+        for index, value in enumerate(node):
+            if isinstance(value, str):
+                node[index] = _substitute_partition_string(
+                    value, data_partition_id
+                )
+            else:
+                _substitute_partition_node(value, data_partition_id)
+
+
+def substitute_partition(
+    manifest_body: dict[str, Any], data_partition_id: str
+) -> dict[str, Any]:
+    """Return a deep copy with every id-shaped token's partition rewritten.
+
+    The vendored TNO manifests ship record ids under the ``osdu`` authority
+    and references under the ``<namespace>`` placeholder. OSDU Storage
+    rejects a record whose id partition does not match the target
+    data-partition-id, so the workflow "finishes" but persists nothing. This
+    rewrites the leading partition token of every id-shaped string (record
+    ``id`` fields and references alike) to ``data_partition_id``, while
+    leaving schema ``kind`` values (``osdu:wks:...`` — second segment has no
+    ``--``) and surrogate keys untouched. A blank partition is a no-op.
+    """
+    out = copy.deepcopy(manifest_body)
+    if data_partition_id.strip():
+        _substitute_partition_node(out, data_partition_id)
+    return out
+
+
+def apply_load_prefix(
+    manifest_bodies: Sequence[dict[str, Any]],
+    *,
+    section: str,
+    prefix: str,
+) -> list[dict[str, Any]]:
+    """Rewrite a set of manifest bodies into an independent, internally
+    consistent copy under ``prefix``.
+
+    Builds the cross-manifest id map first so references that span files
+    (e.g. a ``Wellbore`` pointing at a ``Well`` in another manifest) stay
+    linked. A blank ``prefix`` returns deep copies unchanged.
+    """
+    id_map = build_prefix_id_map(
+        manifest_bodies, section=section, prefix=prefix
+    )
+    return [apply_prefix_to_body(body, id_map) for body in manifest_bodies]
+
+
+def _resolve_active_token(
+    token: str, token_provider: Callable[[], str] | None
+) -> str:
+    """Return a current token, converting provider failures to ``ValueError``.
+
+    A ``token_provider`` (e.g. an Azure-CLI refresher) may raise if it cannot
+    mint a token; we normalize that to ``ValueError`` so the submit loops
+    surface it as a per-manifest error result rather than crashing.
+    """
+    if token_provider is None:
+        return token
+    try:
+        return token_provider()
+    except Exception as exc:  # noqa: BLE001 - providers may raise anything
+        raise ValueError(f"token refresh failed: {exc}") from exc
 
 
 def _extract_record_id(result: Any) -> str | None:
@@ -382,6 +684,8 @@ def submit_tier(
     data_partition_id: str,
     connection: ADMEConnection,
     token: str,
+    load_prefix: str = "",
+    overwrite_acl_legal: bool = False,
     progress_callback: Callable[[SubmitResult], None] | None = None,
 ) -> Iterator[SubmitResult]:
     """Yield one :class:`SubmitResult` per manifest in this tier.
@@ -390,13 +694,81 @@ def submit_tier(
     an error result and the loop continues to the next file (v1 has no
     abort-on-error policy at the service layer; the page can stop
     consuming the iterator).
+
+    When ``load_prefix`` is set, every record id (and the intra-load
+    references that point at it) is rewritten so its unique-id portion
+    carries the prefix, making this submission an independent copy that
+    ages on its own tier clock. References across manifests in the tier
+    stay linked because the prefix map is built from all files first.
     """
     descriptor = load_dataset(dataset_id)
     tier_descriptor = _resolve_tier(descriptor, tier)
     section = _TIER_TO_SECTION.get(tier, "ReferenceData")
     manifests = _resolve_manifests(descriptor, tier_descriptor)
 
-    for manifest_path in manifests:
+    yield from submit_manifest_paths(
+        manifests,
+        section=section,
+        acl_owners=acl_owners,
+        acl_viewers=acl_viewers,
+        legal_tag=legal_tag,
+        data_partition_id=data_partition_id,
+        connection=connection,
+        token=token,
+        load_prefix=load_prefix,
+        overwrite_acl_legal=overwrite_acl_legal,
+        progress_callback=progress_callback,
+    )
+
+
+def submit_manifest_paths(
+    manifest_paths: Sequence[Path],
+    *,
+    section: str,
+    acl_owners: Sequence[str],
+    acl_viewers: Sequence[str],
+    legal_tag: str,
+    data_partition_id: str,
+    connection: ADMEConnection,
+    token: str,
+    load_prefix: str = "",
+    overwrite_acl_legal: bool = False,
+    token_provider: Callable[[], str] | None = None,
+    progress_callback: Callable[[SubmitResult], None] | None = None,
+) -> Iterator[SubmitResult]:
+    """Yield one :class:`SubmitResult` per explicit manifest path.
+
+    The shared engine behind :func:`submit_tier` and the external
+    downloaded-dataset loader: builds the cross-file prefix map (when
+    ``load_prefix`` is set), stamps ACL/legal (``overwrite_acl_legal`` for
+    pre-generated manifests carrying placeholder groups), and submits each
+    list-section manifest. Sequential; a failure yields an error result and
+    the loop continues.
+
+    When ``token_provider`` is given it is called once per manifest to obtain
+    a current token (refreshing near expiry) so a load that outlives a single
+    token keeps going; otherwise the fixed ``token`` is used.
+    """
+    # Pre-pass: build the cross-manifest prefix map. Read errors here are
+    # ignored on purpose — the main loop re-reads each file and surfaces
+    # any failure as an error result for that manifest.
+    id_map: dict[tuple[str, str], str] = {}
+    if load_prefix.strip():
+        scanned: list[dict[str, Any]] = []
+        for manifest_path in manifest_paths:
+            try:
+                scanned_body = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(scanned_body, dict):
+                scanned.append(scanned_body)
+        id_map = build_prefix_id_map(
+            scanned, section=section, prefix=load_prefix
+        )
+
+    for manifest_path in manifest_paths:
         submitted_at = datetime.now(UTC)
         run_id: str | None = None
         record_id: str | None = None
@@ -404,15 +776,20 @@ def submit_tier(
         error: str | None = None
 
         try:
+            active_token = _resolve_active_token(token, token_provider)
             body = json.loads(manifest_path.read_text(encoding="utf-8"))
             if not isinstance(body, dict):
                 raise ValueError("manifest body is not a JSON object")
-            shaped = _inject_acl_and_legal(
+            if id_map:
+                body = apply_prefix_to_body(body, id_map)
+            body = substitute_partition(body, data_partition_id)
+            shaped = inject_acl_and_legal(
                 body,
                 section=section,
                 acl_owners=acl_owners,
                 acl_viewers=acl_viewers,
                 legal_tag=legal_tag,
+                overwrite=overwrite_acl_legal,
             )
             payload = {
                 "executionContext": {
@@ -424,7 +801,7 @@ def submit_tier(
                 },
             }
 
-            workflow_result = submit_manifest(connection, token, payload)
+            workflow_result = submit_manifest(connection, active_token, payload)
             if getattr(workflow_result, "ok", False):
                 status = "success"
                 run_id = getattr(workflow_result, "run_id", None)
@@ -461,3 +838,212 @@ def submit_tier(
             except Exception:  # pragma: no cover - UI callback never fatal
                 logger.exception("bulk_loader progress_callback failed")
         yield result
+
+
+# ---------------------------------------------------------------------------
+# Storage-API load path (PUT /storage/v2/records) — bypasses the DAG
+# ---------------------------------------------------------------------------
+
+
+def extract_section_records(
+    manifest_body: dict[str, Any], section: str
+) -> list[dict[str, Any]]:
+    """Return the storage-shaped records from ``manifest_body[section]``.
+
+    The list-section manifests (``ReferenceData`` / ``MasterData``) hold
+    records already carrying ``id`` / ``kind`` / ``acl`` / ``legal`` /
+    ``data`` — exactly the Storage ``PUT /records`` shape. Non-dict entries
+    are dropped. Returns an empty list when the section is absent.
+    """
+    records = manifest_body.get(section)
+    if not isinstance(records, list):
+        return []
+    return [r for r in records if isinstance(r, dict)]
+
+
+def chunk_records(
+    records: Sequence[dict[str, Any]], batch_size: int
+) -> Iterator[list[dict[str, Any]]]:
+    """Yield ``records`` in lists of at most ``batch_size`` (>=1, <=500)."""
+    size = _clamp_batch_size(batch_size)
+    for start in range(0, len(records), size):
+        yield list(records[start : start + size])
+
+
+def _clamp_batch_size(batch_size: int) -> int:
+    """Clamp a requested batch size into ``[1, STORAGE_MAX_RECORDS_PER_CALL]``."""
+    if batch_size < 1:
+        return 1
+    if batch_size > STORAGE_MAX_RECORDS_PER_CALL:
+        return STORAGE_MAX_RECORDS_PER_CALL
+    return batch_size
+
+
+def count_section_records(
+    manifest_paths: Sequence[Path], section: str
+) -> int:
+    """Count storage records across ``manifest_paths`` for progress totals.
+
+    Best-effort: unreadable / malformed manifests contribute zero. Reads
+    each file once; the leading-token and prefix rewrites don't change the
+    record count, so this is a faithful denominator for the load.
+    """
+    total = 0
+    for manifest_path in manifest_paths:
+        try:
+            body = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(body, dict):
+            total += len(extract_section_records(body, section))
+    return total
+
+
+def submit_records_from_paths(
+    manifest_paths: Sequence[Path],
+    *,
+    section: str,
+    acl_owners: Sequence[str],
+    acl_viewers: Sequence[str],
+    legal_tag: str,
+    data_partition_id: str,
+    connection: ADMEConnection,
+    token: str,
+    batch_size: int = DEFAULT_STORAGE_BATCH_SIZE,
+    load_prefix: str = "",
+    overwrite_acl_legal: bool = False,
+    token_provider: Callable[[], str] | None = None,
+    progress_callback: Callable[[SubmitResult], None] | None = None,
+) -> Iterator[SubmitResult]:
+    """Load list-section manifests via the Storage API, yielding per record.
+
+    Storage counterpart to :func:`submit_manifest_paths`: instead of posting
+    each manifest to the ingestion DAG, it flattens the section's records
+    across all files, applies the same prefix / partition / ACL-legal
+    transforms, and writes them to ``PUT /storage/v2/records`` in batches of
+    at most ``batch_size`` (capped at 500). One :class:`SubmitResult` is
+    yielded per record so the UI keeps per-item progress; every record in a
+    batch shares that batch's success/error outcome.
+
+    Records are streamed: a batch is flushed as soon as ``batch_size`` are
+    buffered, so memory stays flat over large tiers. ``token_provider`` (when
+    given) is consulted once per batch so a long load survives token expiry.
+    A manifest that fails to read yields a single error result and the load
+    continues.
+    """
+    size = _clamp_batch_size(batch_size)
+
+    id_map: dict[tuple[str, str], str] = {}
+    if load_prefix.strip():
+        scanned: list[dict[str, Any]] = []
+        for manifest_path in manifest_paths:
+            try:
+                scanned_body = json.loads(
+                    manifest_path.read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                continue
+            if isinstance(scanned_body, dict):
+                scanned.append(scanned_body)
+        id_map = build_prefix_id_map(
+            scanned, section=section, prefix=load_prefix
+        )
+
+    # Buffer of (record, origin_path) so each record's result names its file.
+    buffer: list[tuple[dict[str, Any], Path]] = []
+
+    def _flush() -> Iterator[SubmitResult]:
+        while len(buffer) >= size:
+            batch = buffer[:size]
+            del buffer[:size]
+            yield from _submit_batch(batch)
+
+    def _drain() -> Iterator[SubmitResult]:
+        if buffer:
+            batch = list(buffer)
+            buffer.clear()
+            yield from _submit_batch(batch)
+
+    def _submit_batch(
+        batch: list[tuple[dict[str, Any], Path]],
+    ) -> Iterator[SubmitResult]:
+        submitted_at = datetime.now(UTC)
+        records = [rec for rec, _ in batch]
+        status = "error"
+        error: str | None = None
+        try:
+            active_token = _resolve_active_token(token, token_provider)
+            result = put_records(connection, active_token, records)
+            if result.ok:
+                status = "success"
+            else:
+                error = (
+                    result.error_message
+                    or f"Storage returned HTTP {result.http_status}"
+                )
+        except ValueError as exc:
+            error = str(exc) or exc.__class__.__name__
+            logger.warning("Storage batch failed: %s", exc)
+
+        for record, origin in batch:
+            item = SubmitResult(
+                manifest_path=origin,
+                filename=origin.name,
+                status=status,
+                run_id=None,
+                record_id=(
+                    record.get("id") if isinstance(record.get("id"), str)
+                    else None
+                ),
+                error=error,
+                submitted_at=submitted_at,
+            )
+            if progress_callback is not None:
+                try:
+                    progress_callback(item)
+                except Exception:  # pragma: no cover - UI callback safe
+                    logger.exception("bulk_loader progress_callback failed")
+            yield item
+
+    for manifest_path in manifest_paths:
+        try:
+            body = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(body, dict):
+                raise ValueError("manifest body is not a JSON object")
+            if id_map:
+                body = apply_prefix_to_body(body, id_map)
+            body = substitute_partition(body, data_partition_id)
+            shaped = inject_acl_and_legal(
+                body,
+                section=section,
+                acl_owners=acl_owners,
+                acl_viewers=acl_viewers,
+                legal_tag=legal_tag,
+                overwrite=overwrite_acl_legal,
+            )
+            for record in extract_section_records(shaped, section):
+                buffer.append((record, manifest_path))
+            yield from _flush()
+        except (OSError, json.JSONDecodeError, ValueError) as exc:
+            error = str(exc) or exc.__class__.__name__
+            logger.warning(
+                "Manifest %s failed to load: %s", manifest_path, exc
+            )
+            item = SubmitResult(
+                manifest_path=manifest_path,
+                filename=manifest_path.name,
+                status="error",
+                run_id=None,
+                record_id=None,
+                error=error,
+                submitted_at=datetime.now(UTC),
+            )
+            if progress_callback is not None:
+                try:
+                    progress_callback(item)
+                except Exception:  # pragma: no cover - UI callback safe
+                    logger.exception("bulk_loader progress_callback failed")
+            yield item
+
+    yield from _drain()
+

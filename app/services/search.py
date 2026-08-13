@@ -20,7 +20,7 @@ References:
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Iterator
 from time import perf_counter
 from typing import Any
 from urllib.parse import quote
@@ -29,16 +29,21 @@ import requests  # type: ignore[import-untyped]
 
 from app.models.connection import ADMEConnection
 from app.models.osdu import (
+    AggregationBucket,
+    CursorSearchResult,
     KindAggregationResult,
     RecordDetailResult,
     RecordSummary,
+    SearchAggregationResult,
     SearchPageResult,
 )
 
 SEARCH_QUERY_PATH = "/api/search/v2/query"
+SEARCH_CURSOR_QUERY_PATH = "/api/search/v2/query_with_cursor"
 STORAGE_RECORD_PATH_TEMPLATE = "/api/storage/v2/records/{record_id}"
 
 SEARCH_TIMEOUT_SECONDS = 15
+EXPORT_TIMEOUT_SECONDS = 30
 DEFAULT_SEARCH_LIMIT = 100
 MAX_OFFSET_PLUS_LIMIT = 10_000
 WILDCARD_KIND = "*:*:*:*"
@@ -172,6 +177,278 @@ def search_records(
         error_message=error_message,
         raw_response=parsed_body,
     )
+
+
+def build_multi_kind_query(
+    kinds: list[str],
+    base_query: str | None = None,
+) -> tuple[str, str]:
+    """Build a kind + query for multi-kind search.
+
+    OSDU doesn't support kind arrays in /query, so multi-kind search uses
+    a wildcard kind with a Lucene kind filter in the query string.
+
+    Returns (effective_kind, effective_query).
+    """
+    base = base_query.strip() if isinstance(base_query, str) else ""
+
+    if len(kinds) == 1:
+        return (kinds[0], base)
+
+    if len(kinds) > 1:
+        kind_clauses = " OR ".join(f'kind:"{k}"' for k in kinds)
+        kind_filter = f"({kind_clauses})"
+        if base:
+            return (WILDCARD_KIND, f"{kind_filter} AND {base}")
+        return (WILDCARD_KIND, kind_filter)
+
+    # Empty list
+    return (WILDCARD_KIND, base)
+
+
+def search_with_aggregation(
+    connection: ADMEConnection,
+    token: str,
+    *,
+    kind: str = WILDCARD_KIND,
+    query: str | None = None,
+    aggregate_by: str | None = None,
+    limit: int = DEFAULT_SEARCH_LIMIT,
+    offset: int = 0,
+) -> SearchAggregationResult:
+    """``POST /api/search/v2/query`` with optional ``aggregateBy``.
+
+    When ``aggregate_by`` is provided (e.g. ``"kind"``), the response
+    includes an ``aggregations`` array with ``{"key": …, "count": N}``
+    entries. When omitted, behaves like :func:`search_records` but
+    returns the richer :class:`SearchAggregationResult` type.
+    """
+    if not kind or not kind.strip():
+        raise ValueError(
+            "A non-empty kind is required for search_with_aggregation."
+        )
+    if limit < 1:
+        raise ValueError("limit must be >= 1.")
+    if offset < 0:
+        raise ValueError("offset must be >= 0.")
+    if offset + limit > MAX_OFFSET_PLUS_LIMIT:
+        raise ValueError(
+            "offset + limit must be <= "
+            f"{MAX_OFFSET_PLUS_LIMIT} (OSDU Search ceiling)."
+        )
+
+    body: dict[str, Any] = {
+        "kind": kind,
+        "limit": limit,
+        "offset": offset,
+        "sort": dict(_DEFAULT_SORT),
+        "returnedFields": list(_DEFAULT_RETURNED_FIELDS),
+    }
+    trimmed_query = query.strip() if isinstance(query, str) else ""
+    if trimmed_query:
+        body["query"] = trimmed_query
+    if aggregate_by:
+        body["aggregateBy"] = aggregate_by
+
+    parsed_body, http_status, correlation_id, latency_ms, error_message = (
+        _call_search(
+            connection=connection,
+            token=token,
+            method="POST",
+            path=SEARCH_QUERY_PATH,
+            json_body=body,
+        )
+    )
+
+    if http_status is None:
+        return SearchAggregationResult(
+            kind=kind,
+            query=trimmed_query or None,
+            offset=offset,
+            limit=limit,
+            ok=False,
+            http_status=None,
+            latency_ms=latency_ms,
+            correlation_id=None,
+            error_message=error_message,
+            raw_response=None,
+        )
+
+    if 200 <= http_status < 300:
+        payload = parsed_body if isinstance(parsed_body, dict) else {}
+        records = _parse_record_summaries(payload.get("results"))
+        total_count = _coerce_int(payload.get("totalCount"))
+        if total_count is not None:
+            has_more = (offset + len(records)) < total_count
+        else:
+            has_more = len(records) >= limit
+        aggregations = _parse_aggregation_buckets(
+            payload.get("aggregations")
+        )
+        return SearchAggregationResult(
+            kind=kind,
+            query=trimmed_query or None,
+            offset=offset,
+            limit=limit,
+            records=records,
+            total_count=total_count,
+            has_more=has_more,
+            aggregations=aggregations,
+            ok=True,
+            http_status=http_status,
+            latency_ms=latency_ms,
+            correlation_id=correlation_id,
+            error_message=None,
+            raw_response=parsed_body,
+        )
+
+    return SearchAggregationResult(
+        kind=kind,
+        query=trimmed_query or None,
+        offset=offset,
+        limit=limit,
+        ok=False,
+        http_status=http_status,
+        latency_ms=latency_ms,
+        correlation_id=correlation_id,
+        error_message=error_message,
+        raw_response=parsed_body,
+    )
+
+
+def search_with_cursor(
+    connection: ADMEConnection,
+    token: str,
+    *,
+    kind: str,
+    query: str | None = None,
+    limit: int = DEFAULT_SEARCH_LIMIT,
+    cursor: str | None = None,
+    returned_fields: tuple[str, ...] | None = None,
+) -> CursorSearchResult:
+    """``POST /api/search/v2/query_with_cursor`` for one page.
+
+    On the first call, omit ``cursor`` (or pass ``None``); on subsequent
+    calls, pass the ``cursor`` returned in the previous result. The
+    response ``has_more`` flag indicates whether more pages remain.
+
+    Uses ``returned_fields`` if provided, otherwise
+    ``_DEFAULT_RETURNED_FIELDS``.
+    """
+    if not kind or not kind.strip():
+        raise ValueError(
+            "A non-empty kind is required for search_with_cursor."
+        )
+    if limit < 1:
+        raise ValueError("limit must be >= 1.")
+
+    fields = list(returned_fields) if returned_fields else list(
+        _DEFAULT_RETURNED_FIELDS
+    )
+
+    body: dict[str, Any] = {
+        "kind": kind,
+        "limit": limit,
+        "sort": dict(_DEFAULT_SORT),
+        "returnedFields": fields,
+    }
+    trimmed_query = query.strip() if isinstance(query, str) else ""
+    if trimmed_query:
+        body["query"] = trimmed_query
+    if cursor:
+        body["cursor"] = cursor
+
+    parsed_body, http_status, correlation_id, latency_ms, error_message = (
+        _call_search(
+            connection=connection,
+            token=token,
+            method="POST",
+            path=SEARCH_CURSOR_QUERY_PATH,
+            json_body=body,
+            timeout=EXPORT_TIMEOUT_SECONDS,
+        )
+    )
+
+    if http_status is None:
+        return CursorSearchResult(
+            kind=kind,
+            query=trimmed_query or None,
+            cursor=None,
+            limit=limit,
+            ok=False,
+            http_status=None,
+            latency_ms=latency_ms,
+            correlation_id=None,
+            error_message=error_message,
+            raw_response=None,
+        )
+
+    if 200 <= http_status < 300:
+        payload = parsed_body if isinstance(parsed_body, dict) else {}
+        records = _parse_record_summaries(payload.get("results"))
+        total_count = _coerce_int(payload.get("totalCount"))
+        next_cursor = payload.get("cursor") or None
+        return CursorSearchResult(
+            kind=kind,
+            query=trimmed_query or None,
+            cursor=next_cursor,
+            limit=limit,
+            records=records,
+            total_count=total_count,
+            has_more=bool(next_cursor),
+            ok=True,
+            http_status=http_status,
+            latency_ms=latency_ms,
+            correlation_id=correlation_id,
+            error_message=None,
+            raw_response=parsed_body,
+        )
+
+    return CursorSearchResult(
+        kind=kind,
+        query=trimmed_query or None,
+        cursor=None,
+        limit=limit,
+        ok=False,
+        http_status=http_status,
+        latency_ms=latency_ms,
+        correlation_id=correlation_id,
+        error_message=error_message,
+        raw_response=parsed_body,
+    )
+
+
+def export_all_records(
+    connection: ADMEConnection,
+    token: str,
+    *,
+    kind: str,
+    query: str | None = None,
+    limit: int = DEFAULT_SEARCH_LIMIT,
+    returned_fields: tuple[str, ...] | None = None,
+) -> Iterator[CursorSearchResult]:
+    """Yield :class:`CursorSearchResult` pages until exhaustion or error.
+
+    Iterates ``search_with_cursor`` calls, feeding each response's
+    ``cursor`` into the next request. Stops when ``has_more`` is
+    ``False`` or an error page is encountered (yielded so the caller
+    sees the failure).
+    """
+    next_cursor: str | None = None
+    while True:
+        page = search_with_cursor(
+            connection,
+            token,
+            kind=kind,
+            query=query,
+            limit=limit,
+            cursor=next_cursor,
+            returned_fields=returned_fields,
+        )
+        yield page
+        if not page.ok or not page.has_more:
+            break
+        next_cursor = page.cursor
 
 
 def list_kinds(
@@ -420,6 +697,25 @@ def _parse_aggregation_kinds(raw: object) -> list[str]:
     return out
 
 
+def _parse_aggregation_buckets(raw: object) -> list[AggregationBucket]:
+    """Parse aggregation buckets from the Search v2 response."""
+    if not isinstance(raw, list):
+        return []
+    buckets: list[AggregationBucket] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        key = entry.get("key")
+        count = entry.get("count")
+        if not isinstance(key, str) or not key:
+            continue
+        coerced_count = _coerce_int(count)
+        if coerced_count is None:
+            continue
+        buckets.append(AggregationBucket(key=key, count=coerced_count))
+    return buckets
+
+
 def _harvest_kinds_from_results(raw: object) -> list[str]:
     if not isinstance(raw, list):
         return []
@@ -455,6 +751,7 @@ def _call_search(
     method: str,
     path: str,
     json_body: dict | None,
+    timeout: int = SEARCH_TIMEOUT_SECONDS,
 ) -> tuple[dict | str | None, int | None, str | None, float, str | None]:
     if not connection.is_valid():
         raise ValueError(
@@ -483,7 +780,7 @@ def _call_search(
             response = requests.get(
                 url=url,
                 headers=headers,
-                timeout=SEARCH_TIMEOUT_SECONDS,
+                timeout=timeout,
                 allow_redirects=False,
             )
         elif method == "POST":
@@ -491,7 +788,7 @@ def _call_search(
                 url=url,
                 headers=headers,
                 json=json_body,
-                timeout=SEARCH_TIMEOUT_SECONDS,
+                timeout=timeout,
                 allow_redirects=False,
             )
         else:
@@ -502,7 +799,7 @@ def _call_search(
             None,
             None,
             _elapsed_ms(started_at),
-            f"Request timed out after {SEARCH_TIMEOUT_SECONDS}s",
+            f"Request timed out after {timeout}s",
         )
     except requests.RequestException as exc:
         return (

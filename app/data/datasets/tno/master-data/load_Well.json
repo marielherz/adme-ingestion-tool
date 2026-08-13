@@ -1,0 +1,171 @@
+{
+    "kind": "osdu:wks:Manifest:1.0.0",
+    "MasterData": [
+        {
+            "id": "osdu:master-data--Well:BUR-GT-01",
+            "kind": "osdu:wks:master-data--Well:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "data": {
+                "FacilityName": "BUR-GT-01",
+                "FacilityID": "BUR-GT-01",
+                "Source": "TNO",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:EBN:",
+                "InitialOperatorID": "<namespace>:master-data--Organisation:EBN:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:TNO:",
+                "OperatingEnvironmentID": "<namespace>:reference-data--OperatingEnvironment:Onshore:",
+                "NameAliases": [
+                    {
+                        "AliasName": "Burg-Haamstede Geothermie 01",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:",
+                        "DefinitionOrganisationID": "<namespace>:master-data--Organisation:NLOG:"
+                    },
+                    {
+                        "AliasName": "BUR-GT-01-NLOG",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:UniqueIdentifier:",
+                        "DefinitionOrganisationID": "<namespace>:master-data--Organisation:NLOG:"
+                    }
+                ],
+                "FacilityStates": [
+                    {
+                        "FacilityStateTypeID": "<namespace>:reference-data--FacilityStateType:Drilling:",
+                        "EffectiveDateTime": "2019-03-01"
+                    },
+                    {
+                        "FacilityStateTypeID": "<namespace>:reference-data--FacilityStateType:Producing:",
+                        "EffectiveDateTime": "2019-09-15"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Well:CAL-GT-01",
+            "kind": "osdu:wks:master-data--Well:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "data": {
+                "FacilityName": "CAL-GT-01",
+                "FacilityID": "CAL-GT-01",
+                "Source": "TNO",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:NAM:",
+                "InitialOperatorID": "<namespace>:master-data--Organisation:NAM:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:TNO:",
+                "OperatingEnvironmentID": "<namespace>:reference-data--OperatingEnvironment:Onshore:",
+                "NameAliases": [
+                    {
+                        "AliasName": "Calandsoog Geothermie 01",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:",
+                        "DefinitionOrganisationID": "<namespace>:master-data--Organisation:NLOG:"
+                    }
+                ],
+                "FacilityStates": [
+                    {
+                        "FacilityStateTypeID": "<namespace>:reference-data--FacilityStateType:Drilling:",
+                        "EffectiveDateTime": "2020-06-10"
+                    },
+                    {
+                        "FacilityStateTypeID": "<namespace>:reference-data--FacilityStateType:PluggedAndAbandoned:",
+                        "EffectiveDateTime": "2020-12-01"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Well:BRD-01",
+            "kind": "osdu:wks:master-data--Well:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "data": {
+                "FacilityName": "BRD-01",
+                "FacilityID": "BRD-01",
+                "Source": "TNO",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:NAM:",
+                "InitialOperatorID": "<namespace>:master-data--Organisation:NAM:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:TNO:",
+                "OperatingEnvironmentID": "<namespace>:reference-data--OperatingEnvironment:Onshore:",
+                "NameAliases": [
+                    {
+                        "AliasName": "Breda 01",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:",
+                        "DefinitionOrganisationID": "<namespace>:master-data--Organisation:NLOG:"
+                    },
+                    {
+                        "AliasName": "BRD-01-EBN",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:UniqueIdentifier:",
+                        "DefinitionOrganisationID": "<namespace>:master-data--Organisation:EBN:"
+                    }
+                ],
+                "FacilityStates": [
+                    {
+                        "FacilityStateTypeID": "<namespace>:reference-data--FacilityStateType:Drilling:",
+                        "EffectiveDateTime": "1988-04-20"
+                    },
+                    {
+                        "FacilityStateTypeID": "<namespace>:reference-data--FacilityStateType:PluggedAndAbandoned:",
+                        "EffectiveDateTime": "1989-01-15"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Well:GRO-01",
+            "kind": "osdu:wks:master-data--Well:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "data": {
+                "FacilityName": "GRO-01",
+                "FacilityID": "GRO-01",
+                "Source": "TNO",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:NAM:",
+                "InitialOperatorID": "<namespace>:master-data--Organisation:NAM:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:TNO:",
+                "OperatingEnvironmentID": "<namespace>:reference-data--OperatingEnvironment:Onshore:",
+                "NameAliases": [
+                    {
+                        "AliasName": "Groningen 01",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:",
+                        "DefinitionOrganisationID": "<namespace>:master-data--Organisation:NLOG:"
+                    }
+                ],
+                "FacilityStates": [
+                    {
+                        "FacilityStateTypeID": "<namespace>:reference-data--FacilityStateType:Drilling:",
+                        "EffectiveDateTime": "1959-01-12"
+                    },
+                    {
+                        "FacilityStateTypeID": "<namespace>:reference-data--FacilityStateType:Producing:",
+                        "EffectiveDateTime": "1963-07-01"
+                    }
+                ]
+            }
+        }
+    ]
+}

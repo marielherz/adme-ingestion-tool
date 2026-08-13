@@ -1,0 +1,101 @@
+{
+    "kind": "osdu:wks:Manifest:1.0.0",
+    "MasterData": [
+        {
+            "id": "osdu:master-data--Organisation:TNO",
+            "kind": "osdu:wks:master-data--Organisation:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "data": {
+                "OrganisationName": "TNO - Geological Survey of the Netherlands",
+                "OrganisationID": "TNO-GSN",
+                "NameAliases": [
+                    {
+                        "AliasName": "TNO Geologische Dienst Nederland",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    },
+                    {
+                        "AliasName": "Netherlands Organisation for Applied Scientific Research",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:UniqueIdentifier:"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Organisation:EBN",
+            "kind": "osdu:wks:master-data--Organisation:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "data": {
+                "OrganisationName": "EBN B.V.",
+                "OrganisationID": "EBN-001",
+                "NameAliases": [
+                    {
+                        "AliasName": "Energie Beheer Nederland",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Organisation:NAM",
+            "kind": "osdu:wks:master-data--Organisation:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "data": {
+                "OrganisationName": "Nederlandse Aardolie Maatschappij B.V.",
+                "OrganisationID": "NAM-001",
+                "NameAliases": [
+                    {
+                        "AliasName": "NAM",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    },
+                    {
+                        "AliasName": "Shell NAM",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:UniqueIdentifier:"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Organisation:NLOG",
+            "kind": "osdu:wks:master-data--Organisation:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "data": {
+                "OrganisationName": "NLOG",
+                "OrganisationID": "NLOG-001",
+                "NameAliases": [
+                    {
+                        "AliasName": "Netherlands Oil and Gas Portal",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ]
+            }
+        }
+    ]
+}

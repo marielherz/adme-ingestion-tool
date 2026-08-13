@@ -26,9 +26,12 @@ contract lives in
 
 from __future__ import annotations
 
+import base64
 from collections.abc import Iterable
+from pathlib import Path
 from time import perf_counter
 from typing import Any
+from urllib.parse import quote
 
 import requests  # type: ignore[import-untyped]
 
@@ -45,6 +48,12 @@ FILES_TIMEOUT_SECONDS = 15
 MAX_FILE_BYTES_V1 = 100 * 1024 * 1024
 FILE_GENERIC_KIND = "osdu:wks:dataset--File.Generic:1.0.0"
 
+# Above this size, a single Put Blob is impractical (memory + service limits),
+# so upload as a Block Blob in chunks. Seismic (SEG-Y) volumes need this.
+FILES_BLOCK_UPLOAD_THRESHOLD_BYTES = 128 * 1024 * 1024
+FILES_BLOCK_SIZE_BYTES = 64 * 1024 * 1024
+FILES_LARGE_UPLOAD_TIMEOUT_SECONDS = 600
+
 _CORRELATION_HEADER_NAMES: tuple[str, ...] = (
     "correlation-id",
     "x-correlation-id",
@@ -56,12 +65,16 @@ _ERROR_BODY_TEXT_LIMIT = 500
 
 __all__ = [
     "FILE_GENERIC_KIND",
+    "FILES_BLOCK_SIZE_BYTES",
+    "FILES_BLOCK_UPLOAD_THRESHOLD_BYTES",
+    "FILES_LARGE_UPLOAD_TIMEOUT_SECONDS",
     "FILES_METADATA_PATH",
     "FILES_TIMEOUT_SECONDS",
     "FILES_UPLOAD_URL_PATH",
     "MAX_FILE_BYTES_V1",
     "get_upload_url",
     "post_file_metadata",
+    "upload_file_blocks",
     "upload_file_bytes",
 ]
 
@@ -240,6 +253,160 @@ def upload_file_bytes(
         http_status=status_code,
         latency_ms=latency_ms,
         error_message=error_message,
+        bytes_uploaded=0,
+    )
+
+
+def _block_id(index: int) -> str:
+    """Return a fixed-length, URL-safe base64 block id for ``index``.
+
+    Azure requires every block id in a blob to be the same byte length; an
+    8-digit zero-padded index encodes to a constant 12-char base64 string
+    (supports up to 100M blocks).
+    """
+    return base64.b64encode(f"{index:08d}".encode("ascii")).decode("ascii")
+
+
+def _build_block_list_xml(block_ids: list[str]) -> bytes:
+    latest = "".join(f"<Latest>{block_id}</Latest>" for block_id in block_ids)
+    return (
+        '<?xml version="1.0" encoding="utf-8"?>'
+        f"<BlockList>{latest}</BlockList>"
+    ).encode()
+
+
+def upload_file_blocks(
+    signed_url: str,
+    file_path: Path,
+    *,
+    content_type: str = "application/octet-stream",
+    block_size: int = FILES_BLOCK_SIZE_BYTES,
+    timeout: int = FILES_LARGE_UPLOAD_TIMEOUT_SECONDS,
+) -> UploadBytesResult:
+    """Stream a file to Azure Blob Storage as a Block Blob in chunks.
+
+    Reads ``file_path`` in ``block_size`` pieces, ``PUT``s each as a staged
+    block (``comp=block``), then commits the ordered block list
+    (``comp=blocklist``). This avoids loading the whole file into memory and
+    bypasses the single Put-Blob size ceiling — required for large seismic
+    (SEG-Y) volumes.
+
+    Auth is the SAS query string on ``signed_url`` (no Bearer / partition
+    header, like :func:`upload_file_bytes`). Success is HTTP 201 on the
+    block-list commit; a failure on any block aborts with ``ok=False``.
+    """
+    if not signed_url or not signed_url.strip():
+        raise ValueError(
+            "A non-empty signed_url is required for upload_file_blocks."
+        )
+    if block_size <= 0:
+        raise ValueError("block_size must be a positive integer.")
+
+    started_at = perf_counter()
+    block_ids: list[str] = []
+    total = 0
+
+    try:
+        with file_path.open("rb") as handle:
+            index = 0
+            while True:
+                chunk = handle.read(block_size)
+                if not chunk:
+                    break
+                block_id = _block_id(index)
+                block_ids.append(block_id)
+                total += len(chunk)
+                put_url = (
+                    f"{signed_url}&comp=block"
+                    f"&blockid={quote(block_id, safe='')}"
+                )
+                response = requests.put(
+                    url=put_url,
+                    data=chunk,
+                    headers={"Content-Length": str(len(chunk))},
+                    timeout=timeout,
+                    allow_redirects=False,
+                )
+                if response.status_code != 201:
+                    body = getattr(response, "text", "") or ""
+                    return UploadBytesResult(
+                        ok=False,
+                        http_status=response.status_code,
+                        latency_ms=_elapsed_ms(started_at),
+                        error_message=(
+                            _truncate(body)
+                            if body
+                            else f"Block {index} failed: "
+                            f"HTTP {response.status_code}"
+                        ),
+                        bytes_uploaded=0,
+                    )
+                index += 1
+
+        if not block_ids:
+            return UploadBytesResult(
+                ok=False,
+                http_status=None,
+                latency_ms=_elapsed_ms(started_at),
+                error_message="File is empty; nothing to upload.",
+                bytes_uploaded=0,
+            )
+
+        commit = requests.put(
+            url=f"{signed_url}&comp=blocklist",
+            data=_build_block_list_xml(block_ids),
+            headers={
+                "Content-Type": "application/xml",
+                "x-ms-blob-content-type": (
+                    content_type or "application/octet-stream"
+                ),
+            },
+            timeout=timeout,
+            allow_redirects=False,
+        )
+    except OSError as exc:
+        return UploadBytesResult(
+            ok=False,
+            http_status=None,
+            latency_ms=_elapsed_ms(started_at),
+            error_message=f"Cannot read {file_path.name}: {exc}",
+            bytes_uploaded=0,
+        )
+    except requests.Timeout:
+        return UploadBytesResult(
+            ok=False,
+            http_status=None,
+            latency_ms=_elapsed_ms(started_at),
+            error_message=f"Request timed out after {timeout}s",
+            bytes_uploaded=0,
+        )
+    except requests.RequestException as exc:
+        return UploadBytesResult(
+            ok=False,
+            http_status=None,
+            latency_ms=_elapsed_ms(started_at),
+            error_message=f"{type(exc).__name__}: {exc}",
+            bytes_uploaded=0,
+        )
+
+    if commit.status_code == 201:
+        return UploadBytesResult(
+            ok=True,
+            http_status=201,
+            latency_ms=_elapsed_ms(started_at),
+            error_message=None,
+            bytes_uploaded=total,
+        )
+    body = getattr(commit, "text", "") or ""
+    return UploadBytesResult(
+        ok=False,
+        http_status=commit.status_code,
+        latency_ms=_elapsed_ms(started_at),
+        error_message=(
+            _truncate(body)
+            if body
+            else f"Block-list commit failed: HTTP {commit.status_code}"
+        ),
         bytes_uploaded=0,
     )
 

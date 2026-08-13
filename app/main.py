@@ -38,9 +38,11 @@ LEGAL_TAGS_PAGE_PATH = "pages/3_🏷️_Legal_Tags.py"
 INGEST_PAGE_PATH = "pages/4_📥_Ingest.py"
 INGESTION_PAGE_PATH = "pages/5_📄_Manifest.py"
 FILE_UPLOAD_PAGE_PATH = "pages/6_📂_File.py"
-SEARCH_PAGE_PATH = "pages/7_🔍_Search.py"
+VOLVE_PAGE_PATH = "pages/7_🌊_Volve_Dataset.py"
+SEARCH_PAGE_PATH = "pages/8_🔍_Search.py"
 BULK_LOAD_PAGE_PATH = "pages/9_📥_Bulk_Load.py"
-HISTORY_PAGE_PATH = "pages/8_📊_History.py"
+TNO_PAGE_PATH = "pages/11_📦_TNO_Dataset.py"
+HISTORY_PAGE_PATH = "pages/10_📊_History.py"
 
 
 def _render_home() -> None:
@@ -181,8 +183,8 @@ def main() -> None:
     )
     ingest_landing_page = st.Page(
         INGEST_PAGE_PATH,
-        title="Ingest",
-        icon="📥",
+        title="Overview",
+        icon="🧭",
     )
     manifest_page = st.Page(
         INGESTION_PAGE_PATH,
@@ -194,10 +196,20 @@ def main() -> None:
         title="File",
         icon="📂",
     )
+    volve_page = st.Page(
+        VOLVE_PAGE_PATH,
+        title="Volve Dataset",
+        icon="🌊",
+    )
     bulk_load_page = st.Page(
         BULK_LOAD_PAGE_PATH,
         title="Bulk Load",
         icon="📥",
+    )
+    tno_page = st.Page(
+        TNO_PAGE_PATH,
+        title="TNO Dataset",
+        icon="📦",
     )
     search_page = st.Page(
         SEARCH_PAGE_PATH,
@@ -222,6 +234,8 @@ def main() -> None:
                 ingest_landing_page,
                 manifest_page,
                 file_page,
+                volve_page,
+                tno_page,
                 bulk_load_page,
             ],
             "Operate": [search_page, history_page],

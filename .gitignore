@@ -6,6 +6,10 @@ __pycache__/
 # C extensions
 *.so
 
+# TNO work-product loader runtime artifacts
+scripts/wp_load.log
+scripts/.wp_load_progress.json
+
 # Distribution / packaging
 .Python
 build/

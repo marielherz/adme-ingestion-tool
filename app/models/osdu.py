@@ -86,7 +86,7 @@ class WorkflowRunResult:
 
 @dataclass(frozen=True)
 class LegalTagCheckResult:
-    """Outcome of a single ``GET /api/legal/v1/legaltags/{name}`` probe."""
+    """Outcome of a ``POST /api/legal/v1/legaltags:validate`` pre-flight check."""
 
     name: str
     ok: bool
@@ -166,11 +166,58 @@ class KindAggregationResult:
 
 
 @dataclass(frozen=True, slots=True)
+class CursorSearchResult:
+    """Outcome of one cursor-based search page."""
+
+    kind: str
+    query: str | None = None
+    cursor: str | None = None
+    limit: int = 0
+    records: list[RecordSummary] = field(default_factory=list)
+    total_count: int | None = None
+    has_more: bool = False
+    ok: bool = False
+    http_status: int | None = None
+    latency_ms: float = 0.0
+    correlation_id: str | None = None
+    error_message: str | None = None
+    raw_response: dict | str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class RecordDetailResult:
     """Outcome of ``GET /api/storage/v2/records/{id}``."""
 
     record_id: str
     record: dict | None = None
+    ok: bool = False
+    http_status: int | None = None
+    latency_ms: float = 0.0
+    correlation_id: str | None = None
+    error_message: str | None = None
+    raw_response: dict | str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class AggregationBucket:
+    """Single aggregation bucket from Search v2."""
+
+    key: str
+    count: int
+
+
+@dataclass(frozen=True, slots=True)
+class SearchAggregationResult:
+    """Search result with optional aggregation buckets."""
+
+    kind: str
+    query: str | None = None
+    offset: int = 0
+    limit: int = 0
+    records: list[RecordSummary] = field(default_factory=list)
+    total_count: int | None = None
+    has_more: bool = False
+    aggregations: list[AggregationBucket] = field(default_factory=list)
     ok: bool = False
     http_status: int | None = None
     latency_ms: float = 0.0
@@ -312,6 +359,27 @@ class FileMetadataResult:
 
 
 @dataclass(frozen=True, slots=True)
+class FileUploadOutcome:
+    """Outcome of one file inside a bulk upload (upload_files).
+
+    Aggregates the three-call File Service flow for a single local file:
+    ``status`` is ``"success"`` only when the bytes uploaded AND the
+    metadata record registered. ``record_id`` / ``record_version`` are
+    the ADME-minted File.Generic identifiers used to wire the file into a
+    work-product manifest; ``file_source`` is the staged blob token.
+    """
+
+    source_path: Path
+    filename: str
+    status: str
+    record_id: str | None = None
+    record_version: int | None = None
+    file_source: str | None = None
+    bytes_uploaded: int = 0
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class DatasetTier:
     """One tier (reference-data / master-data / work-products) of a dataset.
 
@@ -379,6 +447,26 @@ class SubmitResult:
 
 
 @dataclass(frozen=True, slots=True)
+class StorageRecordsResult:
+    """Outcome of one ``PUT /api/storage/v2/records`` batch call.
+
+    ``ok`` is True on a 2xx response. ``record_ids`` are the ids created
+    or updated; ``skipped_record_ids`` are those the service skipped
+    (e.g. an identical version already existed). ``error_message`` carries
+    a curated reason on failure.
+    """
+
+    ok: bool
+    http_status: int | None
+    record_count: int
+    record_ids: list[str]
+    skipped_record_ids: list[str]
+    error_message: str | None
+    correlation_id: str | None
+    latency_ms: float
+
+
+@dataclass(frozen=True, slots=True)
 class RunRow:
     """One row from ``workflow_runs`` in the local run-history DB.
 
@@ -410,3 +498,164 @@ class UploadRow:
     file_source: str
     size_bytes: int | None
     data_partition_id: str
+
+
+# ---------------------------------------------------------------------------
+# Manifest generator types (contract: satya-manifest-generator-contract.md)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class SchemaField:
+    """One mappable leaf field extracted from an OSDU schema."""
+
+    path: str
+    field_type: str
+    required: bool
+    description: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class FieldMapping:
+    """One CSV-column-to-schema-field binding."""
+
+    csv_header: str
+    schema_path: str
+    transform: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class MappingResult:
+    """Output of auto_map: matched pairs + leftovers."""
+
+    mappings: list[FieldMapping]
+    unmatched_csv: list[str]
+    unmatched_required: list[str]
+    confidence: float
+
+
+# ---------------------------------------------------------------------------
+# Bulk ingestion queue types
+# (contract: kevin-bulk-ingest-contract-2026-05-19.md + final-lock 2026-05-22)
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class QueueItem:
+    """One manifest queued for submit via ``app.services.bulk_ingestion``.
+
+    ``raw_text`` is the verbatim source (file bytes decoded as UTF-8, or
+    the textarea chunk between ``---`` separators). Stored unparsed so
+    validation can attribute parse errors to a specific row AND so the
+    raw payload is preserved verbatim for the run_history failure
+    record (operator must be able to copy/edit and resubmit).
+    ``source`` is one of ``"uploaded"`` or ``"pasted"``.
+    """
+
+    label: str
+    raw_text: str
+    source: str
+
+
+@dataclass(frozen=True, slots=True)
+class QueueValidationResult:
+    """Outcome of pre-submit validation for one :class:`QueueItem`.
+
+    ``parsed_manifest`` is the parsed top-level dict when ``ok`` is
+    ``True`` (matches the third element returned by
+    :func:`app.services.ingestion.validate_manifest_json`) and ``None``
+    otherwise. ``kinds`` carries the distinct ``kind`` strings harvested
+    across ReferenceData / MasterData / Data sections, in first-seen
+    order.
+    """
+
+    label: str
+    ok: bool
+    kinds: tuple[str, ...]
+    record_count: int
+    parsed_manifest: dict | None
+    error_message: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class QueueSubmitResult:
+    """Terminal outcome of one queue-item submit attempt.
+
+    ``status`` is one of ``"success" | "error" | "rejected" | "skipped"``:
+      - ``success``  — submit returned a runId; recorded to history.
+      - ``error``    — runtime failure exhausting retries (non-2xx after
+                       final attempt, 429-exhausted, transport error).
+                       Recorded to history; ``raw_text`` retained.
+      - ``rejected`` — pre-submit validation failed and ``skip_invalid``
+                       was True. Recorded to history. No HTTP issued.
+      - ``skipped``  — operator aborted OR circuit breaker open. Abort
+                       rows are NOT written to history (per
+                       2026-05-22 final lock §4); breaker-skipped rows
+                       are.
+
+    ``attempts`` is the number of HTTP attempts made (``0`` for
+    rejected/skipped, ``1..max_attempts`` for success/error).
+    ``raw_text`` echoes :attr:`QueueItem.raw_text` so the history row
+    and any "download failed rows" export carry the manifest verbatim.
+    """
+
+    label: str
+    status: str
+    run_id: str | None
+    correlation_id: str | None
+    http_status: int | None
+    latency_ms: int | None
+    error_message: str | None
+    submitted_at: datetime
+    attempts: int
+    raw_text: str
+
+
+@dataclass(frozen=True, slots=True)
+class RetryPolicy:
+    """Per-row retry configuration for :func:`bulk_ingestion.submit_queue`.
+
+    Defaults match the module constants (``max_attempts=3``, backoff
+    1/2/4/8s with ±25% jitter, ``Retry-After`` honored up to 60s).
+    Pass ``RetryPolicy(max_attempts=1, ...)`` to disable retries.
+    """
+
+    max_attempts: int = 3
+    backoff_initial_seconds: float = 1.0
+    backoff_cap_seconds: float = 8.0
+    backoff_jitter_ratio: float = 0.25
+    retry_after_max_seconds: float = 60.0
+
+
+@dataclass(frozen=True, slots=True)
+class CircuitBreakerState:
+    """In-loop breaker tracking for :func:`bulk_ingestion.submit_queue`.
+
+    Exposed as a dataclass (not just an int) so tests can assert on the
+    trip moment and the page can render the same shape in both real-time
+    and replay paths. ``threshold`` defaults to 5 consecutive failures.
+    """
+
+    consecutive_failures: int = 0
+    is_tripped: bool = False
+    threshold: int = 5
+    tripped_at: datetime | None = None
+    tripping_label: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class CircuitBreakerTripped:
+    """Page-renderable trip signal emitted when the breaker opens.
+
+    Produced once per :func:`bulk_ingestion.submit_queue` invocation,
+    when ``consecutive_failures`` crosses ``threshold``. The page swaps
+    the live status board into a "paused — would you like to continue or
+    abort?" banner.
+    """
+
+    tripped_at: datetime
+    threshold: int
+    failing_labels: tuple[str, ...]
+    last_http_status: int | None
+    last_error_message: str | None
+    remaining_count: int

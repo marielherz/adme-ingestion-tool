@@ -17,6 +17,7 @@ from app.services.auth import (
     complete_user_auth_flow,
     get_token,
     start_user_auth_flow,
+    user_auth_state_from_pasted_token,
 )
 
 
@@ -430,3 +431,61 @@ def test_get_token_rejects_unsupported_auth_method() -> None:
         match="Unsupported authentication method: 'unsupported'.",
     ):
         get_token(connection)
+
+
+# ---------------------------------------------------------------------------
+# user_auth_state_from_pasted_token
+# ---------------------------------------------------------------------------
+
+
+def _make_jwt(payload: dict[str, object]) -> str:
+    """Return a JWT-looking string with the given payload claim set."""
+    import base64
+    import json
+
+    def seg(data: bytes) -> str:
+        return base64.urlsafe_b64encode(data).rstrip(b"=").decode("ascii")
+
+    header = seg(json.dumps({"alg": "RS256", "typ": "JWT"}).encode("utf-8"))
+    body = seg(json.dumps(payload).encode("utf-8"))
+    return f"{header}.{body}.{seg(b'sig')}"
+
+
+def test_user_auth_state_from_pasted_token_accepts_valid_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(auth_module.time, "time", lambda: 1_000.0)
+    token = _make_jwt({"oid": "abc", "exp": 5_000})
+
+    state = user_auth_state_from_pasted_token(f"  {token}  ")
+
+    assert state.access_token == token
+    assert state.expires_at == 5_000
+    assert not state.is_expired()
+
+
+def test_user_auth_state_from_pasted_token_rejects_empty() -> None:
+    with pytest.raises(AuthenticationError, match="non-empty"):
+        user_auth_state_from_pasted_token("   ")
+
+
+def test_user_auth_state_from_pasted_token_rejects_non_jwt() -> None:
+    with pytest.raises(AuthenticationError, match="three"):
+        user_auth_state_from_pasted_token("not-a-jwt")
+
+
+def test_user_auth_state_from_pasted_token_rejects_token_without_exp() -> None:
+    token = _make_jwt({"oid": "abc"})
+
+    with pytest.raises(AuthenticationError, match="expiry"):
+        user_auth_state_from_pasted_token(token)
+
+
+def test_user_auth_state_from_pasted_token_rejects_expired_token(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(auth_module.time, "time", lambda: 10_000.0)
+    token = _make_jwt({"oid": "abc", "exp": 5_000})
+
+    with pytest.raises(AuthenticationError, match="already expired"):
+        user_auth_state_from_pasted_token(token)

@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import base64
+import re
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -23,6 +26,7 @@ from app.services.files import (
     MAX_FILE_BYTES_V1,
     get_upload_url,
     post_file_metadata,
+    upload_file_blocks,
     upload_file_bytes,
 )
 
@@ -668,3 +672,131 @@ def test_post_file_metadata_rejects_blank_required_fields(
         post_file_metadata(
             _connection(), token="t", **_md_kwargs(**{field_name: blank})
         )
+
+
+# ===========================================================================
+# upload_file_blocks (streaming block-blob upload for large files)
+# ===========================================================================
+
+
+def test_upload_file_blocks_happy_path(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured = _patch_method(
+        monkeypatch, "put", lambda **_: _FakeResponse(status_code=201)
+    )
+    path = tmp_path / "big.segy"
+    path.write_bytes(b"ABCDE")  # 5 bytes → 3 blocks at size 2
+
+    result = upload_file_blocks(
+        "https://blob.example/sas?sig=x",
+        path,
+        content_type="application/x-segy",
+        block_size=2,
+    )
+
+    assert result.ok is True
+    assert result.http_status == 201
+    assert result.bytes_uploaded == 5
+    urls = [c["url"] for c in captured]
+    block_puts = [u for u in urls if "comp=block&" in u]
+    commits = [u for u in urls if u.endswith("comp=blocklist")]
+    assert len(block_puts) == 3
+    assert len(commits) == 1
+    commit = next(c for c in captured if c["url"].endswith("comp=blocklist"))
+    assert commit["headers"]["x-ms-blob-content-type"] == "application/x-segy"
+    assert commit["data"].decode("utf-8").count("<Latest>") == 3
+
+
+def test_upload_file_blocks_block_failure_aborts_before_commit(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls = {"n": 0}
+
+    def factory(**kwargs: Any) -> _FakeResponse:
+        calls["n"] += 1
+        return _FakeResponse(
+            status_code=500 if calls["n"] == 2 else 201, body="boom"
+        )
+
+    captured = _patch_method(monkeypatch, "put", factory)
+    path = tmp_path / "big.segy"
+    path.write_bytes(b"ABCD")  # 2 blocks at size 2
+
+    result = upload_file_blocks("https://blob.example/sas", path, block_size=2)
+
+    assert result.ok is False
+    assert result.http_status == 500
+    assert not any(c["url"].endswith("comp=blocklist") for c in captured)
+
+
+def test_upload_file_blocks_commit_failure(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def factory(**kwargs: Any) -> _FakeResponse:
+        if kwargs["url"].endswith("comp=blocklist"):
+            return _FakeResponse(status_code=500, body="commit boom")
+        return _FakeResponse(status_code=201)
+
+    _patch_method(monkeypatch, "put", factory)
+    path = tmp_path / "f"
+    path.write_bytes(b"ABCD")
+
+    result = upload_file_blocks("https://blob.example/sas", path, block_size=2)
+
+    assert result.ok is False
+    assert result.http_status == 500
+
+
+def test_upload_file_blocks_empty_file_no_network(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured = _patch_method(
+        monkeypatch, "put", lambda **_: _FakeResponse(status_code=201)
+    )
+    path = tmp_path / "empty"
+    path.write_bytes(b"")
+
+    result = upload_file_blocks("https://blob.example/sas", path)
+
+    assert result.ok is False
+    assert "empty" in (result.error_message or "").lower()
+    assert captured == []
+
+
+def test_upload_file_blocks_block_ids_fixed_length_and_ordered(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured = _patch_method(
+        monkeypatch, "put", lambda **_: _FakeResponse(status_code=201)
+    )
+    path = tmp_path / "f"
+    path.write_bytes(b"ABCDEF")  # 3 blocks at size 2
+    upload_file_blocks("https://blob.example/sas", path, block_size=2)
+
+    commit = next(c for c in captured if c["url"].endswith("comp=blocklist"))
+    ids = re.findall(r"<Latest>([^<]+)</Latest>", commit["data"].decode("utf-8"))
+    assert len(ids) == 3
+    assert len({len(i) for i in ids}) == 1  # Azure requires equal-length ids
+    decoded = [base64.b64decode(i).decode("ascii") for i in ids]
+    assert decoded == ["00000000", "00000001", "00000002"]
+
+
+@pytest.mark.parametrize("bad_url", ["", "   "])
+def test_upload_file_blocks_rejects_blank_url(
+    bad_url: str, tmp_path: Path
+) -> None:
+    path = tmp_path / "f"
+    path.write_bytes(b"x")
+    with pytest.raises(ValueError, match="non-empty signed_url"):
+        upload_file_blocks(bad_url, path)
+
+
+def test_upload_file_blocks_rejects_nonpositive_block_size(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "f"
+    path.write_bytes(b"x")
+    with pytest.raises(ValueError, match="positive integer"):
+        upload_file_blocks("https://blob.example/sas", path, block_size=0)
+

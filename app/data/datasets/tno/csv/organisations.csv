@@ -1,0 +1,5 @@
+id,organisationname,organisationid,aliasname_1,aliasnametypeid_1,aliasname_2,aliasnametypeid_2
+TNO,TNO - Geological Survey of the Netherlands,TNO-GSN,TNO Geologische Dienst Nederland,<namespace>:reference-data--AliasNameType:RegulatoryName:,Netherlands Organisation for Applied Scientific Research,<namespace>:reference-data--AliasNameType:UniqueIdentifier:
+EBN,EBN B.V.,EBN-001,Energie Beheer Nederland,<namespace>:reference-data--AliasNameType:RegulatoryName:,,
+NAM,Nederlandse Aardolie Maatschappij B.V.,NAM-001,NAM,<namespace>:reference-data--AliasNameType:RegulatoryName:,Shell NAM,<namespace>:reference-data--AliasNameType:UniqueIdentifier:
+NLOG,NLOG,NLOG-001,Netherlands Oil and Gas Portal,<namespace>:reference-data--AliasNameType:RegulatoryName:,,

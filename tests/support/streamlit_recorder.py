@@ -145,6 +145,34 @@ class StreamlitNavigationMock:
             self.flat_pages[0].run()
 
 
+class StreamlitProgressMock:
+    """Stand-in for the object returned by ``st.progress(...)``.
+
+    The page calls ``bar = st.progress(0.0, text=...); bar.progress(0.5)``
+    to update progress during submit loops. This mock records each
+    ``.progress()`` update so tests can assert on final progress values.
+    """
+
+    def __init__(
+        self,
+        recorder: StreamlitRecorder,
+        initial: float,
+        kwargs: dict[str, Any],
+    ) -> None:
+        self._recorder = recorder
+        self._recorder.calls.append(
+            StreamlitCall(name="progress", args=(initial,), kwargs=kwargs)
+        )
+        self.updates: list[tuple[float, dict[str, Any]]] = []
+
+    def progress(self, value: float, **kwargs: Any) -> None:
+        """Record a progress-bar update."""
+        self.updates.append((value, kwargs))
+        self._recorder.calls.append(
+            StreamlitCall(name="progress_update", args=(value,), kwargs=kwargs)
+        )
+
+
 class QueryParamsRecorder(dict[str, object]):
     """Record query-param clearing while behaving like Streamlit query params."""
 
@@ -200,6 +228,20 @@ class StreamlitRecorder(ModuleType):
             for index in range(count)
         ]
 
+    def tabs(self, labels: list[str], **kwargs: Any) -> list[StreamlitContext]:
+        """Return context managers for ``tab_a, tab_b = st.tabs([...])``."""
+        self.calls.append(
+            StreamlitCall(name="tabs", args=(labels,), kwargs=kwargs)
+        )
+        return [
+            StreamlitContext(self, "tab", (label,), {})
+            for label in labels
+        ]
+
+    def progress(self, value: float = 0.0, **kwargs: Any) -> StreamlitProgressMock:
+        """Return a progress-bar mock with a chainable ``.progress()`` method."""
+        return StreamlitProgressMock(self, value, kwargs)
+
     def status(self, label: str, **kwargs: Any) -> StreamlitStatusContext:
         """Return a context manager that also exposes ``.update(...)``."""
         return StreamlitStatusContext(self, (label,), kwargs)
@@ -254,7 +296,14 @@ class StreamlitRecorder(ModuleType):
         return bool(self.widget_values.get(label, value))
 
     def text_input(self, label: str, value: str = "", **kwargs: Any) -> str:
-        """Record a text input and return the configured widget value."""
+        """Record a text input and return the configured widget value.
+
+        Resolution order mirrors Streamlit's precedence for keyed widgets:
+        an explicit ``widget_values[label]`` test override wins first, then a
+        seeded ``session_state[key]`` value (for widgets that manage their value
+        through ``key`` instead of ``value=``), and finally the ``value``
+        default.
+        """
         self.calls.append(
             StreamlitCall(
                 name="text_input",
@@ -262,8 +311,12 @@ class StreamlitRecorder(ModuleType):
                 kwargs={"value": value, **kwargs},
             )
         )
-        widget_value = self.widget_values.get(label, value)
-        return str(widget_value)
+        if label in self.widget_values:
+            return str(self.widget_values[label])
+        key = kwargs.get("key")
+        if key is not None and key in self.session_state:
+            return str(self.session_state[key])
+        return str(value)
 
     def radio(
         self,
@@ -308,6 +361,33 @@ class StreamlitRecorder(ModuleType):
             return False
         return self.button_responses.get(label, False)
 
+    def checkbox(
+        self, label: str, value: bool = False, **kwargs: Any
+    ) -> bool:
+        """Record a checkbox and return the configured widget value (bool).
+
+        Mirrors a keyed Streamlit widget: a ``widget_values[label]`` override
+        wins, else a seeded ``session_state[key]`` value, else ``value``. The
+        resolved value is written back to ``session_state[key]``.
+        """
+        self.calls.append(
+            StreamlitCall(
+                name="checkbox",
+                args=(label,),
+                kwargs={"value": value, **kwargs},
+            )
+        )
+        key = kwargs.get("key")
+        if label in self.widget_values:
+            resolved = bool(self.widget_values[label])
+        elif key and key in self.session_state:
+            resolved = bool(self.session_state[key])
+        else:
+            resolved = bool(value)
+        if key:
+            self.session_state[key] = resolved
+        return resolved
+
     def toggle(
         self, label: str, value: bool = False, **kwargs: Any
     ) -> bool:
@@ -338,6 +418,12 @@ class StreamlitRecorder(ModuleType):
         )
         if label in self.widget_values:
             return self.widget_values[label]
+        # Honour session-state key binding (mirrors real Streamlit behaviour).
+        key = kwargs.get("key")
+        if key and key in self.session_state:
+            val = self.session_state[key]
+            if val in (list(options) if options else []):
+                return val
         if not options:
             return None
         try:
@@ -352,7 +438,12 @@ class StreamlitRecorder(ModuleType):
         default: list[Any] | None = None,
         **kwargs: Any,
     ) -> list[Any]:
-        """Record a multiselect and return the configured value (list)."""
+        """Record a multiselect and return the configured value (list).
+
+        Mirrors a keyed Streamlit widget: a ``widget_values[label]`` override
+        wins, else a seeded ``session_state[key]`` value, else ``default``. The
+        resolved value is written back to ``session_state[key]``.
+        """
         self.calls.append(
             StreamlitCall(
                 name="multiselect",
@@ -360,9 +451,16 @@ class StreamlitRecorder(ModuleType):
                 kwargs={"default": default, **kwargs},
             )
         )
+        key = kwargs.get("key")
         if label in self.widget_values:
-            return list(self.widget_values[label])
-        return list(default) if default else []
+            resolved = list(self.widget_values[label])
+        elif key and key in self.session_state:
+            resolved = list(self.session_state[key])
+        else:
+            resolved = list(default) if default else []
+        if key:
+            self.session_state[key] = resolved
+        return resolved
 
     def date_input(
         self, label: str, value: Any = None, **kwargs: Any

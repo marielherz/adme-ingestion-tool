@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import quote
 
 import pytest
 import requests  # type: ignore[import-untyped]
@@ -18,16 +17,19 @@ from app.models.osdu import (
 from app.services import ingestion as ingestion_module
 from app.services.ingestion import (
     INGESTION_TIMEOUT_SECONDS,
-    LEGAL_TAGS_PATH,
+    STORAGE_MAX_RECORDS_PER_CALL,
+    STORAGE_RECORDS_PATH,
     TNO_SAMPLE_MANIFEST,
     WORKFLOW_INGEST_RUN_PATH,
     WORKFLOW_RUN_STATUS_PATH_TEMPLATE,
     check_legal_tag,
     get_workflow_status,
+    put_records,
     submit_manifest,
     substitute_manifest_placeholders,
     validate_manifest_json,
 )
+from app.services.legal_tags import LEGAL_TAG_VALIDATE_PATH
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -94,6 +96,20 @@ def _patch_post(
         return response_factory(**kwargs)
 
     monkeypatch.setattr(ingestion_module.requests, "post", fake_post)
+    return captured
+
+
+def _patch_put(
+    monkeypatch: pytest.MonkeyPatch,
+    response_factory: Any,
+) -> list[dict[str, Any]]:
+    captured: list[dict[str, Any]] = []
+
+    def fake_put(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+        return response_factory(**kwargs)
+
+    monkeypatch.setattr(ingestion_module.requests, "put", fake_put)
     return captured
 
 
@@ -475,12 +491,12 @@ def test_substitute_manifest_placeholders_rejects_unresolved_token() -> None:
 
 
 def test_check_legal_tag_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured = _patch_get(
+    captured = _patch_post(
         monkeypatch,
         lambda **_: _FakeResponse(
             status_code=200,
             headers={"correlation-id": "corr-legal-1"},
-            json_payload={"name": "opendes-open-test"},
+            json_payload={"invalidLegalTags": []},
         ),
     )
 
@@ -496,20 +512,23 @@ def test_check_legal_tag_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
     assert result.error_message is None
     assert result.latency_ms >= 0.0
     assert len(captured) == 1
-    assert captured[0]["url"].endswith(
-        f"{LEGAL_TAGS_PATH}/opendes-open-test"
-    )
+    assert captured[0]["url"].endswith(LEGAL_TAG_VALIDATE_PATH)
+    assert captured[0]["json"] == {"names": ["opendes-open-test"]}
 
 
-def test_check_legal_tag_404_uses_curated_message(
+def test_check_legal_tag_invalid_tag_returns_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    _patch_get(
+    _patch_post(
         monkeypatch,
         lambda **_: _FakeResponse(
-            status_code=404,
-            headers={"correlation-id": "corr-404"},
-            json_payload={"message": "raw not found"},
+            status_code=200,
+            headers={"correlation-id": "corr-invalid"},
+            json_payload={
+                "invalidLegalTags": [
+                    {"name": "missing-tag", "reason": "not found"}
+                ]
+            },
         ),
     )
 
@@ -520,19 +539,19 @@ def test_check_legal_tag_404_uses_curated_message(
     )
 
     assert result.ok is False
-    assert result.http_status == 404
+    assert result.http_status == 200
     assert result.error_message is not None
     assert "missing-tag" in result.error_message
     assert "opendes" in result.error_message
-    assert "not found" in result.error_message.lower()
-    assert result.correlation_id == "corr-404"
+    assert "not valid" in result.error_message.lower()
+    assert result.correlation_id == "corr-invalid"
 
 
 @pytest.mark.parametrize("status_code", [401, 403, 500])
 def test_check_legal_tag_http_errors(
     monkeypatch: pytest.MonkeyPatch, status_code: int
 ) -> None:
-    _patch_get(
+    _patch_post(
         monkeypatch,
         lambda **_: _FakeResponse(
             status_code=status_code,
@@ -551,10 +570,10 @@ def test_check_legal_tag_http_errors(
 
 
 def test_check_legal_tag_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_get(**_: Any) -> Any:
+    def fake_post(**_: Any) -> Any:
         raise requests.exceptions.Timeout("read timed out")
 
-    monkeypatch.setattr(ingestion_module.requests, "get", fake_get)
+    monkeypatch.setattr(ingestion_module.requests, "post", fake_post)
 
     result = check_legal_tag(_connection(), token="t", legal_tag_name="x")
 
@@ -568,10 +587,10 @@ def test_check_legal_tag_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
 def test_check_legal_tag_connection_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    def fake_get(**_: Any) -> Any:
+    def fake_post(**_: Any) -> Any:
         raise requests.exceptions.ConnectionError("dns failure")
 
-    monkeypatch.setattr(ingestion_module.requests, "get", fake_get)
+    monkeypatch.setattr(ingestion_module.requests, "post", fake_post)
 
     result = check_legal_tag(_connection(), token="t", legal_tag_name="x")
 
@@ -584,9 +603,12 @@ def test_check_legal_tag_connection_error(
 def test_check_legal_tag_outgoing_headers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured = _patch_get(
+    captured = _patch_post(
         monkeypatch,
-        lambda **_: _FakeResponse(status_code=200, json_payload={}),
+        lambda **_: _FakeResponse(
+            status_code=200,
+            json_payload={"invalidLegalTags": []},
+        ),
     )
 
     check_legal_tag(_connection(), token="bearer-abc", legal_tag_name="x")
@@ -595,7 +617,7 @@ def test_check_legal_tag_outgoing_headers(
     assert headers["Authorization"] == "Bearer bearer-abc"
     assert headers["data-partition-id"] == "example-opendes"
     assert headers["Accept"] == "application/json"
-    assert "Content-Type" not in headers  # GET — no body
+    assert headers["Content-Type"] == "application/json"  # POST — has body
     assert captured[0]["timeout"] == INGESTION_TIMEOUT_SECONDS
     assert captured[0]["allow_redirects"] is False
 
@@ -606,12 +628,12 @@ def test_check_legal_tag_outgoing_headers(
 def test_check_legal_tag_correlation_id_case_insensitive(
     monkeypatch: pytest.MonkeyPatch, header_name: str
 ) -> None:
-    _patch_get(
+    _patch_post(
         monkeypatch,
         lambda **_: _FakeResponse(
             status_code=200,
             headers={header_name: "corr-x"},
-            json_payload={},
+            json_payload={"invalidLegalTags": []},
         ),
     )
 
@@ -619,18 +641,22 @@ def test_check_legal_tag_correlation_id_case_insensitive(
     assert result.correlation_id == "corr-x"
 
 
-def test_check_legal_tag_url_encodes_special_chars(
+def test_check_legal_tag_sends_name_in_body(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured = _patch_get(
+    captured = _patch_post(
         monkeypatch,
-        lambda **_: _FakeResponse(status_code=200, json_payload={}),
+        lambda **_: _FakeResponse(
+            status_code=200,
+            json_payload={"invalidLegalTags": []},
+        ),
     )
 
     weird = "a tag/with spaces+and-slash"
     check_legal_tag(_connection(), token="t", legal_tag_name=weird)
 
-    assert captured[0]["url"].endswith(f"{LEGAL_TAGS_PATH}/{quote(weird, safe='')}")
+    assert captured[0]["json"] == {"names": [weird]}
+    assert captured[0]["url"].endswith(LEGAL_TAG_VALIDATE_PATH)
 
 
 @pytest.mark.parametrize("name", ["", "   ", "\t\n"])
@@ -759,6 +785,131 @@ def test_submit_manifest_connection_error(
     assert result.ok is False
     assert result.http_status is None
     assert "ConnectionError" in (result.error_message or "")
+
+
+# ---------------------------------------------------------------------------
+# put_records (Storage API PUT /records)
+# ---------------------------------------------------------------------------
+
+
+def _storage_record(record_id: str = "opendes:master-data--Well:1") -> dict[str, Any]:
+    return {
+        "id": record_id,
+        "kind": "osdu:wks:master-data--Well:1.0.0",
+        "acl": {"owners": ["o@x"], "viewers": ["v@x"]},
+        "legal": {
+            "legaltags": ["opendes-public-usa-dataset"],
+            "otherRelevantDataCountries": ["US"],
+        },
+        "data": {"FacilityName": "W1"},
+    }
+
+
+def test_put_records_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    records = [_storage_record("opendes:master-data--Well:1")]
+    captured = _patch_put(
+        monkeypatch,
+        lambda **_: _FakeResponse(
+            status_code=201,
+            headers={"correlation-id": "corr-put-1"},
+            json_payload={
+                "recordCount": 1,
+                "recordIds": ["opendes:master-data--Well:1"],
+                "skippedRecordIds": [],
+            },
+        ),
+    )
+
+    result = put_records(_connection(), token="t", records=records)
+
+    assert result.ok is True
+    assert result.http_status == 201
+    assert result.record_count == 1
+    assert result.record_ids == ["opendes:master-data--Well:1"]
+    assert result.skipped_record_ids == []
+    assert result.error_message is None
+    assert result.correlation_id == "corr-put-1"
+    # The PUT targets the Storage records endpoint with the records array.
+    assert captured[0]["url"].endswith(STORAGE_RECORDS_PATH)
+    assert captured[0]["json"] == records
+
+
+def test_put_records_surfaces_skipped_ids(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_put(
+        monkeypatch,
+        lambda **_: _FakeResponse(
+            status_code=200,
+            json_payload={
+                "recordCount": 1,
+                "recordIds": ["opendes:master-data--Well:1"],
+                "skippedRecordIds": ["opendes:master-data--Well:2"],
+            },
+        ),
+    )
+
+    result = put_records(
+        _connection(),
+        token="t",
+        records=[_storage_record("opendes:master-data--Well:1")],
+    )
+
+    assert result.ok is True
+    assert result.skipped_record_ids == ["opendes:master-data--Well:2"]
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 409, 500])
+def test_put_records_http_errors(
+    monkeypatch: pytest.MonkeyPatch, status_code: int
+) -> None:
+    _patch_put(
+        monkeypatch,
+        lambda **_: _FakeResponse(
+            status_code=status_code,
+            json_payload={"message": f"boom {status_code}"},
+        ),
+    )
+
+    result = put_records(
+        _connection(), token="t", records=[_storage_record()]
+    )
+
+    assert result.ok is False
+    assert result.http_status == status_code
+    assert result.record_ids == []
+    assert f"boom {status_code}" in (result.error_message or "")
+
+
+def test_put_records_rejects_empty_list() -> None:
+    with pytest.raises(ValueError, match="non-empty list"):
+        put_records(_connection(), token="t", records=[])
+
+
+def test_put_records_rejects_over_500(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    records = [
+        _storage_record(f"opendes:master-data--Well:{i}")
+        for i in range(STORAGE_MAX_RECORDS_PER_CALL + 1)
+    ]
+    with pytest.raises(ValueError, match="at most"):
+        put_records(_connection(), token="t", records=records)
+
+
+def test_put_records_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    def fake_put(**_: Any) -> Any:
+        raise requests.exceptions.Timeout("slow")
+
+    monkeypatch.setattr(ingestion_module.requests, "put", fake_put)
+
+    result = put_records(
+        _connection(), token="t", records=[_storage_record()]
+    )
+
+    assert result.ok is False
+    assert result.http_status is None
+    assert "timed out" in (result.error_message or "").lower()
 
 
 def test_submit_manifest_outgoing_headers(

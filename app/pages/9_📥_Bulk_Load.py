@@ -9,11 +9,22 @@ The page enforces a mandatory **Preview gate**: the Submit button stays
 disabled until the operator has clicked Preview for the current dataset/tier
 combination. Changing dataset or tier invalidates the gate so the operator
 can never submit a payload they didn't first inspect.
+
+The **Generate from CSV** tab lets operators pick an OSDU kind, upload a
+CSV, review/adjust the auto-mapped column-to-field mapping, and generate +
+submit manifests without hand-authoring JSON templates.
 """
 
 from __future__ import annotations
 
+import hashlib
+import io
+import json
 import sys
+import tempfile
+import time
+import uuid
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -34,20 +45,78 @@ from app.models.connection import (  # noqa: E402
     AuthMethod,
 )
 from app.models.osdu import (  # noqa: E402
+    CircuitBreakerTripped,
     DatasetDescriptor,
+    FieldMapping,
     ManifestPreview,
+    MappingResult,
+    QueueItem,
+    QueueSubmitResult,
+    QueueValidationResult,
     SubmitResult,
+    WorkflowStatus,
 )
-from app.services.auth import AuthenticationError, get_token  # noqa: E402
+from app.services.auth import (  # noqa: E402
+    AuthenticationError,
+    RefreshingTokenProvider,
+    acquire_cli_token,
+    get_token,
+)
+from app.services.background_jobs import (  # noqa: E402
+    STATUS_ABORTED,
+    STATUS_ERROR,
+    STATUS_RUNNING,
+    LoadJob,
+    clear_job,
+    get_job,
+    request_abort,
+    start_job,
+)
+from app.services.bulk_ingestion import (  # noqa: E402
+    MAX_QUEUE_SIZE,
+    build_queue_from_files,
+    enforce_queue_size_limit,
+    parse_pasted_manifests,
+    submit_queue,
+    validate_queue,
+)
 from app.services.bulk_loader import (  # noqa: E402
     DATA_ROOT,
+    DEFAULT_STORAGE_BATCH_SIZE,
+    STORAGE_MAX_RECORDS_PER_CALL,
     _clear_cache,
+    count_section_records,
     list_datasets,
+    make_load_prefix,
     preview_tier,
+    submit_records_from_paths,
     submit_tier,
 )
+from app.services.downloaded_dataset import (  # noqa: E402
+    DownloadedPart,
+    discover_parts,
+    list_part_manifests,
+)
 from app.services.entitlements import fetch_groups  # noqa: E402
+from app.services.ingestion import get_workflow_status, submit_manifest  # noqa: E402
+from app.services.interval_loader import (  # noqa: E402
+    plan_interval,
+    run_interval,
+)
 from app.services.legal_tags import list_legal_tags  # noqa: E402
+from app.services.load_progress import ResumableProgress  # noqa: E402
+from app.services.manifest_generator import (  # noqa: E402
+    MappingError,
+    SchemaNotFoundError,
+    auto_map,
+    extract_schema_fields,
+    generate_manifests,
+    list_schema_kinds,
+    load_schema,
+)
+from app.services.work_product_loader import (  # noqa: E402
+    submit_work_products,
+)
 
 SETTINGS_PAGE_PATH = "pages/1_⚙️_Instance_Configuration.py"
 
@@ -57,10 +126,67 @@ BULK_TIER_KEY = "bulk_tier"
 BULK_LEGAL_TAG_KEY = "bulk_legal_tag"
 BULK_ACL_OWNERS_KEY = "bulk_acl_owners"
 BULK_ACL_VIEWERS_KEY = "bulk_acl_viewers"
+BULK_LOAD_PREFIX_KEY = "bulk_load_prefix"  # str — per-load independent-copy id prefix
 BULK_PREVIEW_SEEN_KEY = "bulk_preview_seen"  # tuple[str, str] | None
 BULK_PREVIEW_RESULTS_KEY = "bulk_preview_results"  # list[ManifestPreview]
 BULK_SUBMIT_RESULTS_KEY = "bulk_submit_results"  # list[SubmitResult]
+BULK_RUN_STATUS_KEY = "bulk_run_status"  # dict[run_id, {state, detail}]
 BULK_LAST_ERROR_KEY = "bulk_last_error"  # str | None
+BULK_ABORT_KEY = "bulk_abort_requested"  # bool — graceful mid-loop stop
+
+# --- Downloaded-dataset (external TNO/Volve root) session keys ------------
+DOWNLOAD_ROOT_KEY = "bulk_download_root"  # str — local download folder
+DOWNLOAD_PART_KEY = "bulk_download_part"  # int — selected part index
+DOWNLOAD_LIMIT_KEY = "bulk_download_limit"  # int — manifest cap (0 = all)
+DOWNLOAD_OFFSET_KEY = "bulk_download_offset"  # int — 1-based start manifest #
+DOWNLOAD_AUTO_REFRESH_KEY = "bulk_dl_auto_refresh"  # bool — az CLI token refresh
+DOWNLOAD_JOB_ID_KEY = "bulk_dl_job_id"  # str — active background load job id
+DOWNLOAD_BATCH_SIZE_KEY = "bulk_dl_batch_size"  # int — records per Storage PUT
+
+# Seconds between background-load progress polls (page reruns).
+_JOB_POLL_SECONDS = 1.5
+# Distinct ACL/legal/prefix widget keys so the download tab's inputs don't
+# collide with the Registered Datasets tab (both render in the same run).
+DOWNLOAD_LEGAL_TAG_KEY = "bulk_dl_legal_tag"
+DOWNLOAD_ACL_OWNERS_KEY = "bulk_dl_acl_owners"
+DOWNLOAD_ACL_VIEWERS_KEY = "bulk_dl_acl_viewers"
+DOWNLOAD_LOAD_PREFIX_KEY = "bulk_dl_load_prefix"
+
+# --- Smart Tier interval-load session keys (the recommended one-click flow)
+SMART_ROOT_KEY = "smart_root"  # str — downloaded dataset root
+SMART_INTERVAL_KEY = "smart_interval_label"  # str — date prefix = interval clock
+SMART_INCLUDE_WP_KEY = "smart_include_wp"  # bool — also load work-products (DAG)
+SMART_BATCH_KEY = "smart_batch_size"  # int — Storage records per PUT
+SMART_AUTO_REFRESH_KEY = "smart_auto_refresh"  # bool — az CLI token refresh
+SMART_JOB_ID_KEY = "smart_job_id"  # str — active interval-load job id
+SMART_LEGAL_TAG_KEY = "smart_legal_tag"
+SMART_ACL_OWNERS_KEY = "smart_acl_owners"
+SMART_ACL_VIEWERS_KEY = "smart_acl_viewers"
+
+# Where per-interval resumable progress is persisted (survives restarts).
+_INTERVAL_PROGRESS_DIR = (
+    Path.home() / ".adme-ingestion-tool" / "interval_progress"
+)
+
+
+# --- Generate-from-CSV session-state keys (prefixed gen_) ----------------
+GEN_KIND_KEY = "gen_kind"
+GEN_CSV_DATA_KEY = "gen_csv_data"
+GEN_MAPPING_RESULT_KEY = "gen_mapping_result"
+GEN_CONFIRMED_MAPPINGS_KEY = "gen_confirmed_mappings"
+GEN_MANIFESTS_KEY = "gen_manifests"
+GEN_SUBMIT_RESULTS_KEY = "gen_submit_results"
+GEN_LEGAL_TAG_KEY = "gen_legal_tag"
+GEN_ACL_OWNERS_KEY = "gen_acl_owners"
+GEN_ACL_VIEWERS_KEY = "gen_acl_viewers"
+GEN_LAST_ERROR_KEY = "gen_last_error"
+GEN_ABORT_KEY = "gen_abort_requested"  # bool — graceful mid-loop stop (CSV tab)
+
+# --- Internal helper keys for CSV-gen options ----------------------------
+GEN_OPTIONS_AUTORUN_KEY = "gen_options_autorun_done"
+GEN_LEGAL_TAG_OPTIONS_KEY = "gen_legal_tag_options"
+GEN_ACL_OWNER_OPTIONS_KEY = "gen_acl_owner_options"
+GEN_ACL_VIEWER_OPTIONS_KEY = "gen_acl_viewer_options"
 
 # --- Internal helper keys (not part of the locked contract) --------------
 BULK_OPTIONS_AUTORUN_KEY = "bulk_options_autorun_done"
@@ -70,8 +196,62 @@ BULK_ACL_VIEWER_OPTIONS_KEY = "bulk_acl_viewer_options"
 
 PREVIEW_BUTTON_LABEL = "🔍 Preview manifests"
 SUBMIT_BUTTON_LABEL = "🚀 Submit all manifests"
+RUN_STATUS_BUTTON_LABEL = "🔄 Check ingestion status"
 DISMISS_BUTTON_LABEL = "Dismiss error"
 REFRESH_OPTIONS_LABEL = "🔄 Refresh legal tags & groups"
+
+# --- Queue tab session-state keys (locked — tests assert these names) ----
+QUEUE_INPUT_MODE_KEY = "queue_input_mode"
+QUEUE_UPLOADED_FILES_KEY = "queue_uploaded_files"
+QUEUE_PASTE_TEXT_KEY = "queue_paste_text"
+QUEUE_LEGAL_TAG_KEY = "queue_legal_tag"
+QUEUE_ACL_OWNERS_KEY = "queue_acl_owners"
+QUEUE_ACL_VIEWERS_KEY = "queue_acl_viewers"
+QUEUE_INTER_SUBMIT_DELAY_KEY = "queue_inter_submit_delay"
+QUEUE_SKIP_INVALID_KEY = "queue_skip_invalid"
+QUEUE_PARSED_ITEMS_KEY = "queue_parsed_items"
+QUEUE_VALIDATION_RESULTS_KEY = "queue_validation_results"
+QUEUE_PREVIEW_SEEN_KEY = "queue_preview_seen"  # bool — reviewed checkbox
+QUEUE_LIVE_RESULTS_KEY = "queue_live_results"
+QUEUE_LIVE_ATTEMPTS_KEY = "queue_live_attempts"
+QUEUE_BREAKER_EVENT_KEY = "queue_breaker_event"
+QUEUE_LAST_BATCH_SUMMARY_KEY = "queue_last_batch_summary"
+QUEUE_ABORT_KEY = "queue_abort_requested"
+QUEUE_SUBMIT_IN_FLIGHT_KEY = "queue_submit_in_flight"
+
+# Queue helper keys (autorun-once dropdown options + signature/last-mode).
+QUEUE_LEGAL_TAG_OPTIONS_KEY = "queue_legal_tag_options"
+QUEUE_ACL_OWNER_OPTIONS_KEY = "queue_acl_owner_options"
+QUEUE_ACL_VIEWER_OPTIONS_KEY = "queue_acl_viewer_options"
+QUEUE_OPTIONS_AUTORUN_KEY = "queue_options_autorun_done"
+QUEUE_LAST_MODE_KEY = "queue_last_input_mode"
+QUEUE_INPUT_SIGNATURE_KEY = "queue_input_signature"
+
+QUEUE_INPUT_MODE_UPLOAD = "Multi-file upload"
+QUEUE_INPUT_MODE_PASTE = "Paste many (--- separator)"
+QUEUE_FILE_UPLOADER_LABEL = "Manifest files"
+QUEUE_PASTE_TEXTAREA_LABEL = "Paste manifests (separate each with a line of `---`)"
+QUEUE_PARSE_BUTTON_LABEL = "🔎 Parse queue"
+QUEUE_SUBMIT_BUTTON_LABEL = "🚀 Submit queue"
+QUEUE_ABORT_BUTTON_LABEL = "⏹️ Abort queue"
+QUEUE_PREVIEW_CHECKBOX_LABEL = "I have reviewed the queue"
+QUEUE_RESUME_BUTTON_LABEL = "▶️ Resume after breaker"
+QUEUE_DOWNLOAD_FAILED_LABEL = "⬇️ Download failed rows (JSON)"
+QUEUE_REFRESH_OPTIONS_LABEL = "🔄 Refresh legal tags & groups (queue)"
+
+# Row state → operator emoji mapping for the live progress board.
+_QUEUE_ROW_STATE_EMOJI: dict[str, str] = {
+    "queued": "⏸",
+    "submitting": "⏳",
+    "retrying": "🟡",
+    "success": "✅",
+    "error": "❌",
+    "rejected": "❌",
+    "skipped": "⏹",
+    "skipped_invalid": "⛔",
+    "skipped_breaker": "🛑",
+    "breaker_tripped": "🛑",
+}
 
 
 def main() -> None:
@@ -83,9 +263,9 @@ def main() -> None:
     )
     st.title("📥 Bulk Load")
     st.markdown(
-        "Submit a registered OSDU dataset (reference-data, master-data, or "
-        "work-products) to your ADME instance. **v1 supports reference-data "
-        "only.**"
+        "Load a downloaded OSDU dataset into your ADME instance. The "
+        "**Smart Tier Load** tab runs the whole dataset in the right order "
+        "with one click; **Advanced** holds the manual per-tier loaders."
     )
 
     ensure_session_defaults(st.session_state)
@@ -105,6 +285,47 @@ def main() -> None:
         f"Endpoint: `{connection.endpoint}`"
     )
 
+    tab_smart, tab_advanced = st.tabs(
+        ["🎯 Smart Tier Load", "🛠️ Advanced"]
+    )
+
+    with tab_smart:
+        _render_smart_tier_tab(connection)
+
+    with tab_advanced:
+        st.caption(
+            "Manual loaders — prefer the **Smart Tier Load** tab, which runs "
+            "these tiers in the correct dependency order automatically."
+        )
+        (
+            adv_datasets,
+            adv_download,
+            adv_csv,
+            adv_queue,
+        ) = st.tabs(
+            [
+                "📦 Registered Datasets",
+                "📂 Downloaded Dataset",
+                "📄 Generate from CSV",
+                "📋 Queue",
+            ]
+        )
+
+        with adv_datasets:
+            _render_registered_datasets_tab(connection)
+
+        with adv_download:
+            _render_downloaded_dataset_tab(connection)
+
+        with adv_csv:
+            _render_csv_generation_tab(connection)
+
+        with adv_queue:
+            _render_queue_tab(connection)
+
+
+def _render_registered_datasets_tab(connection: ADMEConnection) -> None:
+    """Render the original Registered Datasets workflow."""
     _render_sticky_error()
 
     datasets = list_datasets()
@@ -138,7 +359,545 @@ def main() -> None:
 
     _render_preview_section(descriptor, tier_name)
     _render_submit_section(connection, descriptor, tier_name)
-    _render_results_section()
+    _render_results_section(connection)
+
+
+# ---------------------------------------------------------------------------
+# Downloaded dataset (external TNO/Volve root)
+# ---------------------------------------------------------------------------
+
+
+def _render_downloaded_dataset_tab(connection: ADMEConnection) -> None:
+    """Load a downloaded OSDU dataset (TNO/Volve) from a local folder.
+
+    Unlike the bundled registry this reads manifests straight from the
+    operator's download root, uploads work-product blobs, and overwrites the
+    placeholder ACL/legal the vendor manifests ship with.
+    """
+    _render_sticky_error(key_suffix="_dl")
+    st.markdown(
+        "Load a **downloaded** dataset (e.g. TNO or Volve from the Azure "
+        "`osdu-data-load-tno` tool) directly from a local folder. Point at "
+        "the download root — the folder that contains `TNO/` and `datasets/`."
+    )
+
+    root_str = str(
+        st.text_input(
+            "Download root folder",
+            key=DOWNLOAD_ROOT_KEY,
+            placeholder=r"C:\Users\you\osdu-data\tno",
+            help=(
+                "Local path to the downloaded dataset. Manifests are read "
+                "from `TNO/provided/**`; work-product blobs from `datasets/**`."
+            ),
+        )
+        or ""
+    ).strip()
+    if not root_str:
+        st.info("Enter the folder where you downloaded the dataset.")
+        return
+
+    root = Path(root_str)
+    if not root.is_dir():
+        st.error(f"Folder not found: `{root}`")
+        return
+
+    parts = discover_parts(root)
+    if not parts:
+        st.warning(
+            "No loadable manifests found. Expected "
+            "`TNO/provided/{reference-data,master-data,work-products}/`."
+        )
+        return
+
+    part_index = st.selectbox(
+        "Part to load",
+        options=range(len(parts)),
+        format_func=lambda i: parts[i].label,
+        key=DOWNLOAD_PART_KEY,
+    )
+    part = parts[int(part_index or 0)]
+
+    controls = st.columns(2)
+    with controls[0]:
+        start_at = int(
+            st.number_input(
+                "Start at manifest # (1 = first)",
+                min_value=1,
+                value=1,
+                step=1,
+                key=DOWNLOAD_OFFSET_KEY,
+                help=(
+                    "Resume an interrupted load without redoing earlier "
+                    "manifests — set this to the number shown next to the "
+                    "first failed row (e.g. 1737). Re-loading already-loaded "
+                    "records is safe (they upsert)."
+                ),
+            )
+            or 1
+        )
+    with controls[1]:
+        limit = int(
+            st.number_input(
+                "Limit (0 = all)",
+                min_value=0,
+                step=1,
+                key=DOWNLOAD_LIMIT_KEY,
+                help=(
+                    "Cap the number of manifests from the start point — use a "
+                    "small value for a smoke batch, or a token-sized chunk "
+                    "(e.g. ~1500) so a long load finishes before the token "
+                    "expires."
+                ),
+            )
+            or 0
+        )
+    offset = max(start_at - 1, 0)
+    manifests = list_part_manifests(part, limit=limit, offset=offset)
+
+    kind_note = (
+        "uploads each file blob, then submits"
+        if part.is_work_product
+        else "writes records via the Storage API (PUT /records)"
+    )
+    end_at = offset + len(manifests)
+    st.caption(
+        f"**{len(manifests)}** manifest(s) — #{start_at}–{end_at} of "
+        f"{part.manifest_count}. {kind_note}. ACL/legal below are "
+        "**overwritten** onto every record (the vendor manifests ship "
+        "placeholder groups)."
+    )
+
+    _render_input_form(
+        connection,
+        legal_key=DOWNLOAD_LEGAL_TAG_KEY,
+        owners_key=DOWNLOAD_ACL_OWNERS_KEY,
+        viewers_key=DOWNLOAD_ACL_VIEWERS_KEY,
+        prefix_key=DOWNLOAD_LOAD_PREFIX_KEY,
+        refresh_key="bulk_dl_refresh_options",
+    )
+
+    st.checkbox(
+        "🔄 Auto-refresh token via Azure CLI (recommended for long loads)",
+        key=DOWNLOAD_AUTO_REFRESH_KEY,
+        help=(
+            "Runs `az account get-access-token` as needed so a long load "
+            "keeps a valid token instead of failing partway with 'Jwt is "
+            "expired'. Requires the Azure CLI installed and `az login`."
+        ),
+    )
+
+    if not part.is_work_product:
+        st.number_input(
+            "Records per Storage call (batch size)",
+            min_value=1,
+            max_value=STORAGE_MAX_RECORDS_PER_CALL,
+            step=1,
+            key=DOWNLOAD_BATCH_SIZE_KEY,
+            help=(
+                "List-section manifests load via the Storage API "
+                "`PUT /records`, which accepts up to "
+                f"{STORAGE_MAX_RECORDS_PER_CALL} records per call. Start "
+                "small for a smoke run, then raise it to load faster."
+            ),
+        )
+
+    reason = _download_disabled_reason(manifests)
+    is_disabled = reason is not None
+    clicked = st.button(
+        "🚀 Load selected part",
+        key="bulk_download_load_button",
+        type="primary",
+        disabled=is_disabled,
+        help="Uploads blobs (work-products) and submits each manifest.",
+    )
+    if is_disabled and reason is not None:
+        st.caption(f"⏸️ {reason}")
+
+    if clicked:
+        _start_download_job(connection, part, manifests)
+
+    _render_download_job_status()
+
+
+def _download_disabled_reason(manifests: Sequence[Path]) -> str | None:
+    """Return why the download Load button is disabled, or ``None``."""
+    if not manifests:
+        return "No manifests match the current selection."
+    if not str(st.session_state.get(DOWNLOAD_LEGAL_TAG_KEY) or "").strip():
+        return "Select a legal tag."
+    if not str(st.session_state.get(DOWNLOAD_ACL_OWNERS_KEY) or "").strip():
+        return "Fill ACL owners group."
+    if not str(st.session_state.get(DOWNLOAD_ACL_VIEWERS_KEY) or "").strip():
+        return "Fill ACL viewers group."
+    return None
+
+
+def _start_download_job(
+    connection: ADMEConnection,
+    part: DownloadedPart,
+    manifests: Sequence[Path],
+) -> None:
+    """Kick off a downloaded-dataset load on a background thread.
+
+    Running off the Streamlit script thread means the load keeps going even
+    if the operator switches tabs or pages — progress is read back from the
+    :mod:`app.services.background_jobs` registry on each render.
+    """
+    _clear_sticky_error()
+    token = _acquire_token(connection)
+    if token is None:
+        return
+
+    legal_tag = str(st.session_state.get(DOWNLOAD_LEGAL_TAG_KEY) or "").strip()
+    acl_owners = [
+        str(st.session_state.get(DOWNLOAD_ACL_OWNERS_KEY) or "").strip()
+    ]
+    acl_viewers = [
+        str(st.session_state.get(DOWNLOAD_ACL_VIEWERS_KEY) or "").strip()
+    ]
+    load_prefix = str(
+        st.session_state.get(DOWNLOAD_LOAD_PREFIX_KEY) or ""
+    ).strip()
+
+    token_provider = None
+    if st.session_state.get(DOWNLOAD_AUTO_REFRESH_KEY):
+        provider = RefreshingTokenProvider(acquire=acquire_cli_token)
+        try:
+            token = provider()  # prove az works + mint an initial fresh token
+        except AuthenticationError as exc:
+            _set_sticky_error(f"Azure CLI auto-refresh unavailable: {exc}")
+            st.rerun()
+            return
+        token_provider = provider
+
+    manifest_list = list(manifests)
+    section = part.section or "ReferenceData"
+    batch_size = int(
+        st.session_state.get(DOWNLOAD_BATCH_SIZE_KEY)
+        or DEFAULT_STORAGE_BATCH_SIZE
+    )
+
+    def work(job: LoadJob) -> None:
+        if part.is_work_product:
+            iterator = submit_work_products(
+                manifest_list,
+                datasets_root=part.datasets_root,
+                acl_owners=acl_owners,
+                acl_viewers=acl_viewers,
+                legal_tag=legal_tag,
+                data_partition_id=connection.data_partition_id,
+                connection=connection,
+                token=token,
+                load_prefix=load_prefix,
+                token_provider=token_provider,
+            )
+        else:
+            iterator = submit_records_from_paths(
+                manifest_list,
+                section=section,
+                acl_owners=acl_owners,
+                acl_viewers=acl_viewers,
+                legal_tag=legal_tag,
+                data_partition_id=connection.data_partition_id,
+                connection=connection,
+                token=token,
+                batch_size=batch_size,
+                load_prefix=load_prefix,
+                overwrite_acl_legal=True,
+                token_provider=token_provider,
+            )
+        for result in iterator:
+            job.record(result)
+            if job.aborting:
+                break
+
+    # Storage path reports per record, so the progress total is the record
+    # count (work-products stay per-manifest on the DAG path).
+    total = (
+        len(manifest_list)
+        if part.is_work_product
+        else count_section_records(manifest_list, section)
+    )
+    job_id = f"dl-{part.key}-{uuid.uuid4().hex[:8]}"
+    start_job(job_id, label=part.label, total=total, work=work)
+    st.session_state[DOWNLOAD_JOB_ID_KEY] = job_id
+    st.rerun()
+
+
+def _clear_background_job(job_id: str, job_id_key: str) -> None:
+    clear_job(job_id)
+    st.session_state[job_id_key] = None
+
+
+def _render_job_panel(job_id_key: str, *, key_prefix: str) -> None:
+    """Render a background load's live progress (survives navigation).
+
+    Generic over the session key holding the job id and a widget-key prefix,
+    so both the Downloaded Dataset and Smart Tier flows share one renderer.
+    """
+    job_id = st.session_state.get(job_id_key)
+    if not job_id:
+        return
+    job = get_job(job_id)
+    if job is None:
+        st.session_state[job_id_key] = None
+        return
+
+    snap = job.snapshot()
+    st.subheader("Load progress")
+    fraction = snap.submitted / snap.total if snap.total else 0.0
+    st.progress(min(max(fraction, 0.0), 1.0))
+    st.caption(
+        f"**{snap.submitted} of {snap.total}** — ✅ {snap.succeeded} · "
+        f"❌ {snap.failed} — {snap.label}"
+    )
+
+    if snap.status == STATUS_RUNNING:
+        st.info(
+            "⏳ Running in the background — you can switch tabs or pages and "
+            "it will keep going. Come back here to watch progress."
+        )
+        st.button(
+            "⏹️ Abort",
+            key=f"{key_prefix}_abort",
+            on_click=request_abort,
+            args=(job_id,),
+            help="Stop after the in-flight items finish.",
+        )
+    elif snap.status == STATUS_ERROR:
+        st.error(f"Load failed: {snap.error}")
+    elif snap.status == STATUS_ABORTED:
+        st.warning(
+            f"⏹️ Aborted after {snap.submitted} of {snap.total} items."
+        )
+    elif snap.failed:
+        st.warning(
+            f"Finished — {snap.succeeded} succeeded, {snap.failed} failed."
+        )
+    else:
+        st.success(
+            f"✅ Finished — {snap.succeeded} of {snap.total} submitted."
+        )
+
+    for result in snap.recent:
+        _render_submit_row(result)
+
+    if snap.status == STATUS_RUNNING:
+        # Poll for live progress. The worker thread keeps running regardless,
+        # so navigating away simply pauses these updates until you return.
+        time.sleep(_JOB_POLL_SECONDS)
+        st.rerun()
+    else:
+        st.button(
+            "Clear",
+            key=f"{key_prefix}_clear",
+            on_click=_clear_background_job,
+            args=(job_id, job_id_key),
+        )
+
+
+def _render_download_job_status() -> None:
+    """Render the Downloaded Dataset background load's progress."""
+    _render_job_panel(DOWNLOAD_JOB_ID_KEY, key_prefix="bulk_dl_job")
+
+
+# ---------------------------------------------------------------------------
+# Smart Tier interval load (the recommended one-click flow)
+# ---------------------------------------------------------------------------
+
+
+def _smart_disabled_reason(plans: Sequence[Any]) -> str | None:
+    """Return why the Smart Tier load button is disabled, or ``None``."""
+    if not str(st.session_state.get(SMART_ROOT_KEY) or "").strip():
+        return "Enter the downloaded dataset root folder."
+    if not plans:
+        return "No loadable tiers found under that root."
+    if not str(st.session_state.get(SMART_LEGAL_TAG_KEY) or "").strip():
+        return "Select a legal tag."
+    if not str(st.session_state.get(SMART_ACL_OWNERS_KEY) or "").strip():
+        return "Fill ACL owners group."
+    if not str(st.session_state.get(SMART_ACL_VIEWERS_KEY) or "").strip():
+        return "Fill ACL viewers group."
+    return None
+
+
+def _render_smart_tier_tab(connection: ADMEConnection) -> None:
+    """One-click, dependency-ordered load of a whole dataset interval."""
+    _render_sticky_error()
+    st.markdown(
+        "Load an entire downloaded dataset as one **Smart Tier interval** — "
+        "reference-data → master-data → work-products, in dependency order, "
+        "each stamped with the interval label so it ages as an independent "
+        "copy. Reference/master-data load via the fast **Storage API**; "
+        "work-products via the throttled ingestion DAG."
+    )
+
+    st.text_input(
+        "Downloaded dataset root",
+        key=SMART_ROOT_KEY,
+        placeholder=r"C:\Users\you\osdu-data\tno",
+        help="The folder that contains `TNO/provided` and `datasets/`.",
+    )
+
+    cols = st.columns(3)
+    with cols[0]:
+        st.text_input(
+            "Interval label",
+            key=SMART_INTERVAL_KEY,
+            help=(
+                "Prefix stamped on every record id so this interval is an "
+                "independent Smart Tier copy. Use a date — today's is "
+                "pre-filled."
+            ),
+        )
+    with cols[1]:
+        st.number_input(
+            "Storage batch size",
+            min_value=1,
+            max_value=STORAGE_MAX_RECORDS_PER_CALL,
+            step=1,
+            key=SMART_BATCH_KEY,
+            help="Records per Storage PUT for the reference/master-data tiers.",
+        )
+    with cols[2]:
+        st.checkbox(
+            "Include work-products",
+            key=SMART_INCLUDE_WP_KEY,
+            help=(
+                "Also load documents / well logs / markers / trajectories via "
+                "the DAG (adds file-blob uploads — can take a while)."
+            ),
+        )
+
+    _render_input_form(
+        connection,
+        legal_key=SMART_LEGAL_TAG_KEY,
+        owners_key=SMART_ACL_OWNERS_KEY,
+        viewers_key=SMART_ACL_VIEWERS_KEY,
+        refresh_key="smart_refresh_options",
+        show_prefix=False,
+    )
+    st.checkbox(
+        "🔄 Auto-refresh token via Azure CLI (recommended for long loads)",
+        key=SMART_AUTO_REFRESH_KEY,
+        help=(
+            "Keeps the load authenticated via `az account get-access-token` "
+            "so it survives token expiry."
+        ),
+    )
+
+    # Plan preview — a guardrail that shows exactly what will load, in order.
+    root_str = str(st.session_state.get(SMART_ROOT_KEY) or "").strip()
+    plans: list[Any] = []
+    if root_str:
+        try:
+            plans = plan_interval(
+                Path(root_str),
+                include_work_products=bool(
+                    st.session_state.get(SMART_INCLUDE_WP_KEY)
+                ),
+            )
+        except (OSError, ValueError):
+            plans = []
+    if plans:
+        rows = "\n".join(
+            f"{i + 1}. **{p.part.key}** — {p.part.manifest_count} "
+            f"manifests · _{p.method}_"
+            for i, p in enumerate(plans)
+        )
+        st.markdown("**Load plan (runs in this order):**\n\n" + rows)
+
+    reason = _smart_disabled_reason(plans)
+    clicked = st.button(
+        "🚀 Kick off interval load",
+        key="smart_load_button",
+        type="primary",
+        disabled=reason is not None,
+        help="Loads every tier in dependency order on a background job.",
+    )
+    if reason is not None:
+        st.caption(f"⏸️ {reason}")
+    if clicked:
+        _start_smart_tier_job(connection)
+
+    _render_job_panel(SMART_JOB_ID_KEY, key_prefix="smart_job")
+
+
+def _start_smart_tier_job(connection: ADMEConnection) -> None:
+    """Start the interval load on a background job (survives navigation)."""
+    _clear_sticky_error()
+    root = Path(str(st.session_state.get(SMART_ROOT_KEY) or "").strip())
+    interval = str(st.session_state.get(SMART_INTERVAL_KEY) or "").strip()
+    include_wp = bool(st.session_state.get(SMART_INCLUDE_WP_KEY))
+    batch = int(
+        st.session_state.get(SMART_BATCH_KEY) or DEFAULT_STORAGE_BATCH_SIZE
+    )
+    legal_tag = str(st.session_state.get(SMART_LEGAL_TAG_KEY) or "").strip()
+    acl_owners = [str(st.session_state.get(SMART_ACL_OWNERS_KEY) or "").strip()]
+    acl_viewers = [
+        str(st.session_state.get(SMART_ACL_VIEWERS_KEY) or "").strip()
+    ]
+
+    token = _acquire_token(connection)
+    if token is None:
+        return
+    token_provider = None
+    if st.session_state.get(SMART_AUTO_REFRESH_KEY):
+        provider = RefreshingTokenProvider(acquire=acquire_cli_token)
+        try:
+            token = provider()
+        except AuthenticationError as exc:
+            _set_sticky_error(f"Azure CLI auto-refresh unavailable: {exc}")
+            st.rerun()
+            return
+        token_provider = provider
+
+    safe = interval.strip("-") or "default"
+    progress = ResumableProgress(_INTERVAL_PROGRESS_DIR / f"{safe}.json")
+
+    # Precompute the progress total: Storage tiers report per record,
+    # work-product tiers per (remaining) manifest.
+    total = 0
+    for plan in plan_interval(root, include_work_products=include_wp):
+        manifests = list_part_manifests(plan.part)
+        if plan.method == "storage":
+            total += count_section_records(
+                manifests, plan.part.section or "ReferenceData"
+            )
+        else:
+            done = progress.completed(plan.part.key)
+            total += sum(1 for m in manifests if m.name not in done)
+
+    def work(job: LoadJob) -> None:
+        for event in run_interval(
+            root,
+            interval_label=interval,
+            connection=connection,
+            acl_owners=acl_owners,
+            acl_viewers=acl_viewers,
+            legal_tag=legal_tag,
+            token=token,
+            token_provider=token_provider,
+            include_work_products=include_wp,
+            storage_batch_size=batch,
+            progress=progress,
+            should_abort=lambda: job.aborting,
+        ):
+            if event.phase == "item" and event.result is not None:
+                job.record(event.result)
+            if job.aborting:
+                break
+
+    job_id = f"smart-{safe}-{uuid.uuid4().hex[:8]}"
+    start_job(
+        job_id,
+        label=f"Interval {interval or '(no prefix)'}",
+        total=total,
+        work=work,
+    )
+    st.session_state[SMART_JOB_ID_KEY] = job_id
+    st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -153,15 +912,71 @@ def _ensure_page_defaults() -> None:
     st.session_state.setdefault(BULK_LEGAL_TAG_KEY, "")
     st.session_state.setdefault(BULK_ACL_OWNERS_KEY, "")
     st.session_state.setdefault(BULK_ACL_VIEWERS_KEY, "")
+    st.session_state.setdefault(BULK_LOAD_PREFIX_KEY, "")
+    st.session_state.setdefault(DOWNLOAD_ROOT_KEY, "")
+    st.session_state.setdefault(DOWNLOAD_LIMIT_KEY, 0)
+    st.session_state.setdefault(DOWNLOAD_OFFSET_KEY, 1)
+    st.session_state.setdefault(DOWNLOAD_AUTO_REFRESH_KEY, False)
+    st.session_state.setdefault(DOWNLOAD_JOB_ID_KEY, None)
+    st.session_state.setdefault(DOWNLOAD_BATCH_SIZE_KEY, DEFAULT_STORAGE_BATCH_SIZE)
+    st.session_state.setdefault(SMART_ROOT_KEY, "")
+    st.session_state.setdefault(SMART_INTERVAL_KEY, make_load_prefix())
+    st.session_state.setdefault(SMART_INCLUDE_WP_KEY, True)
+    st.session_state.setdefault(SMART_BATCH_KEY, 100)
+    st.session_state.setdefault(SMART_AUTO_REFRESH_KEY, True)
+    st.session_state.setdefault(SMART_JOB_ID_KEY, None)
+    st.session_state.setdefault(SMART_LEGAL_TAG_KEY, "")
+    st.session_state.setdefault(SMART_ACL_OWNERS_KEY, "")
+    st.session_state.setdefault(SMART_ACL_VIEWERS_KEY, "")
+    st.session_state.setdefault(DOWNLOAD_LEGAL_TAG_KEY, "")
+    st.session_state.setdefault(DOWNLOAD_ACL_OWNERS_KEY, "")
+    st.session_state.setdefault(DOWNLOAD_ACL_VIEWERS_KEY, "")
+    st.session_state.setdefault(DOWNLOAD_LOAD_PREFIX_KEY, "")
     st.session_state.setdefault(BULK_PREVIEW_SEEN_KEY, None)
     st.session_state.setdefault(BULK_PREVIEW_RESULTS_KEY, [])
     st.session_state.setdefault(BULK_SUBMIT_RESULTS_KEY, [])
+    st.session_state.setdefault(BULK_RUN_STATUS_KEY, {})
     st.session_state.setdefault(BULK_LAST_ERROR_KEY, None)
+    st.session_state.setdefault(BULK_ABORT_KEY, False)
 
     st.session_state.setdefault(BULK_OPTIONS_AUTORUN_KEY, False)
     st.session_state.setdefault(BULK_LEGAL_TAG_OPTIONS_KEY, None)
     st.session_state.setdefault(BULK_ACL_OWNER_OPTIONS_KEY, None)
     st.session_state.setdefault(BULK_ACL_VIEWER_OPTIONS_KEY, None)
+
+    # Generate-from-CSV defaults
+    st.session_state.setdefault(GEN_KIND_KEY, "")
+    st.session_state.setdefault(GEN_CSV_DATA_KEY, None)
+    st.session_state.setdefault(GEN_MAPPING_RESULT_KEY, None)
+    st.session_state.setdefault(GEN_CONFIRMED_MAPPINGS_KEY, None)
+    st.session_state.setdefault(GEN_MANIFESTS_KEY, None)
+    st.session_state.setdefault(GEN_SUBMIT_RESULTS_KEY, [])
+    st.session_state.setdefault(GEN_LEGAL_TAG_KEY, "")
+    st.session_state.setdefault(GEN_ACL_OWNERS_KEY, "")
+    st.session_state.setdefault(GEN_ACL_VIEWERS_KEY, "")
+    st.session_state.setdefault(GEN_LAST_ERROR_KEY, None)
+    st.session_state.setdefault(GEN_ABORT_KEY, False)
+    st.session_state.setdefault(GEN_OPTIONS_AUTORUN_KEY, False)
+    st.session_state.setdefault(GEN_LEGAL_TAG_OPTIONS_KEY, None)
+    st.session_state.setdefault(GEN_ACL_OWNER_OPTIONS_KEY, None)
+    st.session_state.setdefault(GEN_ACL_VIEWER_OPTIONS_KEY, None)
+
+    # Queue tab defaults
+    st.session_state.setdefault(QUEUE_PARSED_ITEMS_KEY, None)
+    st.session_state.setdefault(QUEUE_VALIDATION_RESULTS_KEY, None)
+    st.session_state.setdefault(QUEUE_PREVIEW_SEEN_KEY, False)
+    st.session_state.setdefault(QUEUE_LIVE_RESULTS_KEY, [])
+    st.session_state.setdefault(QUEUE_LIVE_ATTEMPTS_KEY, {})
+    st.session_state.setdefault(QUEUE_BREAKER_EVENT_KEY, None)
+    st.session_state.setdefault(QUEUE_LAST_BATCH_SUMMARY_KEY, None)
+    st.session_state.setdefault(QUEUE_ABORT_KEY, False)
+    st.session_state.setdefault(QUEUE_SUBMIT_IN_FLIGHT_KEY, False)
+    st.session_state.setdefault(QUEUE_OPTIONS_AUTORUN_KEY, False)
+    st.session_state.setdefault(QUEUE_LEGAL_TAG_OPTIONS_KEY, None)
+    st.session_state.setdefault(QUEUE_ACL_OWNER_OPTIONS_KEY, None)
+    st.session_state.setdefault(QUEUE_ACL_VIEWER_OPTIONS_KEY, None)
+    st.session_state.setdefault(QUEUE_LAST_MODE_KEY, "")
+    st.session_state.setdefault(QUEUE_INPUT_SIGNATURE_KEY, "")
 
 
 # ---------------------------------------------------------------------------
@@ -258,12 +1073,12 @@ def _clear_sticky_error() -> None:
     st.session_state[BULK_LAST_ERROR_KEY] = None
 
 
-def _render_sticky_error() -> None:
+def _render_sticky_error(key_suffix: str = "") -> None:
     message = st.session_state.get(BULK_LAST_ERROR_KEY)
     if not message:
         return
     st.error(message)
-    if st.button(DISMISS_BUTTON_LABEL, key="bulk_dismiss_error"):
+    if st.button(DISMISS_BUTTON_LABEL, key=f"bulk_dismiss_error{key_suffix}"):
         _clear_sticky_error()
         st.rerun()
 
@@ -369,11 +1184,27 @@ def _render_tier_selector(descriptor: DatasetDescriptor) -> str | None:
 # ---------------------------------------------------------------------------
 
 
-def _render_input_form(connection: ADMEConnection) -> None:
-    """Render the legal-tag / ACL inputs."""
+def _render_input_form(
+    connection: ADMEConnection,
+    *,
+    legal_key: str = BULK_LEGAL_TAG_KEY,
+    owners_key: str = BULK_ACL_OWNERS_KEY,
+    viewers_key: str = BULK_ACL_VIEWERS_KEY,
+    prefix_key: str = BULK_LOAD_PREFIX_KEY,
+    refresh_key: str = "bulk_refresh_options",
+    show_prefix: bool = True,
+) -> None:
+    """Render the legal-tag / ACL inputs.
+
+    The widget/session keys are parametrized so this form can render in more
+    than one tab within the same run without colliding on Streamlit element
+    keys (each tab passes its own key set). Pass ``show_prefix=False`` when
+    the caller supplies its own load-prefix field (e.g. the Smart Tier tab's
+    interval label).
+    """
     refresh_clicked = st.button(
         REFRESH_OPTIONS_LABEL,
-        key="bulk_refresh_options",
+        key=refresh_key,
         help="Re-fetch legal tags and entitlement groups from ADME.",
     )
     if refresh_clicked:
@@ -390,7 +1221,7 @@ def _render_input_form(connection: ADMEConnection) -> None:
     with cols[0]:
         _render_option_field(
             label="Legal tag name",
-            session_key=BULK_LEGAL_TAG_KEY,
+            session_key=legal_key,
             options=legal_options,
             placeholder="opendes-tno-data",
             help_text=(
@@ -402,7 +1233,7 @@ def _render_input_form(connection: ADMEConnection) -> None:
     with cols[1]:
         _render_option_field(
             label="ACL owners group",
-            session_key=BULK_ACL_OWNERS_KEY,
+            session_key=owners_key,
             options=owner_options,
             placeholder="data.default.owners@opendes.dataservices.energy",
             help_text="Entitlements group that should own these records.",
@@ -411,12 +1242,38 @@ def _render_input_form(connection: ADMEConnection) -> None:
     with cols[2]:
         _render_option_field(
             label="ACL viewers group",
-            session_key=BULK_ACL_VIEWERS_KEY,
+            session_key=viewers_key,
             options=viewer_options,
             placeholder="data.default.viewers@opendes.dataservices.energy",
             help_text="Entitlements group allowed to read these records.",
             empty_caption="⚠️ Couldn't load groups — enter manually",
         )
+
+    if show_prefix:
+        _render_load_prefix_field(prefix_key=prefix_key)
+
+
+def _render_load_prefix_field(prefix_key: str = BULK_LOAD_PREFIX_KEY) -> None:
+    """Render the optional per-load id prefix input (Smart Tier copies).
+
+    Leave blank for a normal idempotent reload (same ids → upsert). Set a
+    distinct prefix — e.g. today's date — to load the dataset as an
+    *independent* copy whose records age on their own tier clock, which is
+    what the Smart Tier test plan needs for its Day 0 / 30 / 90 loads.
+    """
+    suggested = make_load_prefix()
+    st.text_input(
+        "Load prefix (optional)",
+        key=prefix_key,
+        placeholder=f"e.g. {suggested}",
+        help=(
+            "Prepended to every record's unique id (and the references "
+            "between them) so this submission is an independent copy. "
+            "Leave blank to reload over the existing records. Use a "
+            "distinct value per Smart Tier load — today's date is "
+            f"`{suggested}`."
+        ),
+    )
 
 
 def _load_input_options(
@@ -617,17 +1474,20 @@ def _render_submit_section(
     if is_disabled and disabled_reason is not None:
         st.caption(f"⏸️ {disabled_reason}")
 
-    # TODO(judson): Add a mid-loop abort button once Streamlit's reactive
-    # model has a cleaner cancellation primitive. For v1 the loop runs to
-    # completion — to stop, close the browser tab.
-    st.caption(
-        "Submission runs to completion — to stop, close the browser tab."
-    )
-
     if not clicked:
         return
 
     _run_submit(connection, descriptor, tier_name)
+
+
+def _set_bulk_abort() -> None:
+    """``on_click`` callback — sets the graceful abort flag."""
+    st.session_state[BULK_ABORT_KEY] = True
+
+
+def _set_gen_abort() -> None:
+    """``on_click`` callback — sets the graceful abort flag (CSV tab)."""
+    st.session_state[GEN_ABORT_KEY] = True
 
 
 def _run_submit(
@@ -648,6 +1508,7 @@ def _run_submit(
     acl_viewers = [
         str(st.session_state.get(BULK_ACL_VIEWERS_KEY) or "").strip()
     ]
+    load_prefix = str(st.session_state.get(BULK_LOAD_PREFIX_KEY) or "").strip()
 
     previews: list[ManifestPreview] = st.session_state.get(
         BULK_PREVIEW_RESULTS_KEY, []
@@ -656,7 +1517,18 @@ def _run_submit(
     results: list[SubmitResult] = []
 
     st.write(f"Submitting {total} manifest(s)…")
+    if load_prefix:
+        st.caption(
+            f"🔁 Independent copy — record ids prefixed with `{load_prefix}`."
+        )
+    st.button(
+        "⏹️ Abort",
+        key="bulk_abort_btn",
+        on_click=_set_bulk_abort,
+        help="Stop after the current manifest finishes.",
+    )
 
+    aborted = False
     try:
         iterator = submit_tier(
             descriptor.id,
@@ -667,13 +1539,20 @@ def _run_submit(
             data_partition_id=connection.data_partition_id,
             connection=connection,
             token=token,
+            load_prefix=load_prefix,
         )
         for index, result in enumerate(iterator, start=1):
             results.append(result)
+            st.session_state[BULK_SUBMIT_RESULTS_KEY] = list(results)
             st.write(
                 f"**{index} of {total}** — `{result.filename}`"
             )
             _render_submit_row(result)
+
+            # Graceful abort: finish current HTTP call, skip remaining.
+            if st.session_state.get(BULK_ABORT_KEY):
+                aborted = True
+                break
     except ValueError as exc:
         _set_sticky_error(f"Submit aborted: {exc}")
         st.session_state[BULK_SUBMIT_RESULTS_KEY] = results
@@ -688,6 +1567,10 @@ def _run_submit(
         return
 
     st.session_state[BULK_SUBMIT_RESULTS_KEY] = results
+    if aborted:
+        st.warning(
+            f"⏹️ Aborted after {len(results)} of {total} manifests."
+        )
 
 
 def _render_submit_row(result: SubmitResult) -> None:
@@ -701,7 +1584,9 @@ def _render_submit_row(result: SubmitResult) -> None:
         )
 
 
-def _render_results_section() -> None:
+def _render_results_section(
+    connection: ADMEConnection, *, key_suffix: str = ""
+) -> None:
     """Render the persistent summary of the last submit batch."""
     results: list[SubmitResult] = st.session_state.get(
         BULK_SUBMIT_RESULTS_KEY, []
@@ -713,6 +1598,18 @@ def _render_results_section() -> None:
     failed = len(results) - succeeded
 
     st.subheader("Submit results")
+
+    # Show abort indicator when results are partial.
+    if st.session_state.get(BULK_ABORT_KEY):
+        previews_for_abort: list[ManifestPreview] = st.session_state.get(
+            BULK_PREVIEW_RESULTS_KEY, []
+        )
+        if previews_for_abort and len(results) < len(previews_for_abort):
+            st.warning(
+                f"⏹️ Aborted after {len(results)} of "
+                f"{len(previews_for_abort)} manifests."
+            )
+
     summary = f"{succeeded} of {len(results)} succeeded"
     if failed == 0:
         st.success(summary)
@@ -735,6 +1632,1286 @@ def _render_results_section() -> None:
         ]
     )
     st.dataframe(frame, use_container_width=True, hide_index=True)
+
+    _render_ingestion_status_section(connection, key_suffix=key_suffix)
+
+
+# ---------------------------------------------------------------------------
+# Ingestion (workflow run) status — closes the submit→ingest loop
+# ---------------------------------------------------------------------------
+
+_RUN_STATE_ICON = {
+    "finished": "✅",
+    "running": "🟡",
+    "failed": "❌",
+    "unknown": "⚪",
+}
+
+
+def _workflow_state_label(status: WorkflowStatus) -> str:
+    """Map a normalized WorkflowStatus to a compact UI state string."""
+    if status == WorkflowStatus.FINISHED:
+        return "finished"
+    if status == WorkflowStatus.FAILED:
+        return "failed"
+    if status == WorkflowStatus.IN_PROGRESS:
+        return "running"
+    return "unknown"
+
+
+def _render_ingestion_status_section(
+    connection: ADMEConnection, *, key_suffix: str = ""
+) -> None:
+    """Render the per-run ingestion status with a manual refresh.
+
+    A successful *submit* only means each manifest was accepted and a
+    workflow run started. This polls the Workflow Service for each run id so
+    operators can see ingestion actually reach ``finished`` (or ``failed``).
+    """
+    results: list[SubmitResult] = st.session_state.get(
+        BULK_SUBMIT_RESULTS_KEY, []
+    )
+    run_ids = [r.run_id for r in results if r.status == "success" and r.run_id]
+    if not run_ids:
+        return
+
+    st.markdown("### Ingestion status")
+    st.caption(
+        "Submitted manifests run asynchronously. A successful submit means "
+        "*accepted*, not *finished* — check that each workflow run reaches "
+        "✅ finished."
+    )
+
+    if st.button(
+        RUN_STATUS_BUTTON_LABEL,
+        key=f"bulk_run_status_button{key_suffix}",
+        help="Polls the Workflow Service status for each submitted run id.",
+    ):
+        _check_ingestion_status(connection, run_ids)
+
+    statuses: dict[str, dict[str, str]] = st.session_state.get(
+        BULK_RUN_STATUS_KEY, {}
+    )
+    if not statuses:
+        st.caption("Click to poll the Workflow Service for each run.")
+        return
+
+    counts = {"finished": 0, "running": 0, "failed": 0, "unknown": 0}
+    for run_id in run_ids:
+        state = statuses.get(run_id, {}).get("state", "unknown")
+        counts[state] = counts.get(state, 0) + 1
+
+    rollup = (
+        f"✅ {counts['finished']} finished · 🟡 {counts['running']} running · "
+        f"❌ {counts['failed']} failed · ⚪ {counts['unknown']} unknown"
+    )
+    if counts["failed"] or counts["unknown"]:
+        st.warning(rollup)
+    elif counts["running"]:
+        st.info(rollup)
+    else:
+        st.success(rollup)
+
+    status_frame = pd.DataFrame(
+        [
+            {
+                "run_id": run_id,
+                "status": (
+                    f"{_RUN_STATE_ICON.get(state, '⚪')} {state}"
+                ),
+                "detail": statuses.get(run_id, {}).get("detail", ""),
+            }
+            for run_id in run_ids
+            for state in [statuses.get(run_id, {}).get("state", "unknown")]
+        ]
+    )
+    st.dataframe(status_frame, use_container_width=True, hide_index=True)
+
+
+def _check_ingestion_status(
+    connection: ADMEConnection, run_ids: list[str]
+) -> None:
+    """Poll the Workflow Service for each run id and store the states."""
+    token = _acquire_token(connection)
+    if token is None:
+        return
+
+    statuses: dict[str, dict[str, str]] = {}
+    total = len(run_ids)
+    progress = st.progress(0.0, text="Checking run status…")
+    for index, run_id in enumerate(run_ids, start=1):
+        try:
+            result = get_workflow_status(connection, token, run_id)
+        except Exception as exc:  # noqa: BLE001 - operator-safe summary
+            statuses[run_id] = {
+                "state": "unknown",
+                "detail": f"{type(exc).__name__}: {exc}",
+            }
+        else:
+            if result.ok:
+                statuses[run_id] = {
+                    "state": _workflow_state_label(result.status),
+                    "detail": result.raw_status or result.message or "",
+                }
+            else:
+                statuses[run_id] = {
+                    "state": "unknown",
+                    "detail": (
+                        result.error_message
+                        or f"HTTP {result.http_status}"
+                    ),
+                }
+        progress.progress(index / total, text=f"Checked {index} of {total}")
+
+    st.session_state[BULK_RUN_STATUS_KEY] = statuses
+
+
+# ===========================================================================
+# Generate from CSV tab
+# ===========================================================================
+
+
+def _render_csv_generation_tab(connection: ADMEConnection) -> None:
+    """Render the Generate from CSV workflow."""
+    _render_gen_sticky_error()
+
+    # --- Step 1: Kind selector ---
+    kinds = list_schema_kinds()
+    if not kinds:
+        st.warning(
+            "No vendored schemas found. Check that "
+            "`app/data/osdu/rc--3.0.0/schemas/` contains schema JSON files."
+        )
+        return
+
+    selected_kind = st.selectbox(
+        "OSDU kind",
+        options=[""] + kinds,
+        key=GEN_KIND_KEY,
+        help="Select the OSDU kind that matches your CSV data.",
+    )
+
+    if not selected_kind:
+        st.info("Select an OSDU kind to begin.")
+        return
+
+    # --- Step 2: CSV upload ---
+    uploaded_file = st.file_uploader(
+        "Upload CSV",
+        type=["csv"],
+        key="gen_csv_uploader",
+        help="Upload the CSV file containing the data to ingest.",
+    )
+
+    if uploaded_file is not None:
+        csv_bytes = uploaded_file.getvalue()
+        # Reset downstream state when CSV changes
+        prev_csv = st.session_state.get(GEN_CSV_DATA_KEY)
+        if prev_csv != csv_bytes:
+            st.session_state[GEN_CSV_DATA_KEY] = csv_bytes
+            st.session_state[GEN_MAPPING_RESULT_KEY] = None
+            st.session_state[GEN_CONFIRMED_MAPPINGS_KEY] = None
+            st.session_state[GEN_MANIFESTS_KEY] = None
+            st.session_state[GEN_SUBMIT_RESULTS_KEY] = []
+
+    csv_data: bytes | None = st.session_state.get(GEN_CSV_DATA_KEY)
+    if csv_data is None:
+        st.info("Upload a CSV file to continue.")
+        return
+
+    # --- Step 3: Auto-map ---
+    try:
+        csv_headers = _parse_csv_headers(csv_data)
+    except ValueError as exc:
+        st.error(f"Could not parse CSV headers: {exc}")
+        return
+
+    mapping_result: MappingResult | None = st.session_state.get(
+        GEN_MAPPING_RESULT_KEY
+    )
+    if mapping_result is None:
+        try:
+            schema = load_schema(selected_kind)
+            schema_fields = extract_schema_fields(schema)
+            mapping_result = auto_map(schema_fields, csv_headers)
+            st.session_state[GEN_MAPPING_RESULT_KEY] = mapping_result
+        except SchemaNotFoundError as exc:
+            st.error(f"Schema not available: {exc}")
+            return
+
+    # --- Step 4: Editable mapping table ---
+    st.subheader("Column mapping")
+    confidence_pct = int(mapping_result.confidence * 100)
+    if confidence_pct >= 80:
+        st.success(f"Auto-map confidence: **{confidence_pct}%**")
+    elif confidence_pct >= 50:
+        st.warning(f"Auto-map confidence: **{confidence_pct}%** — review suggested")
+    else:
+        st.error(
+            f"Auto-map confidence: **{confidence_pct}%** — "
+            "manual adjustment recommended"
+        )
+
+    schema = load_schema(selected_kind)
+    schema_fields = extract_schema_fields(schema)
+    field_options = ["(unmapped)"] + csv_headers
+
+    confirmed: list[FieldMapping] = []
+    for sf in schema_fields:
+        # Find current mapping for this field
+        current_csv_col = "(unmapped)"
+        for m in mapping_result.mappings:
+            if m.schema_path == sf.path:
+                current_csv_col = m.csv_header
+                break
+
+        default_index = 0
+        if current_csv_col in field_options:
+            default_index = field_options.index(current_csv_col)
+
+        req_marker = " ⚠️" if sf.required else ""
+        chosen = st.selectbox(
+            f"{sf.path} ({sf.field_type}){req_marker}",
+            options=field_options,
+            index=default_index,
+            key=f"gen_map_{sf.path}",
+            help=sf.description or f"Schema field: {sf.path}",
+        )
+        if chosen != "(unmapped)":
+            confirmed.append(
+                FieldMapping(csv_header=chosen, schema_path=sf.path)
+            )
+
+    st.session_state[GEN_CONFIRMED_MAPPINGS_KEY] = confirmed
+
+    if mapping_result.unmatched_required:
+        # Check which required fields are still unmapped after operator edits
+        mapped_paths = {m.schema_path for m in confirmed}
+        still_unmapped = [
+            r for r in mapping_result.unmatched_required
+            if r not in mapped_paths
+        ]
+        if still_unmapped:
+            st.warning(
+                f"**{len(still_unmapped)} required field(s) unmapped:** "
+                + ", ".join(f"`{f}`" for f in still_unmapped)
+            )
+
+    if mapping_result.unmatched_csv:
+        with st.expander("Unmatched CSV columns", expanded=False):
+            for col in mapping_result.unmatched_csv:
+                st.caption(f"• {col}")
+
+    # --- Step 5: Legal tag + ACL ---
+    st.subheader("Legal & ACL")
+    _render_gen_input_form(connection)
+
+    # --- Step 6: Generate manifests ---
+    gen_disabled_reason = _gen_generate_disabled_reason(confirmed)
+    gen_is_disabled = gen_disabled_reason is not None
+
+    gen_clicked = st.button(
+        "📄 Generate Manifests",
+        key="gen_generate_button",
+        disabled=gen_is_disabled,
+        help="Generate OSDU manifests from the CSV using the confirmed mapping.",
+    )
+    if gen_is_disabled and gen_disabled_reason:
+        st.caption(f"⏸️ {gen_disabled_reason}")
+
+    if gen_clicked:
+        _run_generate(selected_kind, csv_data, confirmed, connection)
+
+    # --- Step 7: Summary + Submit ---
+    manifests: list[dict] | None = st.session_state.get(GEN_MANIFESTS_KEY)
+    if manifests:
+        st.subheader("Generated manifests")
+        st.success(
+            f"**{len(manifests)} manifest(s)** generated and ready to submit."
+        )
+        with st.expander(
+            f"📋 Sample manifest (1 of {len(manifests)})", expanded=False
+        ):
+            st.json(manifests[0])
+
+        submit_disabled_reason = _gen_submit_disabled_reason()
+        submit_is_disabled = submit_disabled_reason is not None
+
+        submit_clicked = st.button(
+            "🚀 Submit generated manifests",
+            key="gen_submit_button",
+            type="primary",
+            disabled=submit_is_disabled,
+            help="Submit all generated manifests to the ADME ingestion pipeline.",
+        )
+        if submit_is_disabled and submit_disabled_reason:
+            st.caption(f"⏸️ {submit_disabled_reason}")
+
+        if submit_clicked:
+            _run_gen_submit(connection, manifests)
+
+    # --- Step 8: Submission results ---
+    _render_gen_results_section()
+
+
+# ---------------------------------------------------------------------------
+# CSV generation helpers
+# ---------------------------------------------------------------------------
+
+
+def _parse_csv_headers(csv_bytes: bytes) -> list[str]:
+    """Extract header row from CSV bytes. Raises ValueError if empty."""
+    text = csv_bytes.decode("utf-8-sig")
+    reader = io.StringIO(text)
+    try:
+        headers = next(iter(__import__("csv").reader(reader)))
+    except StopIteration:
+        raise ValueError("CSV file is empty — no header row found.")
+    if not headers or all(h.strip() == "" for h in headers):
+        raise ValueError("Upload a CSV with headers.")
+    return [h.strip() for h in headers]
+
+
+def _gen_generate_disabled_reason(
+    confirmed: list[FieldMapping],
+) -> str | None:
+    """Return a reason the Generate button is disabled, or None."""
+    if not confirmed:
+        return "Map at least one CSV column to a schema field."
+    legal = str(st.session_state.get(GEN_LEGAL_TAG_KEY) or "").strip()
+    if not legal:
+        return "Select a legal tag."
+    owners = str(st.session_state.get(GEN_ACL_OWNERS_KEY) or "").strip()
+    if not owners:
+        return "Fill ACL owners group."
+    viewers = str(st.session_state.get(GEN_ACL_VIEWERS_KEY) or "").strip()
+    if not viewers:
+        return "Fill ACL viewers group."
+    return None
+
+
+def _gen_submit_disabled_reason() -> str | None:
+    """Return a reason the Submit button is disabled, or None."""
+    legal = str(st.session_state.get(GEN_LEGAL_TAG_KEY) or "").strip()
+    if not legal:
+        return "Select a legal tag."
+    owners = str(st.session_state.get(GEN_ACL_OWNERS_KEY) or "").strip()
+    if not owners:
+        return "Fill ACL owners group."
+    viewers = str(st.session_state.get(GEN_ACL_VIEWERS_KEY) or "").strip()
+    if not viewers:
+        return "Fill ACL viewers group."
+    manifests = st.session_state.get(GEN_MANIFESTS_KEY)
+    if not manifests:
+        return "Generate manifests first."
+    return None
+
+
+def _run_generate(
+    kind: str,
+    csv_data: bytes,
+    mapping: list[FieldMapping],
+    connection: ADMEConnection,
+) -> None:
+    """Run generate_manifests and store results in session state."""
+    _clear_gen_sticky_error()
+    legal_tag = str(st.session_state.get(GEN_LEGAL_TAG_KEY) or "").strip()
+    acl_owners = str(st.session_state.get(GEN_ACL_OWNERS_KEY) or "").strip()
+    acl_viewers = str(st.session_state.get(GEN_ACL_VIEWERS_KEY) or "").strip()
+
+    try:
+        # Write CSV bytes to a temp file for generate_manifests
+        with tempfile.NamedTemporaryFile(
+            suffix=".csv", delete=False, mode="wb"
+        ) as tmp:
+            tmp.write(csv_data)
+            tmp_path = Path(tmp.name)
+
+        manifests = generate_manifests(
+            kind=kind,
+            csv_path=tmp_path,
+            mapping=mapping,
+            legal_tag=legal_tag,
+            acl_owners=acl_owners,
+            acl_viewers=acl_viewers,
+            data_partition_id=connection.data_partition_id,
+        )
+        st.session_state[GEN_MANIFESTS_KEY] = manifests
+        st.session_state[GEN_SUBMIT_RESULTS_KEY] = []
+    except SchemaNotFoundError as exc:
+        _set_gen_sticky_error(f"Schema not available: {exc}")
+        st.rerun()
+    except MappingError as exc:
+        _set_gen_sticky_error(f"Mapping error: {exc}")
+        st.rerun()
+    except ValueError as exc:
+        _set_gen_sticky_error(f"Generation error: {exc}")
+        st.rerun()
+    except Exception as exc:  # noqa: BLE001 - operator-safe summary
+        _set_gen_sticky_error(
+            f"Unexpected error: {type(exc).__name__}: {exc}"
+        )
+        st.rerun()
+    finally:
+        # Clean up temp file
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def _run_gen_submit(
+    connection: ADMEConnection,
+    manifests: list[dict],
+) -> None:
+    """Submit each generated manifest via the ingestion pipeline."""
+    _clear_gen_sticky_error()
+    token = _acquire_token(connection)
+    if token is None:
+        return
+
+    total = len(manifests)
+    results: list[dict[str, Any]] = []
+
+    progress_bar = st.progress(0.0, text="Submitting manifests…")
+    st.button(
+        "⏹️ Abort",
+        key="gen_abort_btn",
+        on_click=_set_gen_abort,
+        help="Stop after the current manifest finishes.",
+    )
+
+    aborted = False
+    for index, manifest in enumerate(manifests, start=1):
+        try:
+            run_result = submit_manifest(connection, token, manifest)
+            results.append(
+                {
+                    "index": index,
+                    "ok": run_result.ok,
+                    "run_id": run_result.run_id or "",
+                    "error": run_result.error_message or "",
+                }
+            )
+            status_icon = "✅" if run_result.ok else "❌"
+            st.write(
+                f"**{index}/{total}** {status_icon} "
+                f"runId: `{run_result.run_id or '(none)'}`"
+            )
+        except Exception as exc:  # noqa: BLE001
+            results.append(
+                {
+                    "index": index,
+                    "ok": False,
+                    "run_id": "",
+                    "error": f"{type(exc).__name__}: {exc}",
+                }
+            )
+            st.write(f"**{index}/{total}** ❌ {type(exc).__name__}: {exc}")
+        progress_bar.progress(index / total, text=f"Submitted {index}/{total}")
+        st.session_state[GEN_SUBMIT_RESULTS_KEY] = list(results)
+
+        # Graceful abort: finish current HTTP call, skip remaining.
+        if st.session_state.get(GEN_ABORT_KEY):
+            aborted = True
+            break
+
+    st.session_state[GEN_SUBMIT_RESULTS_KEY] = results
+    if aborted:
+        st.warning(
+            f"⏹️ Aborted after {len(results)} of {total} manifests."
+        )
+
+
+def _render_gen_results_section() -> None:
+    """Render persistent summary of the last CSV-generated submission."""
+    results: list[dict[str, Any]] = st.session_state.get(
+        GEN_SUBMIT_RESULTS_KEY, []
+    )
+    if not results:
+        return
+
+    succeeded = sum(1 for r in results if r.get("ok"))
+    failed = len(results) - succeeded
+
+    st.subheader("Submission results")
+
+    # Show abort indicator when results are partial.
+    if st.session_state.get(GEN_ABORT_KEY):
+        gen_manifests: list[dict] | None = st.session_state.get(GEN_MANIFESTS_KEY)
+        if gen_manifests and len(results) < len(gen_manifests):
+            st.warning(
+                f"⏹️ Aborted after {len(results)} of "
+                f"{len(gen_manifests)} manifests."
+            )
+
+    summary = f"{succeeded} of {len(results)} succeeded"
+    if failed == 0:
+        st.success(summary)
+    else:
+        st.warning(f"{summary} — {failed} failed.")
+
+    frame = pd.DataFrame(results)
+    st.dataframe(frame, use_container_width=True, hide_index=True)
+
+
+# ---------------------------------------------------------------------------
+# CSV-gen sticky errors
+# ---------------------------------------------------------------------------
+
+
+def _set_gen_sticky_error(message: str) -> None:
+    st.session_state[GEN_LAST_ERROR_KEY] = message
+
+
+def _clear_gen_sticky_error() -> None:
+    st.session_state[GEN_LAST_ERROR_KEY] = None
+
+
+def _render_gen_sticky_error() -> None:
+    message = st.session_state.get(GEN_LAST_ERROR_KEY)
+    if not message:
+        return
+    st.error(message)
+    if st.button("Dismiss error", key="gen_dismiss_error"):
+        _clear_gen_sticky_error()
+        st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# CSV-gen input form (legal tag + ACL, mirrors bulk pattern)
+# ---------------------------------------------------------------------------
+
+
+def _render_gen_input_form(connection: ADMEConnection) -> None:
+    """Render legal-tag / ACL inputs for the CSV-gen flow."""
+    refresh_clicked = st.button(
+        "🔄 Refresh legal tags & groups",
+        key="gen_refresh_options",
+        help="Re-fetch legal tags and entitlement groups from ADME.",
+    )
+    if refresh_clicked:
+        _load_gen_input_options(connection, force=True)
+        st.rerun()
+    else:
+        _load_gen_input_options(connection)
+
+    legal_options = st.session_state.get(GEN_LEGAL_TAG_OPTIONS_KEY)
+    owner_options = st.session_state.get(GEN_ACL_OWNER_OPTIONS_KEY)
+    viewer_options = st.session_state.get(GEN_ACL_VIEWER_OPTIONS_KEY)
+
+    cols = st.columns(3)
+    with cols[0]:
+        _render_option_field(
+            label="Legal tag name",
+            session_key=GEN_LEGAL_TAG_KEY,
+            options=legal_options,
+            placeholder="opendes-tno-data",
+            help_text="Fully qualified legal tag applied to generated manifests.",
+            empty_caption="⚠️ Couldn't load legal tags — enter manually",
+        )
+    with cols[1]:
+        _render_option_field(
+            label="ACL owners group",
+            session_key=GEN_ACL_OWNERS_KEY,
+            options=owner_options,
+            placeholder="data.default.owners@opendes.dataservices.energy",
+            help_text="Entitlements group that should own these records.",
+            empty_caption="⚠️ Couldn't load groups — enter manually",
+        )
+    with cols[2]:
+        _render_option_field(
+            label="ACL viewers group",
+            session_key=GEN_ACL_VIEWERS_KEY,
+            options=viewer_options,
+            placeholder="data.default.viewers@opendes.dataservices.energy",
+            help_text="Entitlements group allowed to read these records.",
+            empty_caption="⚠️ Couldn't load groups — enter manually",
+        )
+
+
+def _load_gen_input_options(
+    connection: ADMEConnection, *, force: bool = False
+) -> None:
+    """Autorun-once load of legal tags + entitlement groups for gen dropdowns."""
+    if not force and st.session_state.get(GEN_OPTIONS_AUTORUN_KEY, False):
+        return
+
+    token = _acquire_token(connection)
+    if token is None:
+        st.session_state[GEN_OPTIONS_AUTORUN_KEY] = True
+        return
+
+    try:
+        legal_result = list_legal_tags(connection, token, valid=True)
+        if legal_result.ok and legal_result.items:
+            names = sorted({t.name for t in legal_result.items if t.name})
+            st.session_state[GEN_LEGAL_TAG_OPTIONS_KEY] = names or None
+        else:
+            st.session_state[GEN_LEGAL_TAG_OPTIONS_KEY] = None
+    except Exception:  # noqa: BLE001
+        st.session_state[GEN_LEGAL_TAG_OPTIONS_KEY] = None
+
+    try:
+        groups_result = fetch_groups(connection, token)
+        owners, viewers = _partition_acl_groups(groups_result)
+        st.session_state[GEN_ACL_OWNER_OPTIONS_KEY] = owners or None
+        st.session_state[GEN_ACL_VIEWER_OPTIONS_KEY] = viewers or None
+    except Exception:  # noqa: BLE001
+        st.session_state[GEN_ACL_OWNER_OPTIONS_KEY] = None
+        st.session_state[GEN_ACL_VIEWER_OPTIONS_KEY] = None
+
+    st.session_state[GEN_OPTIONS_AUTORUN_KEY] = True
+
+
+# ===========================================================================
+# Queue tab — Issue #34 (Kevin's bulk_ingestion service)
+# ===========================================================================
+
+
+def _set_queue_abort() -> None:
+    """``on_click`` callback — sets the graceful abort flag (Queue tab)."""
+    st.session_state[QUEUE_ABORT_KEY] = True
+
+
+def _reset_queue_abort_and_mark_in_flight() -> None:
+    """``on_click`` for Queue Submit — clears abort and marks submit running."""
+    st.session_state[QUEUE_ABORT_KEY] = False
+    st.session_state[QUEUE_SUBMIT_IN_FLIGHT_KEY] = True
+
+
+def _queue_abort_check() -> bool:
+    """Closure passed to ``submit_queue`` as ``abort_check``."""
+    return bool(st.session_state.get(QUEUE_ABORT_KEY, False))
+
+
+def _compute_queue_input_signature(items: list[QueueItem] | None) -> str:
+    """Stable hash of the queue's parsed inputs.
+
+    Changes when the operator re-parses different content. Used to
+    invalidate the preview-gate checkbox automatically on re-parse.
+    """
+    if not items:
+        return ""
+    h = hashlib.sha256()
+    for item in items:
+        h.update(item.label.encode("utf-8"))
+        h.update(b"\x1f")
+        h.update(item.raw_text.encode("utf-8"))
+        h.update(b"\x1e")
+    return h.hexdigest()
+
+
+def _load_queue_input_options(
+    connection: ADMEConnection, *, force: bool = False
+) -> None:
+    """Autorun-once load of legal tags + entitlement groups for the Queue tab."""
+    if not force and st.session_state.get(QUEUE_OPTIONS_AUTORUN_KEY, False):
+        return
+
+    token = _acquire_token(connection)
+    if token is None:
+        st.session_state[QUEUE_OPTIONS_AUTORUN_KEY] = True
+        return
+
+    try:
+        legal_result = list_legal_tags(connection, token, valid=True)
+        if legal_result.ok and legal_result.items:
+            names = sorted({t.name for t in legal_result.items if t.name})
+            st.session_state[QUEUE_LEGAL_TAG_OPTIONS_KEY] = names or None
+        else:
+            st.session_state[QUEUE_LEGAL_TAG_OPTIONS_KEY] = None
+    except Exception:  # noqa: BLE001
+        st.session_state[QUEUE_LEGAL_TAG_OPTIONS_KEY] = None
+
+    try:
+        groups_result = fetch_groups(connection, token)
+        owners, viewers = _partition_acl_groups(groups_result)
+        st.session_state[QUEUE_ACL_OWNER_OPTIONS_KEY] = owners or None
+        st.session_state[QUEUE_ACL_VIEWER_OPTIONS_KEY] = viewers or None
+    except Exception:  # noqa: BLE001
+        st.session_state[QUEUE_ACL_OWNER_OPTIONS_KEY] = None
+        st.session_state[QUEUE_ACL_VIEWER_OPTIONS_KEY] = None
+
+    st.session_state[QUEUE_OPTIONS_AUTORUN_KEY] = True
+
+
+def _build_failed_rows_payload(
+    results: list[QueueSubmitResult], partition_id: str
+) -> bytes:
+    """Build a JSON download payload of failed rows.
+
+    Includes rows with status ``error``, ``rejected`` and any row whose
+    ``error_message`` starts with ``"skipped: circuit breaker"``.
+    Excludes operator-aborted rows.
+    """
+    failed: list[dict[str, Any]] = []
+    for row in results:
+        err_msg = (row.error_message or "").strip()
+        is_failure = row.status in ("error", "rejected")
+        is_breaker_skip = (
+            row.status == "skipped"
+            and err_msg.startswith("skipped: circuit breaker")
+        )
+        if not (is_failure or is_breaker_skip):
+            continue
+        failed.append(
+            {
+                "label": row.label,
+                "status": row.status,
+                "run_id": row.run_id,
+                "correlation_id": row.correlation_id,
+                "http_status": row.http_status,
+                "latency_ms": row.latency_ms,
+                "error_message": row.error_message,
+                "attempts": row.attempts,
+                "raw_text": row.raw_text,
+                "data_partition_id": partition_id,
+            }
+        )
+    return json.dumps(failed, indent=2, default=str).encode("utf-8")
+
+
+def _make_queue_progress_callback() -> Any:
+    """Build a progress callback that updates session state.
+
+    The callback never calls ``st.rerun`` — Streamlit will rerun
+    automatically at the end of the script run.
+    """
+
+    def _cb(
+        row_index: int,
+        state: str,
+        *,
+        result: QueueSubmitResult | None = None,
+        attempt: int | None = None,
+        trip: CircuitBreakerTripped | None = None,
+    ) -> None:
+        attempts = dict(st.session_state.get(QUEUE_LIVE_ATTEMPTS_KEY) or {})
+        if attempt is not None:
+            attempts[row_index] = attempt
+        attempts[f"{row_index}:state"] = state
+        st.session_state[QUEUE_LIVE_ATTEMPTS_KEY] = attempts
+        if trip is not None:
+            st.session_state[QUEUE_BREAKER_EVENT_KEY] = trip
+        # The yielded result is appended by the main loop, not here.
+        del result  # unused — kept for callback signature compatibility
+
+    return _cb
+
+
+def _render_queue_progress_board(
+    results: list[QueueSubmitResult],
+    attempts: dict[Any, Any],
+    total: int,
+) -> None:
+    """Render the live per-row progress board."""
+    bar = st.progress(0.0)
+    completed = len(results)
+    bar.progress(min(1.0, completed / total) if total else 0.0)
+    rows: list[dict[str, Any]] = []
+    for index, row in enumerate(results, start=1):
+        emoji = _QUEUE_ROW_STATE_EMOJI.get(row.status, "•")
+        rows.append(
+            {
+                "#": index,
+                "state": f"{emoji} {row.status}",
+                "label": row.label,
+                "attempts": row.attempts,
+                "http": row.http_status,
+                "error": (row.error_message or "")[:140],
+            }
+        )
+    if rows:
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+    if attempts:
+        last_state = attempts.get(f"{completed}:state")
+        if last_state and last_state in _QUEUE_ROW_STATE_EMOJI:
+            st.caption(
+                f"Last event: {_QUEUE_ROW_STATE_EMOJI[last_state]} {last_state}"
+            )
+
+
+def _handle_parse_queue(
+    mode: str,
+    uploaded_files: list[Any] | None,
+    pasted_text: str,
+) -> None:
+    """Parse + validate the operator's input. Stores into session state.
+
+    Resets the preview-gate checkbox and the input signature so the
+    operator must explicitly re-confirm the new queue before submitting.
+    """
+    items: list[QueueItem] = []
+    parse_error: str | None = None
+    try:
+        if mode == QUEUE_INPUT_MODE_UPLOAD:
+            files = list(uploaded_files or [])
+            if not files:
+                parse_error = (
+                    "Upload one or more manifest files (.json) to build a queue."
+                )
+            else:
+                items = build_queue_from_files(files)
+        else:
+            text = (pasted_text or "").strip()
+            if not text:
+                parse_error = "Paste one or more manifests separated by `---`."
+            else:
+                items = parse_pasted_manifests(text)
+    except ValueError as exc:
+        parse_error = str(exc)
+    except Exception as exc:  # noqa: BLE001
+        parse_error = f"{type(exc).__name__}: {exc}"
+
+    if parse_error is not None:
+        st.error(parse_error)
+        return
+
+    try:
+        enforce_queue_size_limit(items)
+    except ValueError as exc:
+        # Surface but still keep parsed items so the operator can see them.
+        st.error(str(exc))
+
+    validations = validate_queue(items)
+
+    st.session_state[QUEUE_PARSED_ITEMS_KEY] = items
+    st.session_state[QUEUE_VALIDATION_RESULTS_KEY] = validations
+    # Reset preview gate + signature so the new queue must be confirmed.
+    st.session_state[QUEUE_PREVIEW_SEEN_KEY] = False
+    st.session_state[QUEUE_INPUT_SIGNATURE_KEY] = (
+        _compute_queue_input_signature(items)
+    )
+
+
+def _iterate_submit_queue(
+    *,
+    items: list[QueueItem],
+    validations: list[QueueValidationResult],
+    acl_owners: list[str],
+    acl_viewers: list[str],
+    legal_tag: str,
+    data_partition_id: str,
+    connection: ADMEConnection,
+    token: str,
+    skip_invalid: bool,
+    inter_submit_delay_seconds: float,
+    progress_callback: Any,
+    abort_check: Any,
+) -> tuple[list[QueueSubmitResult], CircuitBreakerTripped | None]:
+    """Drive ``submit_queue`` and capture results + any breaker trip.
+
+    Returns the collected per-row results and the breaker event (if any).
+    Catches ``CircuitBreakerTripped`` defensively in case the service
+    ever escalates a trip via exception rather than callback.
+    """
+    collected: list[QueueSubmitResult] = []
+    breaker: CircuitBreakerTripped | None = None
+    try:
+        iterator = submit_queue(
+            items,
+            validations,
+            acl_owners=acl_owners,
+            acl_viewers=acl_viewers,
+            legal_tag=legal_tag,
+            data_partition_id=data_partition_id,
+            connection=connection,
+            token=token,
+            skip_invalid=skip_invalid,
+            inter_submit_delay_seconds=inter_submit_delay_seconds,
+            abort_check=abort_check,
+            progress_callback=progress_callback,
+        )
+        for row in iterator:
+            collected.append(row)
+    except CircuitBreakerTripped as trip:
+        breaker = trip
+    return collected, breaker
+
+
+def _handle_submit_queue(
+    connection: ADMEConnection,
+    *,
+    items: list[QueueItem],
+    validations: list[QueueValidationResult],
+    acl_owners: list[str],
+    acl_viewers: list[str],
+    legal_tag: str,
+    skip_invalid: bool,
+    inter_submit_delay: float,
+    start_index: int = 0,
+) -> None:
+    """Submit (or resume) the queue and record results to session state."""
+    token = _acquire_token(connection)
+    if token is None:
+        st.session_state[QUEUE_SUBMIT_IN_FLIGHT_KEY] = False
+        return
+
+    work_items = items[start_index:]
+    work_validations = validations[start_index:]
+
+    progress_cb = _make_queue_progress_callback()
+    st.session_state[QUEUE_LIVE_ATTEMPTS_KEY] = {}
+    st.session_state[QUEUE_BREAKER_EVENT_KEY] = None
+
+    results, breaker = _iterate_submit_queue(
+        items=work_items,
+        validations=work_validations,
+        acl_owners=acl_owners,
+        acl_viewers=acl_viewers,
+        legal_tag=legal_tag,
+        data_partition_id=connection.data_partition_id,
+        connection=connection,
+        token=token,
+        skip_invalid=skip_invalid,
+        inter_submit_delay_seconds=inter_submit_delay,
+        progress_callback=progress_cb,
+        abort_check=_queue_abort_check,
+    )
+
+    if breaker is not None:
+        st.session_state[QUEUE_BREAKER_EVENT_KEY] = breaker
+
+    # Merge with prior partial results (for resume).
+    prior = list(st.session_state.get(QUEUE_LIVE_RESULTS_KEY) or [])
+    merged = prior + results
+    st.session_state[QUEUE_LIVE_RESULTS_KEY] = merged
+
+    # Compute summary.
+    succeeded = sum(1 for r in merged if r.status == "success")
+    failed = sum(1 for r in merged if r.status in ("error", "rejected"))
+    skipped = sum(1 for r in merged if r.status == "skipped")
+    aborted = bool(st.session_state.get(QUEUE_ABORT_KEY, False))
+    st.session_state[QUEUE_LAST_BATCH_SUMMARY_KEY] = {
+        "total": len(merged),
+        "succeeded": succeeded,
+        "failed": failed,
+        "skipped": skipped,
+        "aborted": aborted,
+        "completed_count": len(merged),
+        "planned_total": len(items),
+    }
+    st.session_state[QUEUE_SUBMIT_IN_FLIGHT_KEY] = False
+
+
+def _render_queue_tab(connection: ADMEConnection) -> None:
+    """Render the multi-manifest Queue tab."""
+    st.header("📋 Manifest Queue")
+    st.caption(
+        "Submit many manifests in a single batch. Uploads or pasted blocks "
+        "are parsed, validated, then sent through Kevin's bulk-ingestion "
+        "service with retry + circuit-breaker protection."
+    )
+
+    # Auto-clear parsed state when the input mode changes between reruns.
+    last_mode = str(st.session_state.get(QUEUE_LAST_MODE_KEY) or "")
+
+    mode = st.radio(
+        "Input mode",
+        options=[QUEUE_INPUT_MODE_UPLOAD, QUEUE_INPUT_MODE_PASTE],
+        key=QUEUE_INPUT_MODE_KEY,
+        horizontal=True,
+        help="Choose how to provide manifests to the queue.",
+    )
+
+    if last_mode and last_mode != mode:
+        st.session_state[QUEUE_PARSED_ITEMS_KEY] = None
+        st.session_state[QUEUE_VALIDATION_RESULTS_KEY] = None
+        st.session_state[QUEUE_PREVIEW_SEEN_KEY] = False
+        st.session_state[QUEUE_INPUT_SIGNATURE_KEY] = ""
+    st.session_state[QUEUE_LAST_MODE_KEY] = mode
+
+    uploaded_files: list[Any] | None = None
+    pasted_text: str = ""
+    if mode == QUEUE_INPUT_MODE_UPLOAD:
+        uploaded_files = st.file_uploader(
+            QUEUE_FILE_UPLOADER_LABEL,
+            type=["json"],
+            accept_multiple_files=True,
+            key=QUEUE_UPLOADED_FILES_KEY,
+            help="Drop one or more OSDU manifest JSON files.",
+        )
+    else:
+        pasted_text = st.text_area(
+            QUEUE_PASTE_TEXTAREA_LABEL,
+            key=QUEUE_PASTE_TEXT_KEY,
+            height=200,
+            help="Paste many manifests, separated by a line containing only `---`.",
+        )
+
+    parse_clicked = st.button(
+        QUEUE_PARSE_BUTTON_LABEL,
+        key="queue_parse_btn",
+        help="Parse and validate the queue without submitting.",
+    )
+    if parse_clicked:
+        files_in: list[Any] | None
+        if uploaded_files is None:
+            files_in = None
+        elif isinstance(uploaded_files, list):
+            files_in = uploaded_files
+        else:
+            files_in = [uploaded_files]
+        _handle_parse_queue(mode, files_in, pasted_text)
+
+    items: list[QueueItem] | None = st.session_state.get(QUEUE_PARSED_ITEMS_KEY)
+    validations: list[QueueValidationResult] | None = st.session_state.get(
+        QUEUE_VALIDATION_RESULTS_KEY
+    )
+
+    # ----- Preview + cap UX -----
+    cap_exceeded = False
+    if items:
+        valid_count = sum(1 for v in (validations or []) if v.ok)
+        invalid_count = len(items) - valid_count
+        col_a, col_b, col_c = st.columns(3)
+        col_a.metric("Parsed", len(items))
+        col_b.metric("Valid", valid_count)
+        col_c.metric("Invalid", invalid_count)
+
+        if len(items) > MAX_QUEUE_SIZE:
+            cap_exceeded = True
+            st.error(
+                f"Queue exceeds the {MAX_QUEUE_SIZE}-row hard cap "
+                f"({len(items)} parsed). Trim the input and re-parse."
+            )
+        elif len(items) >= 400:
+            st.warning(
+                f"Queue has {len(items)} rows — approaching the "
+                f"{MAX_QUEUE_SIZE}-row cap. Consider splitting the batch."
+            )
+
+        # Show a compact preview table.
+        rows = []
+        for idx, item in enumerate(items, start=1):
+            validation = (
+                validations[idx - 1] if validations and idx - 1 < len(validations) else None
+            )
+            ok_flag = validation.ok if validation is not None else False
+            err = validation.error_message if validation is not None else None
+            rows.append(
+                {
+                    "#": idx,
+                    "label": item.label,
+                    "valid": "✅" if ok_flag else "❌",
+                    "kinds": ", ".join(
+                        validation.kinds if validation is not None else []
+                    ),
+                    "records": validation.record_count if validation else 0,
+                    "error": (err or "")[:140],
+                }
+            )
+        st.dataframe(rows, use_container_width=True, hide_index=True)
+    else:
+        st.caption("No queue parsed yet. Provide input above and click Parse.")
+
+    st.markdown("---")
+    st.subheader("Submission settings")
+
+    # Load options autorun-once, with a manual refresh.
+    _load_queue_input_options(connection)
+    if st.button(
+        QUEUE_REFRESH_OPTIONS_LABEL,
+        key="queue_refresh_options_btn",
+        help="Re-fetch legal tags and entitlement groups from ADME.",
+    ):
+        _load_queue_input_options(connection, force=True)
+
+    _render_option_field(
+        label="Legal tag",
+        session_key=QUEUE_LEGAL_TAG_KEY,
+        options=st.session_state.get(QUEUE_LEGAL_TAG_OPTIONS_KEY),
+        placeholder="opendes-public-usa-dataset-1",
+        help_text="Legal tag applied to every record in the batch.",
+        empty_caption="Legal tag list unavailable — type the name manually.",
+    )
+    _render_option_field(
+        label="ACL owners",
+        session_key=QUEUE_ACL_OWNERS_KEY,
+        options=st.session_state.get(QUEUE_ACL_OWNER_OPTIONS_KEY),
+        placeholder="data.default.owners@example.com",
+        help_text="Entitlement group with owner rights.",
+        empty_caption="Entitlement groups unavailable — type the email manually.",
+    )
+    _render_option_field(
+        label="ACL viewers",
+        session_key=QUEUE_ACL_VIEWERS_KEY,
+        options=st.session_state.get(QUEUE_ACL_VIEWER_OPTIONS_KEY),
+        placeholder="data.default.viewers@example.com",
+        help_text="Entitlement group with viewer rights.",
+        empty_caption="Entitlement groups unavailable — type the email manually.",
+    )
+
+    inter_delay = st.number_input(
+        "Pause between submits (seconds)",
+        min_value=0.0,
+        max_value=30.0,
+        value=0.0,
+        step=0.25,
+        key=QUEUE_INTER_SUBMIT_DELAY_KEY,
+        help="Throttle the queue to avoid hammering the ingestion endpoint.",
+    )
+    skip_invalid = st.checkbox(
+        "Skip invalid rows (otherwise they are reported and skipped anyway)",
+        value=True,
+        key=QUEUE_SKIP_INVALID_KEY,
+        help="Validation failures never block the rest of the queue.",
+    )
+
+    # Preview gate.
+    preview_ok = st.checkbox(
+        QUEUE_PREVIEW_CHECKBOX_LABEL,
+        key=QUEUE_PREVIEW_SEEN_KEY,
+        value=bool(st.session_state.get(QUEUE_PREVIEW_SEEN_KEY, False)),
+        help="Required before submitting. Re-parsing clears this checkbox.",
+    )
+
+    legal_tag = str(st.session_state.get(QUEUE_LEGAL_TAG_KEY) or "").strip()
+    acl_owners_raw = str(st.session_state.get(QUEUE_ACL_OWNERS_KEY) or "").strip()
+    acl_viewers_raw = str(
+        st.session_state.get(QUEUE_ACL_VIEWERS_KEY) or ""
+    ).strip()
+    acl_owners = [acl_owners_raw] if acl_owners_raw else []
+    acl_viewers = [acl_viewers_raw] if acl_viewers_raw else []
+
+    can_submit = bool(
+        items
+        and validations is not None
+        and not cap_exceeded
+        and preview_ok
+        and legal_tag
+        and acl_owners
+        and acl_viewers
+        and not st.session_state.get(QUEUE_SUBMIT_IN_FLIGHT_KEY, False)
+    )
+    disabled_reason: str | None = None
+    if not items:
+        disabled_reason = "Parse a queue before submitting."
+    elif cap_exceeded:
+        disabled_reason = (
+            f"Queue exceeds the {MAX_QUEUE_SIZE}-row cap — trim and re-parse."
+        )
+    elif not preview_ok:
+        disabled_reason = "Check the preview-confirmation box to unlock Submit."
+    elif not legal_tag:
+        disabled_reason = "Pick a legal tag."
+    elif not acl_owners or not acl_viewers:
+        disabled_reason = "Pick ACL owners and viewers."
+
+    col_submit, col_abort = st.columns(2)
+    with col_submit:
+        submit_clicked = st.button(
+            QUEUE_SUBMIT_BUTTON_LABEL,
+            key="queue_submit_btn",
+            disabled=not can_submit,
+            on_click=_reset_queue_abort_and_mark_in_flight,
+            help="Send every valid row through the bulk-ingestion service.",
+        )
+    with col_abort:
+        st.button(
+            QUEUE_ABORT_BUTTON_LABEL,
+            key="queue_abort_btn",
+            on_click=_set_queue_abort,
+            help="Stop after the row currently in flight finishes.",
+        )
+
+    if disabled_reason is not None and not can_submit:
+        st.caption(f"⏸️ {disabled_reason}")
+
+    if submit_clicked and can_submit and items and validations is not None:
+        # Fresh batch — clear prior live results.
+        st.session_state[QUEUE_LIVE_RESULTS_KEY] = []
+        _handle_submit_queue(
+            connection,
+            items=items,
+            validations=validations,
+            acl_owners=acl_owners,
+            acl_viewers=acl_viewers,
+            legal_tag=legal_tag,
+            skip_invalid=bool(skip_invalid),
+            inter_submit_delay=float(inter_delay),
+            start_index=0,
+        )
+
+    # ----- Breaker banner + resume -----
+    breaker_event = st.session_state.get(QUEUE_BREAKER_EVENT_KEY)
+    if breaker_event is not None:
+        st.error(
+            "🛑 Circuit breaker tripped — "
+            f"{breaker_event.threshold} consecutive failures detected. "
+            f"Remaining rows skipped: {breaker_event.remaining_count}. "
+            "Inspect the failed rows below before resuming."
+        )
+        resume_index = len(
+            st.session_state.get(QUEUE_LIVE_RESULTS_KEY) or []
+        )
+        if items and resume_index < len(items):
+            resume_clicked = st.button(
+                QUEUE_RESUME_BUTTON_LABEL,
+                key="queue_resume_btn",
+                help=(
+                    f"Resume the queue starting at row {resume_index + 1} "
+                    "using the previous submission settings."
+                ),
+            )
+            if resume_clicked and validations is not None:
+                st.session_state[QUEUE_BREAKER_EVENT_KEY] = None
+                st.session_state[QUEUE_ABORT_KEY] = False
+                _handle_submit_queue(
+                    connection,
+                    items=items,
+                    validations=validations,
+                    acl_owners=acl_owners,
+                    acl_viewers=acl_viewers,
+                    legal_tag=legal_tag,
+                    skip_invalid=bool(skip_invalid),
+                    inter_submit_delay=float(inter_delay),
+                    start_index=resume_index,
+                )
+
+    # ----- Live progress / post-batch summary -----
+    live_results: list[QueueSubmitResult] = list(
+        st.session_state.get(QUEUE_LIVE_RESULTS_KEY) or []
+    )
+    if live_results:
+        st.markdown("---")
+        st.subheader("Submission progress")
+        _render_queue_progress_board(
+            live_results,
+            dict(st.session_state.get(QUEUE_LIVE_ATTEMPTS_KEY) or {}),
+            total=len(items) if items else len(live_results),
+        )
+
+    summary = st.session_state.get(QUEUE_LAST_BATCH_SUMMARY_KEY)
+    if summary:
+        if summary.get("aborted"):
+            st.warning(
+                f"⏹ Batch aborted by operator after "
+                f"{summary['completed_count']} of {summary['planned_total']} rows."
+            )
+        elif summary.get("failed", 0) == 0 and summary.get("skipped", 0) == 0:
+            st.success(
+                f"✅ All {summary['succeeded']} rows submitted successfully."
+            )
+        else:
+            st.warning(
+                f"{summary['succeeded']} of {summary['total']} succeeded — "
+                f"{summary['failed']} failed, {summary['skipped']} skipped."
+            )
+
+        # Download failed-rows JSON.
+        payload = _build_failed_rows_payload(
+            live_results, connection.data_partition_id
+        )
+        if payload != b"[]":
+            st.download_button(
+                QUEUE_DOWNLOAD_FAILED_LABEL,
+                data=payload,
+                file_name="failed-queue-rows.json",
+                mime="application/json",
+                key="queue_download_failed_btn",
+            )
 
 
 if __name__ == "__main__":

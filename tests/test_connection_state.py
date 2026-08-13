@@ -13,6 +13,8 @@ from app.connection_state import (
     HEALTH_RESULTS_KEY,
     USER_AUTH_FLOW_KEY,
     USER_AUTH_STATE_KEY,
+    AuthReadiness,
+    auth_readiness,
     clear_pending_user_auth_flow,
     clear_user_auth_state,
     ensure_session_defaults,
@@ -370,6 +372,100 @@ def test_ensure_session_defaults_no_hydration_when_nothing_active(
     assert session_state[CONNECTION_KEY] is None
 
 
+def _jwt_with(payload: dict[str, object]) -> str:
+    import base64
+    import json
+
+    def _seg(data: dict[str, object]) -> str:
+        raw = json.dumps(data).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    return f"{_seg({'alg': 'none'})}.{_seg(payload)}.signature"
+
+
+def _connection(
+    auth_method: AuthMethod = AuthMethod.USER_IMPERSONATION,
+    client_secret: str = "",
+) -> ADMEConnection:
+    return ADMEConnection(
+        endpoint="https://example.energy.azure.com",
+        tenant_id="11111111-1111-1111-1111-111111111111",
+        client_id="22222222-2222-2222-2222-222222222222",
+        data_partition_id="example-opendes",
+        auth_method=auth_method,
+        client_secret=client_secret,
+    )
+
+
+def test_auth_readiness_none_connection_not_ready() -> None:
+    result = auth_readiness(None, None)
+
+    assert isinstance(result, AuthReadiness)
+    assert result.ready is False
+    assert result.identity_label is None
+    assert "Sign in or paste" in result.guidance
+
+
+def test_auth_readiness_service_principal_ready_with_secret() -> None:
+    connection = _connection(AuthMethod.SERVICE_PRINCIPAL, client_secret="s3cret")
+
+    result = auth_readiness(connection, None)
+
+    assert result.ready is True
+    assert result.method == AuthMethod.SERVICE_PRINCIPAL
+    assert result.identity_label is not None
+    assert "service principal" in result.identity_label
+
+
+def test_auth_readiness_service_principal_missing_secret_not_ready() -> None:
+    connection = _connection(AuthMethod.SERVICE_PRINCIPAL, client_secret="  ")
+
+    result = auth_readiness(connection, None)
+
+    assert result.ready is False
+    assert "client secret" in result.guidance.lower()
+
+
+def test_auth_readiness_user_impersonation_ready_with_token() -> None:
+    connection = _connection(AuthMethod.USER_IMPERSONATION)
+    token = _jwt_with({"upn": "mariel@example.com", "exp": 9999999999})
+    state = UserAuthState(access_token=token, expires_at=9999999999)
+
+    result = auth_readiness(connection, state)
+
+    assert result.ready is True
+    assert result.identity_label == "mariel@example.com"
+
+
+def test_auth_readiness_user_impersonation_no_token_not_ready() -> None:
+    connection = _connection(AuthMethod.USER_IMPERSONATION)
+
+    result = auth_readiness(connection, None)
+
+    assert result.ready is False
+    assert "Sign in or paste" in result.guidance
+
+
+def test_auth_readiness_user_impersonation_expired_token_guidance() -> None:
+    connection = _connection(AuthMethod.USER_IMPERSONATION)
+    state = UserAuthState(access_token="placeholder", expires_at=0)
+
+    result = auth_readiness(connection, state)
+
+    assert result.ready is False
+    assert "expired" in result.guidance.lower()
+
+
+def test_auth_readiness_user_impersonation_falls_back_to_generic_label() -> None:
+    connection = _connection(AuthMethod.USER_IMPERSONATION)
+    state = UserAuthState(access_token="not-a-jwt", expires_at=9999999999)
+
+    result = auth_readiness(connection, state)
+
+    assert result.ready is True
+    assert result.identity_label == "signed-in user"
+
+
 def test_ensure_session_defaults_preserves_existing_session_connection(
     isolated_store: Path,
 ) -> None:
@@ -413,6 +509,65 @@ def test_ensure_session_defaults_swallows_store_failures(
     assert session_state[HEALTH_ERROR_KEY] == ""
     assert session_state[USER_AUTH_FLOW_KEY] is None
     assert session_state[USER_AUTH_STATE_KEY] is None
+
+
+def test_store_user_auth_state_persists_token(isolated_store: Path) -> None:
+    settings_store.initialize_store()
+    settings_store.save_connection(DEFAULT_CONNECTION_NAME, _connection())
+    settings_store.set_active_connection(DEFAULT_CONNECTION_NAME)
+    session_state: dict[str, object] = {
+        USER_AUTH_STATE_KEY: None,
+        HEALTH_RESULTS_KEY: [],
+        HEALTH_ERROR_KEY: "",
+    }
+
+    store_user_auth_state(
+        session_state,
+        UserAuthState(access_token="aa.bb.cc", expires_at=1700000000),
+    )
+
+    assert settings_store.load_user_token() == ("aa.bb.cc", 1700000000)
+
+
+def test_clear_user_auth_state_forgets_persisted_token(
+    isolated_store: Path,
+) -> None:
+    settings_store.initialize_store()
+    settings_store.save_connection(DEFAULT_CONNECTION_NAME, _connection())
+    settings_store.set_active_connection(DEFAULT_CONNECTION_NAME)
+    settings_store.save_user_token(
+        "aa.bb.cc", 1700000000, name=DEFAULT_CONNECTION_NAME
+    )
+    session_state: dict[str, object] = {
+        USER_AUTH_STATE_KEY: "placeholder",
+        USER_AUTH_FLOW_KEY: None,
+        HEALTH_RESULTS_KEY: [],
+        HEALTH_ERROR_KEY: "",
+    }
+
+    clear_user_auth_state(session_state)
+
+    assert settings_store.load_user_token() is None
+    assert session_state[USER_AUTH_STATE_KEY] is None
+
+
+def test_ensure_session_defaults_hydrates_persisted_token(
+    isolated_store: Path,
+) -> None:
+    settings_store.initialize_store()
+    settings_store.save_connection(DEFAULT_CONNECTION_NAME, _connection())
+    settings_store.set_active_connection(DEFAULT_CONNECTION_NAME)
+    settings_store.save_user_token(
+        "aa.bb.cc", 1700000000, name=DEFAULT_CONNECTION_NAME
+    )
+    session_state: dict[str, object] = {}
+
+    ensure_session_defaults(session_state)
+
+    restored = session_state[USER_AUTH_STATE_KEY]
+    assert restored is not None
+    assert restored.access_token == "aa.bb.cc"
+    assert restored.expires_at == 1700000000
 
 
 def test_save_connection_persists_to_store_and_marks_active(

@@ -7,10 +7,22 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
 
 from app.models.connection import ADMEConnection, AuthMethod, ServiceHealthResult
-from app.services import settings_store
+from app.services import settings_store, token_utils
 
 if TYPE_CHECKING:
     from app.services.auth import UserAuthFlowStart, UserAuthState
+
+_IDENTITY_CLAIMS = ("upn", "unique_name", "preferred_username", "appid")
+_SIGN_IN_GUIDANCE = (
+    "Sign in or paste a bearer token on the Instance Configuration page."
+)
+_EXPIRED_GUIDANCE = (
+    "Your session token expired — sign in again or paste a fresh token on the "
+    "Instance Configuration page."
+)
+_SERVICE_PRINCIPAL_GUIDANCE = (
+    "Add the service-principal client secret on the Instance Configuration page."
+)
 
 SessionStateView = Any
 MutableSessionState = Any
@@ -74,6 +86,7 @@ def ensure_session_defaults(session_state: MutableSessionState) -> None:
                 stored = settings_store.load_connection(active_name)
                 if stored is not None:
                     session_state[CONNECTION_KEY] = stored
+                    _hydrate_user_token(session_state)
         except settings_store.SettingsStoreError:
             # Hydration is additive; never block session bootstrap on disk I/O.
             pass
@@ -158,10 +171,15 @@ def store_user_auth_state(
     session_state: MutableSessionState,
     auth_state: UserAuthState,
 ) -> None:
-    """Store completed user auth state and clear stale health results."""
+    """Store completed user auth state and clear stale health results.
+
+    The token is also persisted to the OS credential store (best-effort) so it
+    survives app restarts until it expires.
+    """
     if session_state.get(USER_AUTH_STATE_KEY) != auth_state:
         clear_health_state(session_state)
     session_state[USER_AUTH_STATE_KEY] = auth_state
+    _persist_user_token(auth_state)
 
 
 def clear_user_auth_state(session_state: MutableSessionState) -> None:
@@ -169,6 +187,45 @@ def clear_user_auth_state(session_state: MutableSessionState) -> None:
     session_state[USER_AUTH_STATE_KEY] = None
     clear_pending_user_auth_flow(session_state)
     clear_health_state(session_state)
+    _forget_user_token()
+
+
+def _persist_user_token(auth_state: UserAuthState) -> None:
+    """Best-effort: persist the bearer token to the OS credential store."""
+    try:
+        settings_store.save_user_token(
+            auth_state.access_token,
+            auth_state.expires_at,
+        )
+    except Exception:  # noqa: BLE001 - persistence is best-effort
+        pass
+
+
+def _forget_user_token() -> None:
+    """Best-effort: remove any persisted bearer token."""
+    try:
+        settings_store.clear_user_token()
+    except Exception:  # noqa: BLE001 - persistence is best-effort
+        pass
+
+
+def _hydrate_user_token(session_state: MutableSessionState) -> None:
+    """Restore a persisted bearer token into the session, if one exists."""
+    if session_state.get(USER_AUTH_STATE_KEY) is not None:
+        return
+    try:
+        loaded = settings_store.load_user_token()
+    except Exception:  # noqa: BLE001 - hydration is best-effort
+        return
+    if loaded is None:
+        return
+    token, expires_at = loaded
+    from app.services.auth import UserAuthState as _UserAuthState  # noqa: PLC0415
+
+    session_state[USER_AUTH_STATE_KEY] = _UserAuthState(
+        access_token=token,
+        expires_at=expires_at,
+    )
 
 
 def get_health_results(
@@ -237,6 +294,96 @@ def get_overall_state(session_state: SessionStateView) -> str:
         return "error"
     results = get_health_results(session_state)
     return summarize_health(results).overall_state
+
+
+@dataclass(frozen=True)
+class AuthReadiness:
+    """Describe whether the chosen auth method is ready to make ADME calls.
+
+    ``ready`` gates Test Connection and per-page actions. ``identity_label`` is
+    a human-friendly "acting as" description when known. ``guidance`` is the
+    operator-facing next step when ``ready`` is ``False`` (empty otherwise).
+    """
+
+    ready: bool
+    method: AuthMethod
+    identity_label: str | None
+    guidance: str
+
+
+def _identity_label_from_token(token: str) -> str | None:
+    """Return a friendly identity from a token's claims, if readable."""
+    return token_utils.extract_first_string_claim(token, _IDENTITY_CLAIMS)
+
+
+def auth_readiness(
+    connection: ADMEConnection | None,
+    user_auth_state: UserAuthState | None,
+) -> AuthReadiness:
+    """Return readiness, identity, and guidance for the connection's method.
+
+    Service principal is ready as soon as a client secret is present (the
+    ``client-id`` + secret credential authenticates without a sign-in). User
+    impersonation is ready once a non-expired session token exists — obtained
+    by browser sign-in *or* a pasted bearer token.
+    """
+    if connection is None:
+        return AuthReadiness(
+            ready=False,
+            method=AuthMethod.USER_IMPERSONATION,
+            identity_label=None,
+            guidance=_SIGN_IN_GUIDANCE,
+        )
+
+    method = connection.auth_method
+    if method == AuthMethod.SERVICE_PRINCIPAL:
+        if connection.client_secret.strip():
+            client_id = connection.client_id.strip()
+            label = (
+                f"service principal ({client_id})"
+                if client_id
+                else "service principal"
+            )
+            return AuthReadiness(
+                ready=True,
+                method=method,
+                identity_label=label,
+                guidance="",
+            )
+        return AuthReadiness(
+            ready=False,
+            method=method,
+            identity_label=None,
+            guidance=_SERVICE_PRINCIPAL_GUIDANCE,
+        )
+
+    if (
+        user_auth_state is not None
+        and user_auth_state.access_token
+        and not user_auth_state.is_expired()
+    ):
+        label = (
+            _identity_label_from_token(user_auth_state.access_token)
+            or "signed-in user"
+        )
+        return AuthReadiness(
+            ready=True,
+            method=method,
+            identity_label=label,
+            guidance="",
+        )
+
+    guidance = (
+        _EXPIRED_GUIDANCE
+        if user_auth_state is not None and user_auth_state.is_expired()
+        else _SIGN_IN_GUIDANCE
+    )
+    return AuthReadiness(
+        ready=False,
+        method=method,
+        identity_label=None,
+        guidance=guidance,
+    )
 
 
 def format_auth_method(method: AuthMethod) -> str:

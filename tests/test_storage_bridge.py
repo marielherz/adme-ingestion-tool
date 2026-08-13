@@ -279,8 +279,14 @@ def test_settings_and_welcome_load_fake_storage_without_reentering_fields(
     }
     assert text_values["ADME endpoint"] == "https://stored.energy.azure.com"
     assert text_values["Tenant ID"] == "11111111-1111-1111-1111-111111111111"
-    assert text_values["Client ID"] == "22222222-2222-2222-2222-222222222222"
-    assert text_values["Token scope"] == "https://stored.energy.azure.com/.default"
+    assert (
+        streamlit_recorder.session_state["cfg_client_id"]
+        == "22222222-2222-2222-2222-222222222222"
+    )
+    assert (
+        streamlit_recorder.session_state["cfg_token_scope"]
+        == "https://stored.energy.azure.com/.default"
+    )
     assert text_values["Data partition ID"] == "stored-opendes"
     assert "Client secret" not in text_values
 

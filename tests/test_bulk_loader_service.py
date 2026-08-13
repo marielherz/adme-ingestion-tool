@@ -17,6 +17,7 @@ import pytest
 from app.models.connection import ADMEConnection, AuthMethod
 from app.models.osdu import (
     ManifestPreview,
+    StorageRecordsResult,
     SubmitResult,
     WorkflowRunResult,
     WorkflowStatus,
@@ -163,7 +164,7 @@ def test_preview_tier_tno_reference_data() -> None:
 
 def test_preview_tier_disabled_raises() -> None:
     with pytest.raises(ValueError, match="disabled"):
-        bulk_loader.preview_tier("tno", "master-data")
+        bulk_loader.preview_tier("tno", "work-products")
 
 
 def test_preview_tier_unknown_tier_raises() -> None:
@@ -412,8 +413,10 @@ def test_submit_tier_injects_acl_and_legal_into_records(
     assert record["acl"]["owners"] == ["owner-a@example", "owner-b@example"]
     assert record["acl"]["viewers"] == ["viewer-a@example"]
     assert record["legal"]["legaltags"] == ["example-legal-tag"]
-    # otherRelevantDataCountries is untouched (not populated by injector)
-    assert record["legal"]["otherRelevantDataCountries"] == []
+    # An empty otherRelevantDataCountries / missing status makes OSDU Storage
+    # silently drop the record, so the injector fills sane defaults.
+    assert record["legal"]["otherRelevantDataCountries"] == ["US"]
+    assert record["legal"]["status"] == "compliant"
 
 
 def test_submit_tier_does_not_overwrite_populated_acl(
@@ -471,6 +474,10 @@ def test_submit_tier_does_not_overwrite_populated_acl(
     assert record["acl"]["owners"] == ["preset-owner@example"]
     assert record["acl"]["viewers"] == ["preset-viewer@example"]
     assert record["legal"]["legaltags"] == ["preset-tag"]
+    # Populated fields stay, but an *empty* countries / missing status are
+    # still filled — those defaults are required for the record to persist.
+    assert record["legal"]["otherRelevantDataCountries"] == ["US"]
+    assert record["legal"]["status"] == "compliant"
 
 
 def test_submit_tier_continues_past_failure(
@@ -516,3 +523,618 @@ def test_submit_tier_continues_past_failure(
     assert errors[0] is None
     assert errors[1] == "workflow rejected"
     assert errors[2] is None
+
+
+# ---------------------------------------------------------------------------
+# per-load prefix (Smart Tier independent copies)
+# ---------------------------------------------------------------------------
+
+
+def test_make_load_prefix_uses_date() -> None:
+    from datetime import date
+
+    assert bulk_loader.make_load_prefix(date(2026, 6, 30)) == "20260630-"
+
+
+def _master_data_bodies() -> list[dict[str, Any]]:
+    well = {
+        "kind": "osdu:wks:Manifest:1.0.0",
+        "MasterData": [
+            {
+                "id": "osdu:master-data--Well:W1",
+                "kind": "osdu:wks:master-data--Well:1.0.0",
+                "data": {"FacilityName": "W1"},
+            }
+        ],
+    }
+    wellbore = {
+        "kind": "osdu:wks:Manifest:1.0.0",
+        "MasterData": [
+            {
+                "id": "osdu:master-data--Wellbore:W1-S1",
+                "kind": "osdu:wks:master-data--Wellbore:1.0.0",
+                "data": {
+                    "WellID": "<namespace>:master-data--Well:W1:",
+                    "ExistenceKind": (
+                        "<namespace>:reference-data--ExistenceKind:Active:"
+                    ),
+                },
+            }
+        ],
+    }
+    return [well, wellbore]
+
+
+def test_apply_load_prefix_rewrites_ids_and_intra_load_references() -> None:
+    bodies = _master_data_bodies()
+    out = bulk_loader.apply_load_prefix(
+        bodies, section="MasterData", prefix="20260630-"
+    )
+
+    well = out[0]["MasterData"][0]
+    wellbore = out[1]["MasterData"][0]
+
+    # Record ids carry the prefix on the unique-id portion only.
+    assert well["id"] == "osdu:master-data--Well:20260630-W1"
+    assert wellbore["id"] == "osdu:master-data--Wellbore:20260630-W1-S1"
+
+    # The cross-manifest reference is rewritten consistently, preserving the
+    # ``<namespace>`` token and the trailing version colon.
+    assert (
+        wellbore["data"]["WellID"]
+        == "<namespace>:master-data--Well:20260630-W1:"
+    )
+
+    # A reference to a record outside this load (shared reference-data) is
+    # left untouched so the link still resolves to the shared copy.
+    assert (
+        wellbore["data"]["ExistenceKind"]
+        == "<namespace>:reference-data--ExistenceKind:Active:"
+    )
+
+
+def test_apply_load_prefix_does_not_touch_kind_strings() -> None:
+    bodies = _master_data_bodies()
+    out = bulk_loader.apply_load_prefix(
+        bodies, section="MasterData", prefix="20260630-"
+    )
+    assert out[0]["MasterData"][0]["kind"] == "osdu:wks:master-data--Well:1.0.0"
+    assert out[0]["kind"] == "osdu:wks:Manifest:1.0.0"
+
+
+def test_apply_load_prefix_blank_prefix_is_noop_deep_copy() -> None:
+    bodies = _master_data_bodies()
+    out = bulk_loader.apply_load_prefix(bodies, section="MasterData", prefix="  ")
+
+    assert out == bodies
+    # A deep copy is returned so callers can mutate without aliasing.
+    assert out[0] is not bodies[0]
+    assert out[0]["MasterData"][0] is not bodies[0]["MasterData"][0]
+
+
+def test_build_prefix_id_map_keys_on_type_and_unique() -> None:
+    bodies = _master_data_bodies()
+    id_map = bulk_loader.build_prefix_id_map(
+        bodies, section="MasterData", prefix="20260630-"
+    )
+    assert id_map == {
+        ("master-data--Well", "W1"): "20260630-W1",
+        ("master-data--Wellbore", "W1-S1"): "20260630-W1-S1",
+    }
+
+
+def test_build_prefix_id_map_blank_prefix_is_empty() -> None:
+    bodies = _master_data_bodies()
+    assert (
+        bulk_loader.build_prefix_id_map(
+            bodies, section="MasterData", prefix=""
+        )
+        == {}
+    )
+
+
+def test_build_reference_prefix_map_targets_entity_prefix() -> None:
+    # A work-product-shaped body referencing master-data + reference-data.
+    body = {
+        "Data": {
+            "WorkProductComponents": [
+                {
+                    "id": "surrogate-key:wpc-1",
+                    "data": {
+                        "WellboreID": "osdu:master-data--Wellbore:1013:",
+                        "OperatorID": "<namespace>:master-data--Organisation:EBN:",
+                        "ExistenceKind": (
+                            "<namespace>:reference-data--ExistenceKind:Active:"
+                        ),
+                    },
+                }
+            ]
+        }
+    }
+    ref_map = bulk_loader.build_reference_prefix_map(
+        body, prefix="20260730-", entity_prefix="master-data--"
+    )
+    assert ref_map == {
+        ("master-data--Wellbore", "1013"): "20260730-1013",
+        ("master-data--Organisation", "EBN"): "20260730-EBN",
+    }
+    # reference-data refs and surrogate-keys are excluded.
+    assert ("reference-data--ExistenceKind", "Active") not in ref_map
+
+
+def test_build_reference_prefix_map_blank_prefix_is_empty() -> None:
+    body = {"data": {"WellboreID": "osdu:master-data--Wellbore:1013:"}}
+    assert (
+        bulk_loader.build_reference_prefix_map(
+            body, prefix="  ", entity_prefix="master-data--"
+        )
+        == {}
+    )
+
+
+def test_submit_tier_with_load_prefix_rewrites_record_ids(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _build_synthetic_tno(tmp_path, monkeypatch, file_count=2)
+
+    payloads: list[dict[str, Any]] = []
+
+    def fake_submit(
+        connection: ADMEConnection,
+        token: str,
+        manifest_payload: dict[str, Any],
+    ) -> WorkflowRunResult:
+        payloads.append(manifest_payload)
+        return _ok_result(run_id=f"run-{len(payloads)}")
+
+    monkeypatch.setattr(bulk_loader, "submit_manifest", fake_submit)
+
+    list(
+        bulk_loader.submit_tier(
+            "tno",
+            "reference-data",
+            acl_owners=["o@x"],
+            acl_viewers=["v@x"],
+            legal_tag="t",
+            data_partition_id="p",
+            connection=_connection(),
+            token="tok",
+            load_prefix="20260630-",
+        )
+    )
+
+    ids = [
+        payload["executionContext"]["manifest"]["ReferenceData"][0]["id"]
+        for payload in payloads
+    ]
+    assert ids == [
+        "p:reference-data--Foo:20260630-item-0",
+        "p:reference-data--Foo:20260630-item-1",
+    ]
+
+
+def test_submit_manifest_paths_uses_token_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _build_synthetic_tno(tmp_path, monkeypatch, file_count=2)
+    paths = sorted((tmp_path / "data" / "manifests").glob("load_*.json"))
+
+    seen_tokens: list[str] = []
+
+    def fake_submit(
+        connection: ADMEConnection,
+        token: str,
+        manifest_payload: dict[str, Any],
+    ) -> WorkflowRunResult:
+        seen_tokens.append(token)
+        return _ok_result(run_id=f"run-{len(seen_tokens)}")
+
+    monkeypatch.setattr(bulk_loader, "submit_manifest", fake_submit)
+
+    tokens = iter(["fresh-1", "fresh-2"])
+
+    list(
+        bulk_loader.submit_manifest_paths(
+            paths,
+            section="ReferenceData",
+            acl_owners=["o@x"],
+            acl_viewers=["v@x"],
+            legal_tag="t",
+            data_partition_id="p",
+            connection=_connection(),
+            token="stale-fixed",
+            token_provider=lambda: next(tokens),
+        )
+    )
+
+    # The provider's token was used per submit, not the fixed one.
+    assert seen_tokens == ["fresh-1", "fresh-2"]
+
+
+def test_submit_manifest_paths_token_provider_failure_is_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _build_synthetic_tno(tmp_path, monkeypatch, file_count=1)
+    paths = sorted((tmp_path / "data" / "manifests").glob("load_*.json"))
+
+    monkeypatch.setattr(
+        bulk_loader,
+        "submit_manifest",
+        lambda *a, **k: _ok_result(),
+    )
+
+    def boom() -> str:
+        raise RuntimeError("az login expired")
+
+    results = list(
+        bulk_loader.submit_manifest_paths(
+            paths,
+            section="ReferenceData",
+            acl_owners=["o@x"],
+            acl_viewers=["v@x"],
+            legal_tag="t",
+            data_partition_id="p",
+            connection=_connection(),
+            token="tok",
+            token_provider=boom,
+        )
+    )
+
+    assert results[0].status == "error"
+    assert "token refresh failed" in (results[0].error or "")
+
+
+def test_submit_tier_without_prefix_leaves_unique_id_untouched(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _build_synthetic_tno(tmp_path, monkeypatch, file_count=1)
+
+    payloads: list[dict[str, Any]] = []
+
+    def fake_submit(
+        connection: ADMEConnection,
+        token: str,
+        manifest_payload: dict[str, Any],
+    ) -> WorkflowRunResult:
+        payloads.append(manifest_payload)
+        return _ok_result()
+
+    monkeypatch.setattr(bulk_loader, "submit_manifest", fake_submit)
+
+    list(
+        bulk_loader.submit_tier(
+            "tno",
+            "reference-data",
+            acl_owners=["o@x"],
+            acl_viewers=["v@x"],
+            legal_tag="t",
+            data_partition_id="p",
+            connection=_connection(),
+            token="tok",
+        )
+    )
+
+    # No load prefix, so the unique-id portion is untouched; the partition
+    # token is still rewritten from ``osdu`` to the target ``p``.
+    assert (
+        payloads[0]["executionContext"]["manifest"]["ReferenceData"][0]["id"]
+        == "p:reference-data--Foo:item-0"
+    )
+
+
+# ---------------------------------------------------------------------------
+# substitute_partition (rewrite hardwired partition token to the target)
+# ---------------------------------------------------------------------------
+
+
+def _partition_sample_body() -> dict[str, Any]:
+    return {
+        "kind": "osdu:wks:Manifest:1.0.0",
+        "MasterData": [
+            {
+                "id": "osdu:master-data--Well:1001",
+                "kind": "osdu:wks:master-data--Well:1.0.0",
+                "data": {
+                    "FacilityName": "AHM-01",
+                    "OperatorID": (
+                        "osdu:master-data--Organisation:Foo%20Bar:"
+                    ),
+                    "ExistenceKind": (
+                        "<namespace>:reference-data--ExistenceKind:Active:"
+                    ),
+                    "SurrogateRef": "surrogate-key:wpc-1",
+                    "PlainString": "not-an-id",
+                },
+            }
+        ],
+    }
+
+
+def test_substitute_partition_rewrites_record_id_lead_token() -> None:
+    out = bulk_loader.substitute_partition(_partition_sample_body(), "opendes")
+    assert out["MasterData"][0]["id"] == "opendes:master-data--Well:1001"
+
+
+def test_substitute_partition_rewrites_reference_lead_tokens() -> None:
+    out = bulk_loader.substitute_partition(_partition_sample_body(), "opendes")
+    data = out["MasterData"][0]["data"]
+    # Both the literal ``osdu`` authority and the ``<namespace>`` placeholder
+    # references collapse onto the target partition, keeping the trailing
+    # version colon and any URL-encoded characters intact.
+    assert data["OperatorID"] == "opendes:master-data--Organisation:Foo%20Bar:"
+    assert (
+        data["ExistenceKind"]
+        == "opendes:reference-data--ExistenceKind:Active:"
+    )
+
+
+def test_substitute_partition_leaves_kind_and_non_ids_untouched() -> None:
+    out = bulk_loader.substitute_partition(_partition_sample_body(), "opendes")
+    record = out["MasterData"][0]
+    # Schema kinds (second segment lacks ``--``) stay on the osdu authority.
+    assert record["kind"] == "osdu:wks:master-data--Well:1.0.0"
+    assert out["kind"] == "osdu:wks:Manifest:1.0.0"
+    # Surrogate keys and plain strings are not id-shaped and pass through.
+    assert record["data"]["SurrogateRef"] == "surrogate-key:wpc-1"
+    assert record["data"]["PlainString"] == "not-an-id"
+
+
+def test_substitute_partition_blank_is_noop_deep_copy() -> None:
+    body = _partition_sample_body()
+    out = bulk_loader.substitute_partition(body, "   ")
+    assert out == body
+    # A deep copy is returned so callers can mutate without aliasing.
+    assert out is not body
+    assert out["MasterData"][0] is not body["MasterData"][0]
+
+
+def test_substitute_partition_is_exported() -> None:
+    assert "substitute_partition" in bulk_loader.__all__
+
+
+# ---------------------------------------------------------------------------
+# Storage-API load path (put_records / submit_records_from_paths)
+# ---------------------------------------------------------------------------
+
+
+def _write_records_manifest(
+    directory: Path, name: str, section: str, count: int, *, start: int = 0
+) -> Path:
+    records = [
+        {
+            "id": f"osdu:master-data--Well:{start + i}",
+            "kind": "osdu:wks:master-data--Well:1.0.0",
+            "data": {"FacilityName": f"W{start + i}"},
+            "acl": {"owners": [], "viewers": []},
+            "legal": {"legaltags": [], "otherRelevantDataCountries": []},
+        }
+        for i in range(count)
+    ]
+    body = {"kind": "osdu:wks:Manifest:1.0.0", section: records}
+    path = directory / name
+    path.write_text(json.dumps(body), encoding="utf-8")
+    return path
+
+
+def _ok_storage(record_ids: list[str]) -> StorageRecordsResult:
+    return StorageRecordsResult(
+        ok=True,
+        http_status=201,
+        record_count=len(record_ids),
+        record_ids=record_ids,
+        skipped_record_ids=[],
+        error_message=None,
+        correlation_id=None,
+        latency_ms=1.0,
+    )
+
+
+def test_extract_section_records_returns_dicts_only() -> None:
+    body = {
+        "MasterData": [
+            {"id": "a", "kind": "k"},
+            "not-a-dict",
+            {"id": "b", "kind": "k"},
+        ]
+    }
+    records = bulk_loader.extract_section_records(body, "MasterData")
+    assert [r["id"] for r in records] == ["a", "b"]
+    assert bulk_loader.extract_section_records(body, "Missing") == []
+
+
+def test_chunk_records_respects_batch_size() -> None:
+    records = [{"id": str(i)} for i in range(5)]
+    batches = list(bulk_loader.chunk_records(records, 2))
+    assert [len(b) for b in batches] == [2, 2, 1]
+
+
+def test_chunk_records_clamps_batch_size() -> None:
+    records = [{"id": str(i)} for i in range(3)]
+    # Below 1 clamps to 1 (one record per batch).
+    assert [len(b) for b in bulk_loader.chunk_records(records, 0)] == [1, 1, 1]
+    # Above 500 clamps to 500 (all three fit in one batch).
+    assert [len(b) for b in bulk_loader.chunk_records(records, 999)] == [3]
+
+
+def test_count_section_records_sums_across_files(tmp_path: Path) -> None:
+    p1 = _write_records_manifest(tmp_path, "a.json", "MasterData", 3)
+    p2 = _write_records_manifest(tmp_path, "b.json", "MasterData", 2, start=3)
+    missing = tmp_path / "nope.json"
+    assert bulk_loader.count_section_records([p1, p2, missing], "MasterData") == 5
+
+
+def test_submit_records_from_paths_batches_and_yields_per_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    p1 = _write_records_manifest(tmp_path, "a.json", "MasterData", 3)
+    p2 = _write_records_manifest(tmp_path, "b.json", "MasterData", 2, start=3)
+
+    batches: list[list[dict[str, Any]]] = []
+
+    def fake_put(connection: Any, token: str, records: list[dict]):
+        batches.append(records)
+        return _ok_storage([r["id"] for r in records])
+
+    monkeypatch.setattr(bulk_loader, "put_records", fake_put)
+
+    results = list(
+        bulk_loader.submit_records_from_paths(
+            [p1, p2],
+            section="MasterData",
+            acl_owners=["o@x"],
+            acl_viewers=["v@x"],
+            legal_tag="lt",
+            data_partition_id="opendes",
+            connection=_connection(),
+            token="tok",
+            batch_size=2,
+        )
+    )
+
+    # 5 records across two files -> batches of 2, 2, 1 (streamed across files).
+    assert [len(b) for b in batches] == [2, 2, 1]
+    # One SubmitResult per record, all successful.
+    assert len(results) == 5
+    assert all(r.status == "success" for r in results)
+    assert {r.record_id for r in results} == {
+        f"opendes:master-data--Well:{i}" for i in range(5)
+    }
+
+
+def test_submit_records_from_paths_applies_partition_and_legal(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_records_manifest(tmp_path, "a.json", "MasterData", 1)
+    seen: list[dict[str, Any]] = []
+
+    def fake_put(connection: Any, token: str, records: list[dict]):
+        seen.extend(records)
+        return _ok_storage([r["id"] for r in records])
+
+    monkeypatch.setattr(bulk_loader, "put_records", fake_put)
+
+    list(
+        bulk_loader.submit_records_from_paths(
+            [path],
+            section="MasterData",
+            acl_owners=["owner@x"],
+            acl_viewers=["viewer@x"],
+            legal_tag="opendes-legal",
+            data_partition_id="opendes",
+            connection=_connection(),
+            token="tok",
+            overwrite_acl_legal=True,
+        )
+    )
+
+    record = seen[0]
+    # Partition rewritten from osdu -> opendes on the record id.
+    assert record["id"] == "opendes:master-data--Well:0"
+    # ACL/legal stamped, including the required storage defaults.
+    assert record["acl"]["owners"] == ["owner@x"]
+    assert record["legal"]["legaltags"] == ["opendes-legal"]
+    assert record["legal"]["otherRelevantDataCountries"] == ["US"]
+    assert record["legal"]["status"] == "compliant"
+
+
+def test_submit_records_from_paths_bad_manifest_yields_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    good = _write_records_manifest(tmp_path, "good.json", "MasterData", 1)
+    bad = tmp_path / "bad.json"
+    bad.write_text("{ not json", encoding="utf-8")
+
+    monkeypatch.setattr(
+        bulk_loader,
+        "put_records",
+        lambda c, t, records: _ok_storage([r["id"] for r in records]),
+    )
+
+    results = list(
+        bulk_loader.submit_records_from_paths(
+            [bad, good],
+            section="MasterData",
+            acl_owners=["o@x"],
+            acl_viewers=["v@x"],
+            legal_tag="lt",
+            data_partition_id="opendes",
+            connection=_connection(),
+            token="tok",
+            batch_size=10,
+        )
+    )
+
+    statuses = {r.filename: r.status for r in results}
+    assert statuses["bad.json"] == "error"
+    assert statuses["good.json"] == "success"
+
+
+def test_submit_records_from_paths_batch_error_marks_all_records(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_records_manifest(tmp_path, "a.json", "MasterData", 2)
+
+    def fail_put(connection: Any, token: str, records: list[dict]):
+        return StorageRecordsResult(
+            ok=False,
+            http_status=400,
+            record_count=0,
+            record_ids=[],
+            skipped_record_ids=[],
+            error_message="validation error",
+            correlation_id=None,
+            latency_ms=1.0,
+        )
+
+    monkeypatch.setattr(bulk_loader, "put_records", fail_put)
+
+    results = list(
+        bulk_loader.submit_records_from_paths(
+            [path],
+            section="MasterData",
+            acl_owners=["o@x"],
+            acl_viewers=["v@x"],
+            legal_tag="lt",
+            data_partition_id="opendes",
+            connection=_connection(),
+            token="tok",
+            batch_size=10,
+        )
+    )
+
+    assert len(results) == 2
+    assert all(r.status == "error" for r in results)
+    assert all(r.error == "validation error" for r in results)
+
+
+def test_submit_records_from_paths_uses_token_provider(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _write_records_manifest(tmp_path, "a.json", "MasterData", 1)
+    tokens: list[str] = []
+
+    def fake_put(connection: Any, token: str, records: list[dict]):
+        tokens.append(token)
+        return _ok_storage([r["id"] for r in records])
+
+    monkeypatch.setattr(bulk_loader, "put_records", fake_put)
+
+    list(
+        bulk_loader.submit_records_from_paths(
+            [path],
+            section="MasterData",
+            acl_owners=["o@x"],
+            acl_viewers=["v@x"],
+            legal_tag="lt",
+            data_partition_id="opendes",
+            connection=_connection(),
+            token="fixed",
+            token_provider=lambda: "refreshed",
+        )
+    )
+
+    assert tokens == ["refreshed"]

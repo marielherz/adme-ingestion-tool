@@ -7,7 +7,7 @@ import sys
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any, cast
 
 import pytest
@@ -17,9 +17,13 @@ from app.models.connection import ADMEConnection, AuthMethod
 from app.models.osdu import (
     DatasetDescriptor,
     DatasetTier,
+    FieldMapping,
     ManifestPreview,
+    MappingResult,
+    SchemaField,
     SubmitResult,
 )
+from app.services import background_jobs as bj_module
 from tests.support.streamlit_recorder import StreamlitRecorder
 
 BULK_LOAD_PAGE_PATH = (
@@ -35,6 +39,7 @@ TIER_KEY = "bulk_tier"
 LEGAL_TAG_KEY = "bulk_legal_tag"
 ACL_OWNERS_KEY = "bulk_acl_owners"
 ACL_VIEWERS_KEY = "bulk_acl_viewers"
+LOAD_PREFIX_KEY = "bulk_load_prefix"
 PREVIEW_SEEN_KEY = "bulk_preview_seen"
 PREVIEW_RESULTS_KEY = "bulk_preview_results"
 SUBMIT_RESULTS_KEY = "bulk_submit_results"
@@ -572,3 +577,1940 @@ def test_submit_renders_mixed_success_and_failure_results(
     assert len(stored) == 2
     assert stored[0].status == "success"
     assert stored[1].status == "error"
+
+
+def test_submit_forwards_load_prefix_to_submit_tier(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A load prefix entered on the page is passed through to submit_tier."""
+    streamlit_recorder.session_state[CONNECTION_KEY] = _connection()
+    streamlit_recorder.session_state[DATASET_KEY] = "tno"
+    streamlit_recorder.session_state[TIER_KEY] = "reference-data"
+    streamlit_recorder.session_state[LEGAL_TAG_KEY] = "opendes-tno-data"
+    streamlit_recorder.session_state[ACL_OWNERS_KEY] = "data.x.owners@x"
+    streamlit_recorder.session_state[ACL_VIEWERS_KEY] = "data.x.viewers@x"
+    streamlit_recorder.session_state[LOAD_PREFIX_KEY] = "20260630-"
+    streamlit_recorder.session_state[PREVIEW_SEEN_KEY] = (
+        "tno",
+        "reference-data",
+    )
+    streamlit_recorder.session_state[PREVIEW_RESULTS_KEY] = [
+        _preview_row("load_a.json", "kindA", 1),
+    ]
+    streamlit_recorder.button_responses[SUBMIT_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    tno = _tno_descriptor(tmp_path)
+    spy = _patch_service(
+        page_module,
+        monkeypatch,
+        datasets=[tno],
+        submit_results=[_submit_row("load_a.json", ok=True, run_id="run-1")],
+    )
+
+    page_module.main()
+
+    assert spy["submit"], "submit_tier should have been called"
+    kwargs = spy["submit"][0][2]
+    assert kwargs["load_prefix"] == "20260630-"
+
+
+def test_submit_defaults_load_prefix_to_empty(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """With no prefix entered, submit_tier receives an empty load_prefix."""
+    streamlit_recorder.session_state[CONNECTION_KEY] = _connection()
+    streamlit_recorder.session_state[DATASET_KEY] = "tno"
+    streamlit_recorder.session_state[TIER_KEY] = "reference-data"
+    streamlit_recorder.session_state[LEGAL_TAG_KEY] = "opendes-tno-data"
+    streamlit_recorder.session_state[ACL_OWNERS_KEY] = "data.x.owners@x"
+    streamlit_recorder.session_state[ACL_VIEWERS_KEY] = "data.x.viewers@x"
+    streamlit_recorder.session_state[PREVIEW_SEEN_KEY] = (
+        "tno",
+        "reference-data",
+    )
+    streamlit_recorder.session_state[PREVIEW_RESULTS_KEY] = [
+        _preview_row("load_a.json", "kindA", 1),
+    ]
+    streamlit_recorder.button_responses[SUBMIT_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    tno = _tno_descriptor(tmp_path)
+    spy = _patch_service(
+        page_module,
+        monkeypatch,
+        datasets=[tno],
+        submit_results=[_submit_row("load_a.json", ok=True, run_id="run-1")],
+    )
+
+    page_module.main()
+
+    assert spy["submit"], "submit_tier should have been called"
+    assert spy["submit"][0][2]["load_prefix"] == ""
+
+
+# ===========================================================================
+# Generate from CSV tab — session keys (mirror page module GEN_* constants)
+# ===========================================================================
+
+GEN_KIND_KEY = "gen_kind"
+GEN_CSV_DATA_KEY = "gen_csv_data"
+GEN_MAPPING_RESULT_KEY = "gen_mapping_result"
+GEN_CONFIRMED_MAPPINGS_KEY = "gen_confirmed_mappings"
+GEN_MANIFESTS_KEY = "gen_manifests"
+GEN_SUBMIT_RESULTS_KEY = "gen_submit_results"
+GEN_LEGAL_TAG_KEY = "gen_legal_tag"
+GEN_ACL_OWNERS_KEY = "gen_acl_owners"
+GEN_ACL_VIEWERS_KEY = "gen_acl_viewers"
+GEN_LAST_ERROR_KEY = "gen_last_error"
+
+# Abort feature keys — Judson's #31 implementation will define these.
+# Tests written ahead of implementation; expected to fail until wired up.
+BULK_ABORT_KEY = "bulk_abort_requested"
+GEN_ABORT_KEY = "gen_abort_requested"
+
+GENERATE_BUTTON_LABEL = "📄 Generate Manifests"
+GEN_SUBMIT_LABEL = "🚀 Submit generated manifests"
+
+
+# ---------------------------------------------------------------------------
+# CSV-gen helpers
+# ---------------------------------------------------------------------------
+
+_SAMPLE_CSV = b"WellName,Country,FieldName\nWell-A,Norway,Troll\nWell-B,UK,Brent\n"
+_SAMPLE_CSV_HEADERS = ["WellName", "Country", "FieldName"]
+_SAMPLE_KINDS = [
+    "osdu:wks:master-data--Well:1.0.0",
+    "osdu:wks:reference-data--AliasNameType:1.0.0",
+]
+
+
+class FakeUploadedCSV:
+    """Minimal stand-in for ``st.file_uploader`` return value."""
+
+    def __init__(
+        self,
+        content: bytes = _SAMPLE_CSV,
+        name: str = "wells.csv",
+    ) -> None:
+        self.name = name
+        self.size = len(content)
+        self.type = "text/csv"
+        self._content = content
+
+    def getvalue(self) -> bytes:
+        return self._content
+
+
+def _sample_schema_fields() -> list[SchemaField]:
+    return [
+        SchemaField(path="data.WellName", field_type="string", required=True),
+        SchemaField(path="data.Country", field_type="string", required=False),
+        SchemaField(
+            path="data.FieldName", field_type="string", required=False
+        ),
+    ]
+
+
+def _sample_mapping_result() -> MappingResult:
+    return MappingResult(
+        mappings=[
+            FieldMapping(csv_header="WellName", schema_path="data.WellName"),
+            FieldMapping(csv_header="Country", schema_path="data.Country"),
+            FieldMapping(csv_header="FieldName", schema_path="data.FieldName"),
+        ],
+        unmatched_csv=[],
+        unmatched_required=[],
+        confidence=1.0,
+    )
+
+
+def _sample_manifests() -> list[dict]:
+    return [
+        {"executionContext": {"manifest": {"kind": "osdu:wks:Manifest:1.0.0"}, "i": 0}},
+        {"executionContext": {"manifest": {"kind": "osdu:wks:Manifest:1.0.0"}, "i": 1}},
+    ]
+
+
+def _patch_csv_services(
+    page_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    datasets: list[DatasetDescriptor] | None = None,
+    kinds: list[str] | None = None,
+    schema: dict | None = None,
+    schema_fields: list[SchemaField] | None = None,
+    mapping_result: MappingResult | None = None,
+    generate_result: list[dict] | None = None,
+    generate_raises: Exception | None = None,
+    submit_manifest_result: Any | None = None,
+    submit_manifest_raises: Exception | None = None,
+) -> dict[str, list[Any]]:
+    """Patch all services needed for CSV-generation tab tests.
+
+    Extends the base ``_patch_service`` stubs with manifest_generator and
+    ingestion service patches. Returns a call-spy dict.
+    """
+    # Start with the base patches (list_datasets, submit_tier, get_token, etc.)
+    spy = _patch_service(page_module, monkeypatch, datasets=datasets or [])
+
+    csv_spy: dict[str, list[Any]] = {
+        "list_kinds": [],
+        "load_schema": [],
+        "extract_fields": [],
+        "auto_map": [],
+        "generate": [],
+        "submit_manifest": [],
+    }
+    spy.update(csv_spy)
+
+    def fake_list_schema_kinds(**_: Any) -> list[str]:
+        csv_spy["list_kinds"].append(True)
+        return list(kinds if kinds is not None else _SAMPLE_KINDS)
+
+    def fake_load_schema(kind: str, **_: Any) -> dict:
+        csv_spy["load_schema"].append(kind)
+        return schema or {"properties": {"data": {"properties": {}}}}
+
+    def fake_extract_schema_fields(s: dict, **_: Any) -> list[SchemaField]:
+        csv_spy["extract_fields"].append(s)
+        return list(schema_fields if schema_fields is not None else _sample_schema_fields())
+
+    def fake_auto_map(
+        fields: list[SchemaField], headers: list[str]
+    ) -> MappingResult:
+        csv_spy["auto_map"].append((fields, headers))
+        return mapping_result or _sample_mapping_result()
+
+    def fake_generate_manifests(**kwargs: Any) -> list[dict]:
+        csv_spy["generate"].append(kwargs)
+        if generate_raises is not None:
+            raise generate_raises
+        return list(generate_result if generate_result is not None else _sample_manifests())
+
+    def fake_submit_manifest(
+        connection: ADMEConnection, token: str, payload: dict
+    ) -> Any:
+        csv_spy["submit_manifest"].append((connection, token, payload))
+        if submit_manifest_raises is not None:
+            raise submit_manifest_raises
+        if submit_manifest_result is not None:
+            return submit_manifest_result
+        # Return a minimal successful WorkflowRunResult
+        from app.models.osdu import WorkflowRunResult, WorkflowStatus
+
+        return WorkflowRunResult(
+            workflow_id="wf-1",
+            run_id=f"run-{len(csv_spy['submit_manifest'])}",
+            status=WorkflowStatus.FINISHED,
+            raw_status="finished",
+            message=None,
+            ok=True,
+            http_status=200,
+            latency_ms=50.0,
+        )
+
+    monkeypatch.setattr(page_module, "list_schema_kinds", fake_list_schema_kinds)
+    monkeypatch.setattr(page_module, "load_schema", fake_load_schema)
+    monkeypatch.setattr(
+        page_module, "extract_schema_fields", fake_extract_schema_fields
+    )
+    monkeypatch.setattr(page_module, "auto_map", fake_auto_map)
+    monkeypatch.setattr(page_module, "generate_manifests", fake_generate_manifests)
+    monkeypatch.setattr(page_module, "submit_manifest", fake_submit_manifest)
+
+    return spy
+
+
+def _setup_csv_tab_session(
+    recorder: StreamlitRecorder,
+    *,
+    kind: str = "",
+    csv_data: bytes | None = None,
+    legal_tag: str = "",
+    acl_owners: str = "",
+    acl_viewers: str = "",
+    mapping_result: MappingResult | None = None,
+    confirmed_mappings: list[FieldMapping] | None = None,
+    manifests: list[dict] | None = None,
+) -> None:
+    """Prime session state for CSV-gen tab tests.
+
+    The recorder's ``selectbox`` reads from ``widget_values[label]``, not
+    ``session_state[key]``.  We set **both** so the page's session-state
+    reads AND the selectbox return values are consistent.
+    """
+    recorder.session_state[CONNECTION_KEY] = _connection()
+    recorder.session_state[GEN_KIND_KEY] = kind
+    recorder.session_state[GEN_CSV_DATA_KEY] = csv_data
+    recorder.session_state[GEN_LEGAL_TAG_KEY] = legal_tag
+    recorder.session_state[GEN_ACL_OWNERS_KEY] = acl_owners
+    recorder.session_state[GEN_ACL_VIEWERS_KEY] = acl_viewers
+    # Widget values drive what the recorder returns from selectbox/text_input.
+    if kind:
+        recorder.widget_values["OSDU kind"] = kind
+    if mapping_result is not None:
+        recorder.session_state[GEN_MAPPING_RESULT_KEY] = mapping_result
+    if confirmed_mappings is not None:
+        recorder.session_state[GEN_CONFIRMED_MAPPINGS_KEY] = confirmed_mappings
+    if manifests is not None:
+        recorder.session_state[GEN_MANIFESTS_KEY] = manifests
+
+
+# ===========================================================================
+# CSV Generation Tab — Issue #17
+# ===========================================================================
+
+
+class TestCSVGenerationKindPicker:
+    """Kind picker renders with schema kinds from ``list_schema_kinds()``."""
+
+    def test_kind_selectbox_renders_with_schema_kinds(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The OSDU kind selectbox renders with all vendored schema kinds."""
+        _setup_csv_tab_session(streamlit_recorder)
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        spy = _patch_csv_services(
+            page_module, monkeypatch, kinds=_SAMPLE_KINDS
+        )
+
+        page_module.main()
+
+        assert spy["list_kinds"], "list_schema_kinds was not called"
+        kind_selects = [
+            call
+            for call in streamlit_recorder.calls_named("selectbox")
+            if call.args and call.args[0] == "OSDU kind"
+        ]
+        assert kind_selects, "OSDU kind selectbox was not rendered"
+        options = kind_selects[0].args[1]
+        # First option is the blank placeholder ""
+        assert "" in options
+        for k in _SAMPLE_KINDS:
+            assert k in options
+
+    def test_no_schemas_shows_warning(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When no vendored schemas exist, a warning is displayed."""
+        _setup_csv_tab_session(streamlit_recorder)
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch, kinds=[])
+
+        page_module.main()
+
+        warnings = [
+            call.args[0] for call in streamlit_recorder.calls_named("warning")
+        ]
+        assert any("schema" in w.lower() for w in warnings)
+
+
+class TestCSVUpload:
+    """CSV file upload stores data in session state."""
+
+    def test_upload_stores_csv_bytes_in_session_state(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Uploading a CSV file stores its bytes in GEN_CSV_DATA_KEY."""
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(streamlit_recorder, kind=kind)
+        fake_csv = FakeUploadedCSV()
+        streamlit_recorder.file_uploader_responses["Upload CSV"] = fake_csv
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        stored = streamlit_recorder.session_state.get(GEN_CSV_DATA_KEY)
+        assert stored == _SAMPLE_CSV
+
+    def test_new_csv_resets_downstream_state(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Uploading a different CSV clears mapping, manifests, and results."""
+        kind = _SAMPLE_KINDS[0]
+        old_csv = b"OldCol\nval\n"
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=old_csv,
+            mapping_result=_sample_mapping_result(),
+            manifests=_sample_manifests(),
+        )
+        # Now upload a new file with different content
+        new_csv = FakeUploadedCSV(content=_SAMPLE_CSV)
+        streamlit_recorder.file_uploader_responses["Upload CSV"] = new_csv
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        # Downstream state should be reset
+        assert streamlit_recorder.session_state.get(GEN_CSV_DATA_KEY) == _SAMPLE_CSV
+        # Mapping result is recomputed (auto_map called again for new CSV)
+        # Manifests should be cleared when CSV changes
+        assert streamlit_recorder.session_state.get(GEN_MANIFESTS_KEY) is None
+
+
+class TestCSVAutoMap:
+    """Auto-map is called when both kind and CSV are present."""
+
+    def test_auto_map_called_with_kind_and_csv(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When kind is selected and CSV uploaded, auto_map is invoked."""
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(streamlit_recorder, kind=kind, csv_data=_SAMPLE_CSV)
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        spy = _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        assert spy["auto_map"], "auto_map was not called"
+        fields, headers = spy["auto_map"][0]
+        assert len(fields) == 3
+        assert set(headers) == {"WellName", "Country", "FieldName"}
+
+    def test_auto_map_skipped_when_no_csv(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Without a CSV upload, auto_map is not called."""
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(streamlit_recorder, kind=kind, csv_data=None)
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        spy = _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        assert not spy["auto_map"]
+        info_msgs = [
+            call.args[0] for call in streamlit_recorder.calls_named("info")
+        ]
+        assert any("Upload a CSV" in m for m in info_msgs)
+
+    def test_auto_map_skipped_when_no_kind(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Without a kind selection, auto_map is not called."""
+        _setup_csv_tab_session(streamlit_recorder, kind="", csv_data=_SAMPLE_CSV)
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        spy = _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        assert not spy["auto_map"]
+
+    def test_auto_map_not_rerun_when_mapping_cached(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When GEN_MAPPING_RESULT_KEY is already set, auto_map is not re-called."""
+        kind = _SAMPLE_KINDS[0]
+        cached = _sample_mapping_result()
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            mapping_result=cached,
+        )
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        spy = _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        assert not spy["auto_map"], "auto_map should not re-run when cached"
+
+
+class TestCSVMappingOverride:
+    """Mapping override UI renders with correct field options."""
+
+    def test_mapping_selectboxes_rendered_for_each_schema_field(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A selectbox per schema field is rendered for override."""
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(streamlit_recorder, kind=kind, csv_data=_SAMPLE_CSV)
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        # Each schema field gets a selectbox keyed by gen_map_{path}
+        mapping_selects = [
+            call
+            for call in streamlit_recorder.calls_named("selectbox")
+            if call.kwargs.get("key", "").startswith("gen_map_")
+        ]
+        assert len(mapping_selects) == 3, (
+            f"Expected 3 mapping selectboxes, got {len(mapping_selects)}"
+        )
+
+    def test_mapping_options_include_unmapped_and_csv_headers(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Each mapping selectbox offers (unmapped) + all CSV headers."""
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(streamlit_recorder, kind=kind, csv_data=_SAMPLE_CSV)
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        mapping_selects = [
+            call
+            for call in streamlit_recorder.calls_named("selectbox")
+            if call.kwargs.get("key", "").startswith("gen_map_")
+        ]
+        for sel in mapping_selects:
+            options = sel.args[1]
+            assert "(unmapped)" in options
+            for h in _SAMPLE_CSV_HEADERS:
+                assert h in options
+
+    def test_confidence_indicator_renders(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Auto-map confidence percentage is displayed."""
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(streamlit_recorder, kind=kind, csv_data=_SAMPLE_CSV)
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        # 100% confidence → st.success
+        success_msgs = [
+            call.args[0]
+            for call in streamlit_recorder.calls_named("success")
+        ]
+        assert any("100%" in m for m in success_msgs)
+
+    def test_low_confidence_shows_warning(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Low confidence mapping shows a warning indicator."""
+        kind = _SAMPLE_KINDS[0]
+        low_conf = MappingResult(
+            mappings=[
+                FieldMapping(csv_header="WellName", schema_path="data.WellName"),
+            ],
+            unmatched_csv=["Country", "FieldName"],
+            unmatched_required=[],
+            confidence=0.33,
+        )
+        _setup_csv_tab_session(streamlit_recorder, kind=kind, csv_data=_SAMPLE_CSV)
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch, mapping_result=low_conf)
+
+        page_module.main()
+
+        error_msgs = [
+            call.args[0] for call in streamlit_recorder.calls_named("error")
+        ]
+        assert any("33%" in m for m in error_msgs)
+
+    def test_unmatched_required_fields_surfaced(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Unmapped required fields produce a warning listing them."""
+        kind = _SAMPLE_KINDS[0]
+        partial = MappingResult(
+            mappings=[],
+            unmatched_csv=["WellName", "Country", "FieldName"],
+            unmatched_required=["data.WellName"],
+            confidence=0.0,
+        )
+        _setup_csv_tab_session(streamlit_recorder, kind=kind, csv_data=_SAMPLE_CSV)
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch, mapping_result=partial)
+
+        page_module.main()
+
+        warnings = [
+            call.args[0] for call in streamlit_recorder.calls_named("warning")
+        ]
+        assert any(
+            "required" in w.lower() and "data.WellName" in w for w in warnings
+        )
+
+
+class TestCSVGenerate:
+    """Generate button calls ``generate_manifests()`` with confirmed mappings."""
+
+    def test_generate_disabled_without_any_mappings(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Generate is disabled when no CSV columns are mapped to fields."""
+        kind = _SAMPLE_KINDS[0]
+        # All fields unmapped → confirmed list empty
+        all_unmapped = MappingResult(
+            mappings=[],
+            unmatched_csv=_SAMPLE_CSV_HEADERS,
+            unmatched_required=["data.WellName"],
+            confidence=0.0,
+        )
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            legal_tag="opendes-tag",
+            acl_owners="data.x.owners@x",
+            acl_viewers="data.x.viewers@x",
+        )
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch, mapping_result=all_unmapped)
+
+        page_module.main()
+
+        gen_buttons = [
+            call
+            for call in streamlit_recorder.calls_named("button")
+            if call.args and call.args[0] == GENERATE_BUTTON_LABEL
+        ]
+        assert gen_buttons, "Generate button must be rendered"
+        assert gen_buttons[0].kwargs.get("disabled") is True
+
+    def test_generate_disabled_without_legal_tag(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Generate is disabled when legal tag is empty."""
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            legal_tag="",  # empty
+            acl_owners="data.x.owners@x",
+            acl_viewers="data.x.viewers@x",
+        )
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        gen_buttons = [
+            call
+            for call in streamlit_recorder.calls_named("button")
+            if call.args and call.args[0] == GENERATE_BUTTON_LABEL
+        ]
+        assert gen_buttons
+        assert gen_buttons[0].kwargs.get("disabled") is True
+        captions = [
+            call.args[0] for call in streamlit_recorder.calls_named("caption")
+        ]
+        assert any("legal tag" in c.lower() for c in captions)
+
+    def test_generate_disabled_without_acl_owners(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Generate is disabled when ACL owners is empty."""
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            legal_tag="opendes-tag",
+            acl_owners="",
+            acl_viewers="data.x.viewers@x",
+        )
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        gen_buttons = [
+            call
+            for call in streamlit_recorder.calls_named("button")
+            if call.args and call.args[0] == GENERATE_BUTTON_LABEL
+        ]
+        assert gen_buttons
+        assert gen_buttons[0].kwargs.get("disabled") is True
+
+    def test_generate_calls_generate_manifests_on_click(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Clicking Generate invokes generate_manifests with confirmed mappings."""
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            legal_tag="opendes-tag",
+            acl_owners="data.x.owners@x",
+            acl_viewers="data.x.viewers@x",
+        )
+        streamlit_recorder.button_responses[GENERATE_BUTTON_LABEL] = True
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        spy = _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        assert spy["generate"], "generate_manifests was not called"
+        gen_kwargs = spy["generate"][0]
+        assert gen_kwargs["kind"] == kind
+        assert gen_kwargs["legal_tag"] == "opendes-tag"
+        assert gen_kwargs["acl_owners"] == "data.x.owners@x"
+        assert gen_kwargs["acl_viewers"] == "data.x.viewers@x"
+
+
+class TestCSVManifestPreview:
+    """Generated manifests display in preview before submit."""
+
+    def test_generated_manifests_stored_and_count_shown(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """After generate, manifests are stored and a count summary renders."""
+        kind = _SAMPLE_KINDS[0]
+        manifests = _sample_manifests()
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            legal_tag="opendes-tag",
+            acl_owners="data.x.owners@x",
+            acl_viewers="data.x.viewers@x",
+            manifests=manifests,
+        )
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        success_msgs = [
+            call.args[0] for call in streamlit_recorder.calls_named("success")
+        ]
+        assert any(
+            "2" in m and "manifest" in m.lower() for m in success_msgs
+        ), "Preview should show manifest count"
+
+    def test_submit_button_appears_when_manifests_generated(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """The Submit button renders once manifests are generated."""
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            legal_tag="opendes-tag",
+            acl_owners="data.x.owners@x",
+            acl_viewers="data.x.viewers@x",
+            manifests=_sample_manifests(),
+        )
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        submit_buttons = [
+            call
+            for call in streamlit_recorder.calls_named("button")
+            if call.args and call.args[0] == GEN_SUBMIT_LABEL
+        ]
+        assert submit_buttons, "Submit generated manifests button must render"
+
+    def test_submit_disabled_without_manifests(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Submit is disabled when no manifests have been generated yet."""
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            legal_tag="opendes-tag",
+            acl_owners="data.x.owners@x",
+            acl_viewers="data.x.viewers@x",
+            manifests=None,
+        )
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        # The submit button only renders when manifests exist; if it does
+        # render it should be disabled.
+        submit_buttons = [
+            call
+            for call in streamlit_recorder.calls_named("button")
+            if call.args and call.args[0] == GEN_SUBMIT_LABEL
+        ]
+        if submit_buttons:
+            assert submit_buttons[0].kwargs.get("disabled") is True
+
+
+class TestCSVSubmit:
+    """Submit iterates through generated manifests via ``submit_manifest()``."""
+
+    def test_submit_calls_submit_manifest_for_each(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Clicking Submit calls submit_manifest once per generated manifest."""
+        kind = _SAMPLE_KINDS[0]
+        manifests = _sample_manifests()
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            legal_tag="opendes-tag",
+            acl_owners="data.x.owners@x",
+            acl_viewers="data.x.viewers@x",
+            manifests=manifests,
+        )
+        streamlit_recorder.button_responses[GEN_SUBMIT_LABEL] = True
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        spy = _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        assert len(spy["submit_manifest"]) == len(manifests), (
+            f"Expected {len(manifests)} submit_manifest calls, "
+            f"got {len(spy['submit_manifest'])}"
+        )
+
+    def test_submit_stores_results_in_session_state(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Submission results are stored in GEN_SUBMIT_RESULTS_KEY."""
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            legal_tag="opendes-tag",
+            acl_owners="data.x.owners@x",
+            acl_viewers="data.x.viewers@x",
+            manifests=_sample_manifests(),
+        )
+        streamlit_recorder.button_responses[GEN_SUBMIT_LABEL] = True
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        results = streamlit_recorder.session_state.get(GEN_SUBMIT_RESULTS_KEY, [])
+        assert len(results) == 2
+        assert results[0]["ok"] is True
+
+    def test_submit_progress_bar_updates(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Progress bar updates during submission."""
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            legal_tag="opendes-tag",
+            acl_owners="data.x.owners@x",
+            acl_viewers="data.x.viewers@x",
+            manifests=_sample_manifests(),
+        )
+        streamlit_recorder.button_responses[GEN_SUBMIT_LABEL] = True
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        progress_updates = streamlit_recorder.calls_named("progress_update")
+        assert progress_updates, "Progress bar should update during submit"
+
+
+class TestCSVErrorHandling:
+    """Error handling: invalid CSV, schema errors, generate/submit failures."""
+
+    def test_invalid_csv_shows_error(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Uploading a CSV with no headers shows a parse error."""
+        kind = _SAMPLE_KINDS[0]
+        bad_csv = b""  # empty file
+        _setup_csv_tab_session(
+            streamlit_recorder, kind=kind, csv_data=bad_csv
+        )
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        error_msgs = [
+            call.args[0] for call in streamlit_recorder.calls_named("error")
+        ]
+        assert any(
+            "csv" in m.lower() or "header" in m.lower() for m in error_msgs
+        )
+
+    def test_schema_not_found_shows_error(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """When load_schema raises SchemaNotFoundError, an error is displayed."""
+        from app.services.manifest_generator import SchemaNotFoundError
+
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(
+            streamlit_recorder, kind=kind, csv_data=_SAMPLE_CSV
+        )
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+        # Override load_schema to raise
+        monkeypatch.setattr(
+            page_module,
+            "load_schema",
+            lambda *a, **k: (_ for _ in ()).throw(
+                SchemaNotFoundError("no-such-kind")
+            ),
+        )
+
+        page_module.main()
+
+        error_msgs = [
+            call.args[0] for call in streamlit_recorder.calls_named("error")
+        ]
+        assert any("schema" in m.lower() for m in error_msgs)
+
+    def test_generate_failure_sets_sticky_error(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A generate_manifests exception sets a sticky error."""
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            legal_tag="opendes-tag",
+            acl_owners="data.x.owners@x",
+            acl_viewers="data.x.viewers@x",
+        )
+        streamlit_recorder.button_responses[GENERATE_BUTTON_LABEL] = True
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(
+            page_module,
+            monkeypatch,
+            generate_raises=ValueError("CSV data malformed"),
+        )
+
+        page_module.main()
+
+        sticky_error = streamlit_recorder.session_state.get(GEN_LAST_ERROR_KEY)
+        assert sticky_error is not None
+        assert "malformed" in sticky_error.lower() or "error" in sticky_error.lower()
+
+    def test_submit_manifest_failure_records_error_result(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """A submit_manifest exception is captured as a failed result row."""
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            legal_tag="opendes-tag",
+            acl_owners="data.x.owners@x",
+            acl_viewers="data.x.viewers@x",
+            manifests=[_sample_manifests()[0]],
+        )
+        streamlit_recorder.button_responses[GEN_SUBMIT_LABEL] = True
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(
+            page_module,
+            monkeypatch,
+            submit_manifest_raises=RuntimeError("network timeout"),
+        )
+
+        page_module.main()
+
+        results = streamlit_recorder.session_state.get(GEN_SUBMIT_RESULTS_KEY, [])
+        assert len(results) == 1
+        assert results[0]["ok"] is False
+        assert "timeout" in results[0].get("error", "").lower()
+
+    def test_csv_gen_results_section_renders_summary(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Persistent results section renders success/failure summary."""
+        kind = _SAMPLE_KINDS[0]
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            legal_tag="opendes-tag",
+            acl_owners="data.x.owners@x",
+            acl_viewers="data.x.viewers@x",
+        )
+        # Pre-populate results as if a prior submit completed
+        streamlit_recorder.session_state[GEN_SUBMIT_RESULTS_KEY] = [
+            {"index": 1, "ok": True, "run_id": "run-1", "error": ""},
+            {"index": 2, "ok": False, "run_id": "", "error": "boom"},
+        ]
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        warning_msgs = [
+            call.args[0]
+            for call in streamlit_recorder.calls_named("warning")
+        ]
+        assert any(
+            "1 of 2" in w and "1 failed" in w for w in warning_msgs
+        ), "Results summary should show succeeded/failed counts"
+
+
+# ===========================================================================
+# Abort button — Issue #31
+#
+# Judson's implementation is in progress. These tests codify the expected
+# abort behavior for BOTH the registered-dataset submit loop and the
+# CSV-generation submit loop. They will fail until the abort feature is
+# wired up — that's intentional: they're the acceptance gate.
+# ===========================================================================
+
+
+class TestAbortRegisteredDatasets:
+    """Abort button behavior during registered-dataset submit."""
+
+    def test_abort_flag_stops_registered_dataset_submit_loop(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Setting the abort flag before submit causes the loop to stop early."""
+        streamlit_recorder.session_state[CONNECTION_KEY] = _connection()
+        streamlit_recorder.session_state[DATASET_KEY] = "tno"
+        streamlit_recorder.session_state[TIER_KEY] = "reference-data"
+        streamlit_recorder.session_state[LEGAL_TAG_KEY] = "opendes-tno-data"
+        streamlit_recorder.session_state[ACL_OWNERS_KEY] = "data.x.owners@x"
+        streamlit_recorder.session_state[ACL_VIEWERS_KEY] = "data.x.viewers@x"
+        streamlit_recorder.session_state[PREVIEW_SEEN_KEY] = (
+            "tno",
+            "reference-data",
+        )
+        streamlit_recorder.session_state[PREVIEW_RESULTS_KEY] = [
+            _preview_row("a.json", "kindA", 1),
+            _preview_row("b.json", "kindB", 1),
+            _preview_row("c.json", "kindC", 1),
+        ]
+        # Pre-set abort flag to simulate mid-loop abort
+        streamlit_recorder.session_state[BULK_ABORT_KEY] = True
+        streamlit_recorder.button_responses[SUBMIT_LABEL] = True
+
+        call_count = 0
+
+        def counting_submit_tier(
+            dataset_id: str, tier: str, **kwargs: Any
+        ) -> Iterator[SubmitResult]:
+            nonlocal call_count
+            for name in ["a.json", "b.json", "c.json"]:
+                call_count += 1
+                yield _submit_row(name, ok=True, run_id=f"run-{call_count}")
+
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        tno = _tno_descriptor(tmp_path)
+        _patch_service(page_module, monkeypatch, datasets=[tno])
+        monkeypatch.setattr(page_module, "submit_tier", counting_submit_tier)
+
+        page_module.main()
+
+        # With abort flag set, the loop should have stopped before
+        # processing all 3 manifests.
+        stored = streamlit_recorder.session_state.get(SUBMIT_RESULTS_KEY, [])
+        assert len(stored) < 3, (
+            f"Abort should stop the loop early but got {len(stored)} results"
+        )
+
+    def test_abort_partial_results_preserved(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """Partial results from before the abort are kept in session state."""
+        streamlit_recorder.session_state[CONNECTION_KEY] = _connection()
+        streamlit_recorder.session_state[DATASET_KEY] = "tno"
+        streamlit_recorder.session_state[TIER_KEY] = "reference-data"
+        streamlit_recorder.session_state[LEGAL_TAG_KEY] = "opendes-tno-data"
+        streamlit_recorder.session_state[ACL_OWNERS_KEY] = "data.x.owners@x"
+        streamlit_recorder.session_state[ACL_VIEWERS_KEY] = "data.x.viewers@x"
+        streamlit_recorder.session_state[PREVIEW_SEEN_KEY] = (
+            "tno",
+            "reference-data",
+        )
+        streamlit_recorder.session_state[PREVIEW_RESULTS_KEY] = [
+            _preview_row("a.json", "kindA", 1),
+            _preview_row("b.json", "kindB", 1),
+        ]
+        streamlit_recorder.session_state[BULK_ABORT_KEY] = True
+        streamlit_recorder.button_responses[SUBMIT_LABEL] = True
+
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        tno = _tno_descriptor(tmp_path)
+        _patch_service(
+            page_module,
+            monkeypatch,
+            datasets=[tno],
+            submit_results=[
+                _submit_row("a.json", ok=True, run_id="run-1"),
+                _submit_row("b.json", ok=True, run_id="run-2"),
+            ],
+        )
+
+        page_module.main()
+
+        stored = streamlit_recorder.session_state.get(SUBMIT_RESULTS_KEY, [])
+        # At least partial results should be present (whatever was
+        # processed before the abort was checked).
+        assert isinstance(stored, list)
+
+    def test_abort_message_shows_count(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+    ) -> None:
+        """After abort, a message shows 'Aborted after N/M manifests'."""
+        streamlit_recorder.session_state[CONNECTION_KEY] = _connection()
+        streamlit_recorder.session_state[DATASET_KEY] = "tno"
+        streamlit_recorder.session_state[TIER_KEY] = "reference-data"
+        streamlit_recorder.session_state[LEGAL_TAG_KEY] = "opendes-tno-data"
+        streamlit_recorder.session_state[ACL_OWNERS_KEY] = "data.x.owners@x"
+        streamlit_recorder.session_state[ACL_VIEWERS_KEY] = "data.x.viewers@x"
+        streamlit_recorder.session_state[PREVIEW_SEEN_KEY] = (
+            "tno",
+            "reference-data",
+        )
+        streamlit_recorder.session_state[PREVIEW_RESULTS_KEY] = [
+            _preview_row("a.json", "kindA", 1),
+            _preview_row("b.json", "kindB", 1),
+            _preview_row("c.json", "kindC", 1),
+        ]
+        streamlit_recorder.session_state[BULK_ABORT_KEY] = True
+        streamlit_recorder.button_responses[SUBMIT_LABEL] = True
+
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        tno = _tno_descriptor(tmp_path)
+        _patch_service(
+            page_module,
+            monkeypatch,
+            datasets=[tno],
+            submit_results=[
+                _submit_row("a.json", ok=True, run_id="run-1"),
+                _submit_row("b.json", ok=True, run_id="run-2"),
+                _submit_row("c.json", ok=True, run_id="run-3"),
+            ],
+        )
+
+        page_module.main()
+
+        # Look for abort-count message in warning/info/write calls
+        all_text = []
+        for name in ("warning", "info", "write", "error"):
+            all_text.extend(
+                call.args[0]
+                for call in streamlit_recorder.calls_named(name)
+                if call.args
+            )
+        assert any(
+            "abort" in t.lower() for t in all_text
+        ), "An abort-related message should be displayed to the operator"
+
+
+class TestAbortCSVGeneration:
+    """Abort button behavior during CSV-generation submit."""
+
+    def test_abort_stops_csv_submit_loop(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Setting the abort flag stops the CSV-gen submit loop early."""
+        kind = _SAMPLE_KINDS[0]
+        manifests = [
+            {"executionContext": {"manifest": {}, "i": i}} for i in range(5)
+        ]
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            legal_tag="opendes-tag",
+            acl_owners="data.x.owners@x",
+            acl_viewers="data.x.viewers@x",
+            manifests=manifests,
+        )
+        streamlit_recorder.session_state[GEN_ABORT_KEY] = True
+        streamlit_recorder.button_responses[GEN_SUBMIT_LABEL] = True
+
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        spy = _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        # With abort set, should process fewer than all 5
+        results = streamlit_recorder.session_state.get(GEN_SUBMIT_RESULTS_KEY, [])
+        assert len(results) < 5, (
+            f"Abort should stop CSV submit early but got {len(results)} results"
+        )
+
+    def test_abort_csv_partial_results_preserved(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Partial results from aborted CSV submit are preserved."""
+        kind = _SAMPLE_KINDS[0]
+        manifests = _sample_manifests()
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            legal_tag="opendes-tag",
+            acl_owners="data.x.owners@x",
+            acl_viewers="data.x.viewers@x",
+            manifests=manifests,
+        )
+        streamlit_recorder.session_state[GEN_ABORT_KEY] = True
+        streamlit_recorder.button_responses[GEN_SUBMIT_LABEL] = True
+
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        results = streamlit_recorder.session_state.get(GEN_SUBMIT_RESULTS_KEY, [])
+        assert isinstance(results, list)
+
+    def test_abort_csv_message_shows_count(
+        self,
+        streamlit_recorder: StreamlitRecorder,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """After aborting CSV submit, a message shows the abort count."""
+        kind = _SAMPLE_KINDS[0]
+        manifests = [
+            {"executionContext": {"manifest": {}, "i": i}} for i in range(4)
+        ]
+        _setup_csv_tab_session(
+            streamlit_recorder,
+            kind=kind,
+            csv_data=_SAMPLE_CSV,
+            legal_tag="opendes-tag",
+            acl_owners="data.x.owners@x",
+            acl_viewers="data.x.viewers@x",
+            manifests=manifests,
+        )
+        streamlit_recorder.session_state[GEN_ABORT_KEY] = True
+        streamlit_recorder.button_responses[GEN_SUBMIT_LABEL] = True
+
+        page_module = _load_page(streamlit_recorder, monkeypatch)
+        _patch_csv_services(page_module, monkeypatch)
+
+        page_module.main()
+
+        all_text = []
+        for name in ("warning", "info", "write", "error"):
+            all_text.extend(
+                call.args[0]
+                for call in streamlit_recorder.calls_named(name)
+                if call.args
+            )
+        assert any(
+            "abort" in t.lower() for t in all_text
+        ), "An abort-related message should be displayed after CSV submit abort"
+
+
+# ===========================================================================
+# Ingestion (workflow run) status indicator
+# ===========================================================================
+
+SUBMIT_RESULTS_KEY = "bulk_submit_results"
+RUN_STATUS_KEY = "bulk_run_status"
+
+
+def _workflow_result(run_id: str, status: Any, *, ok: bool = True) -> Any:
+    from app.models.osdu import WorkflowRunResult
+
+    return WorkflowRunResult(
+        workflow_id="Osdu_ingest",
+        run_id=run_id,
+        status=status,
+        raw_status=str(status.value),
+        message=None,
+        ok=ok,
+        http_status=200 if ok else 404,
+        latency_ms=1.0,
+        correlation_id=None,
+        error_message=None if ok else "run not found",
+        raw_response={},
+    )
+
+
+def test_ingestion_status_section_polls_and_rolls_up(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.models.osdu import WorkflowStatus
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    streamlit_recorder.session_state[SUBMIT_RESULTS_KEY] = [
+        _submit_row("a.json", ok=True, run_id="run-a"),
+        _submit_row("b.json", ok=True, run_id="run-b"),
+        _submit_row("c.json", ok=False, error="boom"),
+    ]
+    streamlit_recorder.button_responses[
+        page_module.RUN_STATUS_BUTTON_LABEL
+    ] = True
+
+    mapping = {"run-a": WorkflowStatus.FINISHED, "run-b": WorkflowStatus.FAILED}
+
+    def fake_get_token(connection: ADMEConnection, **_: Any) -> str:
+        return "test-token"
+
+    def fake_status(
+        connection: ADMEConnection, token: str, run_id: str
+    ) -> Any:
+        return _workflow_result(run_id, mapping[run_id])
+
+    monkeypatch.setattr(page_module, "get_token", fake_get_token)
+    monkeypatch.setattr(page_module, "get_workflow_status", fake_status)
+
+    page_module._render_ingestion_status_section(_connection())
+
+    stored = streamlit_recorder.session_state[RUN_STATUS_KEY]
+    assert stored["run-a"]["state"] == "finished"
+    assert stored["run-b"]["state"] == "failed"
+    warnings = [c.args[0] for c in streamlit_recorder.calls_named("warning")]
+    assert any("1 finished" in w and "1 failed" in w for w in warnings)
+
+
+def test_ingestion_status_section_hidden_without_run_ids(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    streamlit_recorder.session_state[SUBMIT_RESULTS_KEY] = [
+        _submit_row("c.json", ok=False, error="boom"),
+    ]
+
+    page_module._render_ingestion_status_section(_connection())
+
+    markdowns = [
+        call.args[0]
+        for call in streamlit_recorder.calls_named("markdown")
+        if call.args
+    ]
+    assert all("Ingestion status" not in m for m in markdowns)
+
+
+def test_workflow_state_label_maps_statuses(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from app.models.osdu import WorkflowStatus
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    assert (
+        page_module._workflow_state_label(WorkflowStatus.FINISHED) == "finished"
+    )
+    assert page_module._workflow_state_label(WorkflowStatus.FAILED) == "failed"
+    assert (
+        page_module._workflow_state_label(WorkflowStatus.IN_PROGRESS)
+        == "running"
+    )
+    assert (
+        page_module._workflow_state_label(WorkflowStatus.UNKNOWN) == "unknown"
+    )
+
+
+# ===========================================================================
+# Downloaded-dataset tab (external TNO/Volve root)
+# ===========================================================================
+
+DOWNLOAD_ROOT_KEY = "bulk_download_root"
+DOWNLOAD_LIMIT_KEY = "bulk_download_limit"
+DOWNLOAD_AUTO_REFRESH_KEY = "bulk_dl_auto_refresh"
+DOWNLOAD_LEGAL_TAG_KEY = "bulk_dl_legal_tag"
+DOWNLOAD_ACL_OWNERS_KEY = "bulk_dl_acl_owners"
+DOWNLOAD_ACL_VIEWERS_KEY = "bulk_dl_acl_viewers"
+DOWNLOAD_LOAD_LABEL = "🚀 Load selected part"
+
+
+def _seed_download_inputs(
+    recorder: StreamlitRecorder, root: Path
+) -> None:
+    recorder.session_state[CONNECTION_KEY] = _connection()
+    recorder.session_state[DOWNLOAD_ROOT_KEY] = str(root)
+    recorder.session_state[DOWNLOAD_LEGAL_TAG_KEY] = "opendes-tno"
+    recorder.session_state[DOWNLOAD_ACL_OWNERS_KEY] = "data.x.owners@x"
+    recorder.session_state[DOWNLOAD_ACL_VIEWERS_KEY] = "data.x.viewers@x"
+
+
+def _patch_download_discovery(
+    page_module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    part: Any,
+    manifests: list[Path],
+) -> dict[str, list[Any]]:
+    spy: dict[str, list[Any]] = {"wp": [], "list": [], "manifests": []}
+
+    # Run background load jobs inline so the load is observable within the
+    # single test render, and start from a clean registry.
+    bj_module.reset()
+    monkeypatch.setattr(bj_module, "_RUN_SYNC", True)
+
+    monkeypatch.setattr(
+        page_module, "discover_parts", lambda root: [part]
+    )
+
+    def fake_list_part_manifests(
+        p: Any, *, limit: int = 0, offset: int = 0
+    ) -> list[Path]:
+        spy["manifests"].append({"limit": limit, "offset": offset})
+        return list(manifests)
+
+    monkeypatch.setattr(
+        page_module, "list_part_manifests", fake_list_part_manifests
+    )
+
+    def fake_wp(paths: Any, **kwargs: Any) -> Iterator[SubmitResult]:
+        spy["wp"].append((list(paths), kwargs))
+        yield from [_submit_row("a.json", ok=True, run_id="wp-1")]
+
+    def fake_list(paths: Any, **kwargs: Any) -> Iterator[SubmitResult]:
+        spy["list"].append((list(paths), kwargs))
+        yield from [_submit_row("a.json", ok=True, run_id="md-1")]
+
+    monkeypatch.setattr(page_module, "submit_work_products", fake_wp)
+    monkeypatch.setattr(page_module, "submit_records_from_paths", fake_list)
+    monkeypatch.setattr(
+        page_module, "count_section_records", lambda paths, section: len(paths)
+    )
+    return spy
+
+
+def test_download_tab_loads_work_products(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Clicking Load on a work-products part calls submit_work_products."""
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+    streamlit_recorder.button_responses[DOWNLOAD_LOAD_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+
+    part = page_module.DownloadedPart(
+        key="work-products/documents",
+        label="work-products / documents (9)",
+        kind="work-products",
+        section=None,
+        is_work_product=True,
+        manifest_dir=tmp_path / "wp",
+        manifest_count=9,
+        datasets_root=tmp_path / "datasets",
+    )
+    manifests = [tmp_path / "wp" / "a.json"]
+    spy = _patch_download_discovery(
+        page_module, monkeypatch, part=part, manifests=manifests
+    )
+
+    page_module.main()
+
+    assert spy["wp"], "submit_work_products should be called"
+    assert spy["list"] == []
+    paths, kwargs = spy["wp"][0]
+    assert paths == manifests
+    assert kwargs["datasets_root"] == tmp_path / "datasets"
+    assert kwargs["legal_tag"] == "opendes-tno"
+    assert kwargs["acl_owners"] == ["data.x.owners@x"]
+
+
+def test_download_tab_loads_list_tier_with_overwrite(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A reference/master part calls submit_records_from_paths w/ overwrite."""
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+    streamlit_recorder.button_responses[DOWNLOAD_LOAD_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+
+    part = page_module.DownloadedPart(
+        key="master-data/Well",
+        label="master-data / Well (4947)",
+        kind="master-data",
+        section="MasterData",
+        is_work_product=False,
+        manifest_dir=tmp_path / "md",
+        manifest_count=4947,
+        datasets_root=tmp_path / "datasets",
+    )
+    manifests = [tmp_path / "md" / "w1.json", tmp_path / "md" / "w2.json"]
+    spy = _patch_download_discovery(
+        page_module, monkeypatch, part=part, manifests=manifests
+    )
+
+    page_module.main()
+
+    assert spy["list"], "submit_records_from_paths should be called"
+    assert spy["wp"] == []
+    paths, kwargs = spy["list"][0]
+    assert paths == manifests
+    assert kwargs["section"] == "MasterData"
+    assert kwargs["overwrite_acl_legal"] is True
+    assert kwargs["batch_size"] >= 1
+
+
+def test_download_tab_auto_refresh_passes_token_provider(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Enabling Azure CLI auto-refresh passes a token_provider to the loader."""
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+    streamlit_recorder.session_state[DOWNLOAD_AUTO_REFRESH_KEY] = True
+    streamlit_recorder.button_responses[DOWNLOAD_LOAD_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+    # Avoid shelling out to az; the real RefreshingTokenProvider wraps this.
+    monkeypatch.setattr(
+        page_module, "acquire_cli_token", lambda *a, **k: "fresh-cli-token"
+    )
+
+    part = page_module.DownloadedPart(
+        key="work-products/documents",
+        label="work-products / documents (9)",
+        kind="work-products",
+        section=None,
+        is_work_product=True,
+        manifest_dir=tmp_path / "wp",
+        manifest_count=9,
+        datasets_root=tmp_path / "datasets",
+    )
+    spy = _patch_download_discovery(
+        page_module,
+        monkeypatch,
+        part=part,
+        manifests=[tmp_path / "wp" / "a.json"],
+    )
+
+    page_module.main()
+
+    assert spy["wp"], "submit_work_products should be called"
+    _, kwargs = spy["wp"][0]
+    assert kwargs["token_provider"] is not None
+
+
+def test_download_tab_starts_background_job_and_renders_progress(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Clicking Load starts a background job (id stored) and its progress
+    renders — the load runs off the render path so navigation can't kill it."""
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+    streamlit_recorder.button_responses[DOWNLOAD_LOAD_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+
+    part = page_module.DownloadedPart(
+        key="work-products/documents",
+        label="work-products / documents (9)",
+        kind="work-products",
+        section=None,
+        is_work_product=True,
+        manifest_dir=tmp_path / "wp",
+        manifest_count=9,
+        datasets_root=tmp_path / "datasets",
+    )
+    spy = _patch_download_discovery(
+        page_module,
+        monkeypatch,
+        part=part,
+        manifests=[tmp_path / "wp" / "a.json"],
+    )
+
+    page_module.main()
+
+    job_id = streamlit_recorder.session_state.get("bulk_dl_job_id")
+    assert job_id, "a background job id should be stored"
+    snap = bj_module.get_job(job_id).snapshot()
+    assert snap.status == bj_module.STATUS_DONE
+    assert snap.submitted == 1
+    assert spy["wp"], "the loader ran inside the background job"
+
+
+def test_download_tab_no_auto_refresh_passes_none_provider(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Without auto-refresh the loader gets token_provider=None (fixed token)."""
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+    streamlit_recorder.button_responses[DOWNLOAD_LOAD_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+
+    part = page_module.DownloadedPart(
+        key="work-products/documents",
+        label="work-products / documents (9)",
+        kind="work-products",
+        section=None,
+        is_work_product=True,
+        manifest_dir=tmp_path / "wp",
+        manifest_count=9,
+        datasets_root=tmp_path / "datasets",
+    )
+    spy = _patch_download_discovery(
+        page_module,
+        monkeypatch,
+        part=part,
+        manifests=[tmp_path / "wp" / "a.json"],
+    )
+
+    page_module.main()
+
+    assert spy["wp"], "submit_work_products should be called"
+    _, kwargs = spy["wp"][0]
+    assert kwargs["token_provider"] is None
+
+
+def test_download_tab_forwards_start_offset(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The 'Start at #' field resumes a load via list_part_manifests offset."""
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+    # The recorder's number_input resolves by label.
+    streamlit_recorder.widget_values["Start at manifest # (1 = first)"] = 1737
+    streamlit_recorder.button_responses[DOWNLOAD_LOAD_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+    part = page_module.DownloadedPart(
+        key="master-data/Well",
+        label="master-data / Well (4947)",
+        kind="master-data",
+        section="MasterData",
+        is_work_product=False,
+        manifest_dir=tmp_path / "md",
+        manifest_count=4947,
+        datasets_root=tmp_path / "datasets",
+    )
+    spy = _patch_download_discovery(
+        page_module,
+        monkeypatch,
+        part=part,
+        manifests=[tmp_path / "md" / "w.json"],
+    )
+
+    page_module.main()
+
+    assert spy["manifests"], "list_part_manifests should be called"
+    # start_at 1737 -> 0-based offset 1736.
+    assert any(m["offset"] == 1736 for m in spy["manifests"])
+
+
+def test_download_tab_results_section_no_duplicate_keys(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Both tabs render the results/ingestion-status section without a
+    StreamlitDuplicateElementKey collision (regression)."""
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+    streamlit_recorder.session_state[SUBMIT_RESULTS_KEY] = [
+        _submit_row("load_a.json", ok=True, run_id="run-xyz"),
+    ]
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    tno = _tno_descriptor(tmp_path)
+    # datasets=[tno] so the Registered Datasets tab renders its own results
+    # section too, exercising the cross-tab key collision.
+    _patch_service(page_module, monkeypatch, datasets=[tno])
+
+    part = page_module.DownloadedPart(
+        key="work-products/documents",
+        label="work-products / documents (9)",
+        kind="work-products",
+        section=None,
+        is_work_product=True,
+        manifest_dir=tmp_path / "wp",
+        manifest_count=9,
+        datasets_root=tmp_path / "datasets",
+    )
+    _patch_download_discovery(
+        page_module,
+        monkeypatch,
+        part=part,
+        manifests=[tmp_path / "wp" / "a.json"],
+    )
+
+    # Must not raise StreamlitDuplicateElementKey.
+    page_module.main()
+
+    # The Registered Datasets tab still renders its ingestion-status button;
+    # the Downloaded Dataset tab now shows a background-job panel instead, so
+    # there is exactly one such button (no cross-tab collision).
+    status_button_keys = {
+        call.kwargs.get("key")
+        for call in streamlit_recorder.calls_named("button")
+        if str(call.kwargs.get("key", "")).startswith("bulk_run_status_button")
+    }
+    assert status_button_keys == {"bulk_run_status_button"}
+
+
+def test_download_tab_unknown_root_warns(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A root with no recognizable manifests warns and does not submit."""
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+    monkeypatch.setattr(page_module, "discover_parts", lambda root: [])
+    spy = _patch_download_discovery(
+        page_module, monkeypatch, part=None, manifests=[]
+    )
+    # discover_parts override above is replaced by the empty list; re-apply.
+    monkeypatch.setattr(page_module, "discover_parts", lambda root: [])
+
+    page_module.main()
+
+    assert spy["wp"] == []
+    assert spy["list"] == []
+    warnings = [
+        call.args[0]
+        for call in streamlit_recorder.calls_named("warning")
+        if call.args
+    ]
+    assert any("No loadable manifests" in w for w in warnings)
+
+
+def test_full_page_render_has_no_duplicate_widget_keys(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Rendering all four tabs must not reuse any Streamlit widget key.
+
+    Definitive guard against cross-tab StreamlitDuplicateElementKey
+    regressions: every element with an explicit ``key`` across the whole
+    page render must be globally unique.
+    """
+    _seed_download_inputs(streamlit_recorder, tmp_path)
+    # Seed a prior submit so BOTH results/ingestion-status sections render.
+    streamlit_recorder.session_state[SUBMIT_RESULTS_KEY] = [
+        _submit_row("load_a.json", ok=True, run_id="run-xyz"),
+    ]
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    tno = _tno_descriptor(tmp_path)
+    # A bundled dataset so the Registered Datasets tab renders in full.
+    _patch_service(page_module, monkeypatch, datasets=[tno])
+    monkeypatch.setattr(
+        page_module,
+        "list_schema_kinds",
+        lambda: ["osdu:wks:master-data--Well:1.0.0"],
+    )
+
+    part = page_module.DownloadedPart(
+        key="work-products/documents",
+        label="work-products / documents (9)",
+        kind="work-products",
+        section=None,
+        is_work_product=True,
+        manifest_dir=tmp_path / "wp",
+        manifest_count=9,
+        datasets_root=tmp_path / "datasets",
+    )
+    _patch_download_discovery(
+        page_module,
+        monkeypatch,
+        part=part,
+        manifests=[tmp_path / "wp" / "a.json"],
+    )
+
+    # Must render all tabs without raising StreamlitDuplicateElementKey.
+    page_module.main()
+
+    keys = [
+        call.kwargs.get("key")
+        for call in streamlit_recorder.calls
+        if call.kwargs.get("key") is not None
+    ]
+    duplicates = sorted({k for k in keys if keys.count(k) > 1})
+    assert not duplicates, f"Duplicate widget keys across tabs: {duplicates}"
+
+
+# ---------------------------------------------------------------------------
+# Smart Tier interval load tab
+# ---------------------------------------------------------------------------
+
+SMART_ROOT_KEY = "smart_root"
+SMART_INTERVAL_KEY = "smart_interval_label"
+SMART_INCLUDE_WP_KEY = "smart_include_wp"
+SMART_AUTO_REFRESH_KEY = "smart_auto_refresh"
+SMART_LEGAL_TAG_KEY = "smart_legal_tag"
+SMART_ACL_OWNERS_KEY = "smart_acl_owners"
+SMART_ACL_VIEWERS_KEY = "smart_acl_viewers"
+SMART_JOB_ID_KEY = "smart_job_id"
+SMART_LOAD_LABEL = "🚀 Kick off interval load"
+
+
+def _seed_smart_inputs(recorder: StreamlitRecorder, root: Path) -> None:
+    recorder.session_state[CONNECTION_KEY] = _connection()
+    recorder.session_state[SMART_ROOT_KEY] = str(root)
+    recorder.session_state[SMART_INTERVAL_KEY] = "20260908-"
+    recorder.session_state[SMART_INCLUDE_WP_KEY] = True
+    recorder.session_state[SMART_AUTO_REFRESH_KEY] = False  # no az CLI in tests
+    recorder.session_state[SMART_LEGAL_TAG_KEY] = "opendes-tno"
+    recorder.session_state[SMART_ACL_OWNERS_KEY] = "data.x.owners@x"
+    recorder.session_state[SMART_ACL_VIEWERS_KEY] = "data.x.viewers@x"
+
+
+def _fake_plan(key: str, method: str, section: str | None) -> SimpleNamespace:
+    return SimpleNamespace(
+        part=SimpleNamespace(key=key, manifest_count=2, section=section),
+        method=method,
+    )
+
+
+def test_smart_tier_tab_kicks_off_interval_load(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Clicking the Smart Tier button runs run_interval on a background job."""
+    _seed_smart_inputs(streamlit_recorder, tmp_path)
+    streamlit_recorder.button_responses[SMART_LOAD_LABEL] = True
+
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+    bj_module.reset()
+    monkeypatch.setattr(bj_module, "_RUN_SYNC", True)
+    monkeypatch.setattr(page_module, "_INTERVAL_PROGRESS_DIR", tmp_path / "prog")
+
+    plans = [_fake_plan("reference-data", "storage", "ReferenceData")]
+    monkeypatch.setattr(page_module, "plan_interval", lambda root, **k: plans)
+    monkeypatch.setattr(
+        page_module,
+        "list_part_manifests",
+        lambda p, **k: [tmp_path / "a.json", tmp_path / "b.json"],
+    )
+    monkeypatch.setattr(
+        page_module, "count_section_records", lambda paths, section: len(paths)
+    )
+
+    calls: list[dict[str, Any]] = []
+
+    def fake_run_interval(root: Any, **kwargs: Any) -> Iterator[Any]:
+        calls.append(kwargs)
+        yield SimpleNamespace(phase="tier_start", result=None)
+        yield SimpleNamespace(phase="item", result=_submit_row("r1", ok=True))
+        yield SimpleNamespace(phase="item", result=_submit_row("r2", ok=True))
+        yield SimpleNamespace(phase="tier_done", result=None)
+
+    monkeypatch.setattr(page_module, "run_interval", fake_run_interval)
+
+    page_module.main()
+
+    assert calls, "run_interval should be called"
+    assert calls[0]["interval_label"] == "20260908-"
+    assert calls[0]["include_work_products"] is True
+    job_id = streamlit_recorder.session_state.get(SMART_JOB_ID_KEY)
+    assert job_id, "a background job id should be stored"
+    snap = bj_module.get_job(job_id).snapshot()
+    assert snap.status == bj_module.STATUS_DONE
+    assert snap.succeeded == 2  # only 'item' events are recorded
+
+
+def test_smart_tier_button_disabled_without_root(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no dataset root the load button is disabled (guardrail)."""
+    streamlit_recorder.session_state[CONNECTION_KEY] = _connection()
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    _patch_service(page_module, monkeypatch, datasets=[])
+    monkeypatch.setattr(page_module, "plan_interval", lambda root, **k: [])
+
+    page_module.main()
+
+    btns = [
+        c
+        for c in streamlit_recorder.calls_named("button")
+        if c.kwargs.get("key") == "smart_load_button"
+    ]
+    assert btns, "the Smart Tier load button should render"
+    assert btns[0].kwargs.get("disabled") is True
+

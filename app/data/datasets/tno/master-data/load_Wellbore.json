@@ -1,0 +1,211 @@
+{
+    "kind": "osdu:wks:Manifest:1.0.0",
+    "MasterData": [
+        {
+            "id": "osdu:master-data--Wellbore:BUR-GT-01-S1",
+            "kind": "osdu:wks:master-data--Wellbore:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "data": {
+                "FacilityName": "BUR-GT-01-S1",
+                "FacilityID": "BUR-GT-01-S1",
+                "WellID": "<namespace>:master-data--Well:BUR-GT-01:",
+                "SequenceNumber": 1,
+                "Source": "TNO",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:EBN:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:TNO:",
+                "TrajectoryTypeID": "<namespace>:reference-data--WellboreTrajectoryType:Vertical:",
+                "NameAliases": [
+                    {
+                        "AliasName": "Burg-Haamstede GT-01 Sidetrack 1",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    },
+                    {
+                        "AliasName": "BUR-GT-01-S1-NLOG",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:UniqueIdentifier:"
+                    }
+                ],
+                "FacilityStates": [
+                    {
+                        "FacilityStateTypeID": "<namespace>:reference-data--FacilityStateType:Drilling:",
+                        "EffectiveDateTime": "2019-03-01"
+                    },
+                    {
+                        "FacilityStateTypeID": "<namespace>:reference-data--FacilityStateType:Producing:",
+                        "EffectiveDateTime": "2019-09-15"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Wellbore:CAL-GT-01-S1",
+            "kind": "osdu:wks:master-data--Wellbore:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "data": {
+                "FacilityName": "CAL-GT-01-S1",
+                "FacilityID": "CAL-GT-01-S1",
+                "WellID": "<namespace>:master-data--Well:CAL-GT-01:",
+                "SequenceNumber": 1,
+                "Source": "TNO",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:NAM:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:TNO:",
+                "TrajectoryTypeID": "<namespace>:reference-data--WellboreTrajectoryType:Directional:",
+                "NameAliases": [
+                    {
+                        "AliasName": "Calandsoog GT-01 Sidetrack 1",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ],
+                "FacilityStates": [
+                    {
+                        "EffectiveDateTime": "<namespace>:reference-data--FacilityStateType:Drilling:",
+                        "TerminationDateTime": "2020-06-10"
+                    },
+                    {
+                        "EffectiveDateTime": "<namespace>:reference-data--FacilityStateType:PluggedAndAbandoned:",
+                        "TerminationDateTime": "2020-12-01"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Wellbore:BRD-01-S1",
+            "kind": "osdu:wks:master-data--Wellbore:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "data": {
+                "FacilityName": "BRD-01-S1",
+                "FacilityID": "BRD-01-S1",
+                "WellID": "<namespace>:master-data--Well:BRD-01:",
+                "SequenceNumber": 1,
+                "Source": "TNO",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:NAM:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:TNO:",
+                "TrajectoryTypeID": "<namespace>:reference-data--WellboreTrajectoryType:Vertical:",
+                "NameAliases": [
+                    {
+                        "AliasName": "Breda 01 Sidetrack 1",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    },
+                    {
+                        "AliasName": "BRD-01-S1-EBN",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:UniqueIdentifier:"
+                    }
+                ],
+                "FacilityStates": [
+                    {
+                        "FacilityStateTypeID": "<namespace>:reference-data--FacilityStateType:Drilling:",
+                        "EffectiveDateTime": "1988-04-20"
+                    },
+                    {
+                        "FacilityStateTypeID": "<namespace>:reference-data--FacilityStateType:PluggedAndAbandoned:",
+                        "EffectiveDateTime": "1989-01-15"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Wellbore:BRD-01-S2",
+            "kind": "osdu:wks:master-data--Wellbore:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "data": {
+                "FacilityName": "BRD-01-S2",
+                "FacilityID": "BRD-01-S2",
+                "WellID": "<namespace>:master-data--Well:BRD-01:",
+                "SequenceNumber": 2,
+                "Source": "TNO",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:NAM:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:TNO:",
+                "TrajectoryTypeID": "<namespace>:reference-data--WellboreTrajectoryType:Directional:",
+                "NameAliases": [
+                    {
+                        "AliasName": "Breda 01 Sidetrack 2",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ],
+                "FacilityStates": [
+                    {
+                        "EffectiveDateTime": "<namespace>:reference-data--FacilityStateType:Drilling:",
+                        "TerminationDateTime": "1989-06-01"
+                    },
+                    {
+                        "FacilityStateTypeID": "1989-09-30"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Wellbore:GRO-01-S1",
+            "kind": "osdu:wks:master-data--Wellbore:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "data": {
+                "FacilityName": "GRO-01-S1",
+                "FacilityID": "GRO-01-S1",
+                "WellID": "<namespace>:master-data--Well:GRO-01:",
+                "SequenceNumber": 1,
+                "Source": "TNO",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:NAM:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:TNO:",
+                "TrajectoryTypeID": "<namespace>:reference-data--WellboreTrajectoryType:Vertical:",
+                "NameAliases": [
+                    {
+                        "AliasName": "Groningen 01 Sidetrack 1",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    },
+                    {
+                        "AliasName": "GRO-01-S1-NAM",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:UniqueIdentifier:"
+                    }
+                ],
+                "FacilityStates": [
+                    {
+                        "FacilityStateTypeID": "<namespace>:reference-data--FacilityStateType:Drilling:",
+                        "EffectiveDateTime": "1959-01-12"
+                    },
+                    {
+                        "FacilityStateTypeID": "<namespace>:reference-data--FacilityStateType:Producing:",
+                        "EffectiveDateTime": "1963-07-01"
+                    }
+                ]
+            }
+        }
+    ]
+}

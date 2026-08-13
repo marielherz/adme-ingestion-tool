@@ -15,6 +15,7 @@ import pandas as pd  # type: ignore[import-untyped]  # noqa: E402
 import streamlit as st  # type: ignore[import-not-found]  # noqa: E402
 
 from app.connection_state import (  # noqa: E402
+    auth_readiness,
     ensure_session_defaults,
     get_connection,
     get_user_auth_state,
@@ -134,10 +135,13 @@ def _preflight_ok(connection: ADMEConnection | None) -> bool:
         return False
 
     if connection.auth_method == AuthMethod.USER_IMPERSONATION:
-        if get_user_auth_state(st.session_state) is None:
+        readiness = auth_readiness(
+            connection, get_user_auth_state(st.session_state)
+        )
+        if not readiness.ready:
             st.info(
-                "No token available for this session. Sign in on the "
-                "Instance Configuration page to enable the entitlements smoke test."
+                f"{readiness.guidance} A token is required to run the "
+                "entitlements smoke test."
             )
             st.page_link(
                 SETTINGS_PAGE_PATH,

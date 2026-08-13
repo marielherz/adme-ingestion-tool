@@ -10,8 +10,9 @@
       "description": "13 generic OSDU reference-data lookup tables (AliasNameType, DrillingReasonType, FacilityEventType, FacilityStateType, GeoPoliticalEntityType, MaterialType, OperatingEnvironment, SchemaFormatType, TrajectoryStationPropertyType, and related)."
     },
     "master-data": {
-      "enabled": false,
-      "reason": "v2 \u2014 not yet vendored"
+      "enabled": true,
+      "manifest_glob": "master-data/load_*.json",
+      "description": "3 TNO master-data entity types: Organisation, Well, and Wellbore."
     },
     "work-products": {
       "enabled": false,
