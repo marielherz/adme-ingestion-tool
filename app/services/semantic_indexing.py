@@ -67,18 +67,35 @@ class TextFieldExtractor:
     
     @staticmethod
     def extract_from_well(well_record: dict) -> SemanticDocument:
-        """Extract semantic document from a Well (master-data) record."""
+        """Extract semantic document from a Well (master-data) record.
+        
+        OSDU Well has limited text fields. We extract:
+        - FacilityName: Name of the facility
+        - Source: Entity that produced the record
+        - VersionCreationReason: Why this version was created
+        """
         data = well_record.get("data", {})
+        
+        # Build description from available text fields
+        text_parts = []
+        if facility_name := data.get("FacilityName"):
+            text_parts.append(f"Facility: {facility_name}")
+        if source := data.get("Source"):
+            text_parts.append(f"Source: {source}")
+        if version_reason := data.get("VersionCreationReason"):
+            text_parts.append(f"Version reason: {version_reason}")
+        
+        combined_description = " | ".join(text_parts) if text_parts else None
         
         return SemanticDocument(
             entity_id=well_record.get("id", "unknown"),
             entity_type="Well",
             entity_kind=well_record.get("kind", "osdu:wks:master-data--Well:1.0.0"),
-            common_name=data.get("CommonName", ""),
-            description=data.get("Description", None),
-            remarks=data.get("Remarks", None),
-            field_name=data.get("Field", None),
-            operator=data.get("Operator", None),
+            common_name=data.get("FacilityName", ""),
+            description=combined_description,
+            remarks=None,  # Not in standard OSDU Well schema
+            field_name=None,  # Not in standard schema
+            operator=None,  # Use InitialOperatorID or CurrentOperatorID if needed
             measured_depth=None,
             true_vertical_depth=None,
             inclination=None,
@@ -87,66 +104,126 @@ class TextFieldExtractor:
     
     @staticmethod
     def extract_from_wellbore(wellbore_record: dict) -> SemanticDocument:
-        """Extract semantic document from a Wellbore (master-data) record."""
+        """Extract semantic document from a Wellbore (master-data) record.
+        
+        OSDU Wellbore text fields:
+        - FacilityName: Name of the facility
+        - Source: Entity that produced the record  
+        - VersionCreationReason: Why this version was created
+        - DrillingReasons: Array of drilling reasons (nested, may have text)
+        """
         data = wellbore_record.get("data", {})
         
-        # Combine all trajectory descriptions if available
-        trajectory_text = ""
-        if "WellboreTrajectory" in data:
-            trajectory_text = f"Trajectory: {data['WellboreTrajectory']}"
+        # Extract drilling reasons (nested objects with descriptions)
+        drilling_text_parts = []
+        if drilling_reasons := data.get("DrillingReasons"):
+            if isinstance(drilling_reasons, list):
+                for reason in drilling_reasons:
+                    # Each reason might have Description field
+                    if isinstance(reason, dict):
+                        if desc := reason.get("Description"):
+                            drilling_text_parts.append(str(desc))
+                        if reason_text := reason.get("Reason"):
+                            drilling_text_parts.append(str(reason_text))
         
-        remarks_combined = " ".join(filter(None, [
-            data.get("Remarks", ""),
-            trajectory_text
-        ]))
+        # Build comprehensive description
+        text_parts = []
+        if facility_name := data.get("FacilityName"):
+            text_parts.append(f"Facility: {facility_name}")
+        if source := data.get("Source"):
+            text_parts.append(f"Source: {source}")
+        if version_reason := data.get("VersionCreationReason"):
+            text_parts.append(f"Version reason: {version_reason}")
+        if drilling_text_parts:
+            text_parts.append(f"Drilling: {' '.join(drilling_text_parts)}")
+        
+        combined_description = " | ".join(text_parts) if text_parts else None
         
         return SemanticDocument(
             entity_id=wellbore_record.get("id", "unknown"),
             entity_type="Wellbore",
             entity_kind=wellbore_record.get("kind", "osdu:wks:master-data--Wellbore:1.0.0"),
-            common_name=data.get("CommonName", ""),
-            description=data.get("Description", None),
-            remarks=remarks_combined if remarks_combined else None,
-            field_name=data.get("Field", None),
-            operator=data.get("Operator", None),
-            measured_depth=data.get("MeasuredDepth", None),
-            true_vertical_depth=data.get("TrueVerticalDepth", None),
-            inclination=data.get("Inclination", None),
+            common_name=data.get("FacilityName", ""),
+            description=combined_description,
+            remarks=None,  # Not in standard OSDU schema
+            field_name=None,  # Not in standard schema
+            operator=None,  # Would need to resolve InitialOperatorID/CurrentOperatorID
+            measured_depth=data.get("MeasuredDepth"),
+            true_vertical_depth=data.get("TrueVerticalDepth"),
+            inclination=data.get("Inclination"),
             created_at=wellbore_record.get("createTime", datetime.utcnow().isoformat()),
         )
     
     @staticmethod
     def extract_from_wellbore_trajectory(trajectory_record: dict) -> SemanticDocument:
-        """Extract semantic document from a WellboreTrajectory record."""
+        """Extract semantic document from a WellboreTrajectory (work product) record.
+        
+        OSDU WellboreTrajectory has rich text fields ideal for semantic search:
+        - Description: Summary of the trajectory work product
+        - AcquisitionRemark: Remarks about acquisition context  
+        - SurveyReferenceIdentifier: Reference to source documents
+        - SurveyType: Type of survey (Horizontal, Vertical, Directional)
+        - SurveyToolTypeID: Equipment type (e.g., MWD, Gyro)
+        - Tags: Keywords for search
+        - BusinessActivities: Process/workflow context
+        - SurveyStations: Nested survey data with per-station remarks
+        """
         data = trajectory_record.get("data", {})
         
         # Extract remarks from survey stations if available
-        survey_remarks = ""
+        survey_remarks = []
         if "SurveyStations" in data and isinstance(data["SurveyStations"], list):
-            remarks_list = [
-                str(station.get("Remarks", ""))
-                for station in data["SurveyStations"]
-                if station.get("Remarks")
-            ]
-            survey_remarks = " ".join(remarks_list)
+            for station in data["SurveyStations"]:
+                if isinstance(station, dict) and (remarks := station.get("Remarks")):
+                    survey_remarks.append(str(remarks))
         
-        remarks_combined = " ".join(filter(None, [
-            data.get("Remarks", ""),
-            survey_remarks
-        ]))
+        # Build comprehensive description from all available text fields
+        text_parts = []
+        if desc := data.get("Description"):
+            text_parts.append(desc)
+        if acq := data.get("AcquisitionRemark"):
+            text_parts.append(f"Acquisition: {acq}")
+        if ref := data.get("SurveyReferenceIdentifier"):
+            text_parts.append(f"Reference: {ref}")
+        if survey_type := data.get("SurveyType"):
+            text_parts.append(f"Type: {survey_type}")
+        if tool_id := data.get("SurveyToolTypeID"):
+            text_parts.append(f"Tool: {tool_id}")
+        if tags := data.get("Tags"):
+            if isinstance(tags, list):
+                text_parts.append(f"Tags: {', '.join(tags)}")
+        if activities := data.get("BusinessActivities"):
+            if isinstance(activities, list):
+                text_parts.append(f"Activities: {', '.join(activities)}")
+        if survey_remarks:
+            text_parts.append(f"Station remarks: {' | '.join(survey_remarks)}")
+        
+        combined_description = " | ".join(text_parts) if text_parts else None
+        
+        # Extract depth/inclination from survey stations if available
+        measured_depth = None
+        true_vertical_depth = None
+        inclination = None
+        
+        if "SurveyStations" in data and isinstance(data["SurveyStations"], list) and data["SurveyStations"]:
+            last_station = data["SurveyStations"][-1]  # Last station has final values
+            if isinstance(last_station, dict):
+                measured_depth = last_station.get("MeasuredDepth")
+                true_vertical_depth = last_station.get("TrueVerticalDepth")
+                inclination = last_station.get("Inclination")
         
         return SemanticDocument(
             entity_id=trajectory_record.get("id", "unknown"),
             entity_type="WellboreTrajectory",
-            entity_kind=trajectory_record.get("kind", "osdu:wks:work-product--WellboreTrajectory:1.0.0"),
+            entity_kind=trajectory_record.get("kind", "osdu:wks:work-product-component--WellboreTrajectory:1.0.0"),
             common_name=data.get("CommonName", trajectory_record.get("id", "")),
-            description=data.get("Description", None),
-            remarks=remarks_combined if remarks_combined else None,
+            description=combined_description,
+            remarks=None,  # Individual station remarks are included in description
             field_name=None,
-            operator=data.get("Operator", None),
-            measured_depth=data.get("MeasuredDepth", None),
-            true_vertical_depth=data.get("TrueVerticalDepth", None),
-            inclination=data.get("Inclination", None),
+            operator=None,
+            measured_depth=measured_depth,
+            true_vertical_depth=true_vertical_depth,
+            inclination=inclination,
             created_at=trajectory_record.get("createTime", datetime.utcnow().isoformat()),
         )
 
@@ -247,33 +324,58 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
     
-    # Build index from Volve exported data
+    print("ADME Semantic Indexing - Track A: Well/Wellbore Extraction")
+    print("=" * 60)
+    
+    # Build index from Volve exported data (TRACK A)
     builder = SemanticIndexBuilder(
         Path.home() / "adme-ingestion-tool" / ".semantic-index.jsonl"
     )
     
     # Paths to Volve data (from your manifest files)
-    volve_data_root = Path.home() / "osdu-data" / "volve" / "generated-json"
+    volve_data_root = Path.home() / "osdu-data" / "volve" / "generated-json" / "provided" / "master-data"
     
-    print("Building semantic index from Volve data...")
+    print(f"\n1. Extracting from Volve master-data...")
+    print(f"   Source: {volve_data_root}")
     
     # Add Wells
-    well_count = builder.add_from_jsonl(
-        volve_data_root / "load_Well.jsonl",
-        "Well"
-    )
-    print(f"  + {well_count} Wells")
+    well_file = volve_data_root / "Well" / "load_Well.jsonl"
+    well_count = 0
+    if well_file.exists():
+        well_count = builder.add_from_jsonl(well_file, "Well")
+        print(f"   ✓ {well_count} Wells extracted")
+    else:
+        print(f"   ✗ Well file not found: {well_file}")
     
     # Add Wellbores
-    wellbore_count = builder.add_from_jsonl(
-        volve_data_root / "load_Wellbore.jsonl",
-        "Wellbore"
-    )
-    print(f"  + {wellbore_count} Wellbores")
+    wellbore_file = volve_data_root / "Wellbore" / "load_Wellbore.jsonl"
+    wellbore_count = 0
+    if wellbore_file.exists():
+        wellbore_count = builder.add_from_jsonl(wellbore_file, "Wellbore")
+        print(f"   ✓ {wellbore_count} Wellbores extracted")
+    else:
+        print(f"   ✗ Wellbore file not found: {wellbore_file}")
+    
+    # Add WellboreTrajectory (if available from Track B generator)
+    trajectory_file = Path.home() / "adme-ingestion-tool" / ".wellbore-trajectories.jsonl"
+    trajectory_count = 0
+    if trajectory_file.exists():
+        trajectory_count = builder.add_from_jsonl(trajectory_file, "WellboreTrajectory")
+        print(f"   ✓ {trajectory_count} WellboreTrajectories extracted")
+    else:
+        print(f"   ✗ Trajectory file not available (run Track B generator first)")
     
     # Save
-    builder.save_index("jsonl")
-    stats = builder.stats()
-    print(f"\nIndex statistics:")
-    for key, value in stats.items():
-        print(f"  {key}: {value}")
+    total = well_count + wellbore_count + trajectory_count
+    if total > 0:
+        print(f"\n2. Saving semantic index...")
+        builder.save_index("jsonl")
+        stats = builder.stats()
+        print(f"\n3. Index Statistics:")
+        print(f"   Total documents: {stats['total_documents']}")
+        print(f"   By type: {stats['by_type']}")
+        print(f"   Documents with text: {stats['documents_with_remarks']}")
+        print(f"   Avg text length: {stats['avg_text_length']:.0f} chars")
+        print(f"\n✓ Ready for embedding generation (semantic_embeddings.py)")
+    else:
+        print("\n✗ No records extracted. Check file paths.")
