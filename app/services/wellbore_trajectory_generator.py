@@ -132,11 +132,11 @@ class TrajectoryCSVParser:
     def parse(self) -> list[SurveyStation]:
         """Parse CSV file and extract survey stations.
         
-        Expected CSV columns (case-insensitive):
-        - MD, MeasuredDepth: Measured depth
-        - TVD, TrueVerticalDepth: True vertical depth  
-        - INC, Inclination: Wellbore inclination
-        - AZ, Azimuth: Wellbore azimuth
+        Expected CSV columns (handles multiple naming conventions):
+        - AH_DEPTH, MD, MeasuredDepth: Actual hole depth / measured depth
+        - TV_DEPTH_NAP, TVD, TrueVerticalDepth: True vertical depth  
+        - AzimuthTN, AZ, Azimuth: Wellbore azimuth
+        - DEV_ANGLE, INC, Inclination: Wellbore inclination/deviation angle
         - DLS, DoglegSeverity: Dogleg severity
         - TF, ToolFace: Tool face angle
         - Remarks: Any survey remarks
@@ -159,18 +159,21 @@ class TrajectoryCSVParser:
                 
                 for row_num, row in enumerate(reader, 2):  # Skip header
                     try:
-                        # Extract values (handle multiple possible column names)
-                        md = self._get_float(row, normalized_headers, ['md', 'measureddepth'])
+                        # Extract values using actual column names first, then fallbacks
+                        # AH_DEPTH is the actual hole depth (measured depth in Volve data)
+                        md_candidates = ['ah_depth', 'md', 'measureddepth']
+                        md = self._get_float_by_candidates(row, normalized_headers, md_candidates)
+                        
                         if md is None:
                             logger.warning(f"Row {row_num}: Missing measured depth, skipping")
                             continue
                         
-                        tvd = self._get_float(row, normalized_headers, ['tvd', 'truevertdicaldepth'])
-                        inc = self._get_float(row, normalized_headers, ['inc', 'inclination'])
-                        az = self._get_float(row, normalized_headers, ['az', 'azimuth'])
-                        dls = self._get_float(row, normalized_headers, ['dls', 'doglegseverity'])
-                        tf = self._get_float(row, normalized_headers, ['tf', 'toolface'])
-                        remarks = self._get_string(row, normalized_headers, ['remarks', 'notes', 'comments'])
+                        tvd = self._get_float_by_candidates(row, normalized_headers, ['tv_depth_nap', 'tvd', 'truevertdicaldepth'])
+                        inc = self._get_float_by_candidates(row, normalized_headers, ['dev_angle', 'inc', 'inclination'])
+                        az = self._get_float_by_candidates(row, normalized_headers, ['azimuthtn', 'az', 'azimuth'])
+                        dls = self._get_float_by_candidates(row, normalized_headers, ['dls', 'doglegseverity'])
+                        tf = self._get_float_by_candidates(row, normalized_headers, ['tf', 'toolface'])
+                        remarks = self._get_string_by_candidates(row, normalized_headers, ['remarks', 'notes', 'comments'])
                         
                         station = SurveyStation(
                             measured_depth=md,
@@ -195,8 +198,8 @@ class TrajectoryCSVParser:
             return []
     
     @staticmethod
-    def _get_float(row: dict, headers: dict, possible_names: list[str]) -> Optional[float]:
-        """Extract float value from row, trying multiple column name variants."""
+    def _get_float_by_candidates(row: dict, headers: dict, possible_names: list[str]) -> Optional[float]:
+        """Extract float value from row, trying multiple column name candidates."""
         for name in possible_names:
             if name in headers:
                 actual_col = headers[name]
@@ -208,8 +211,8 @@ class TrajectoryCSVParser:
         return None
     
     @staticmethod
-    def _get_string(row: dict, headers: dict, possible_names: list[str]) -> Optional[str]:
-        """Extract string value from row, trying multiple column name variants."""
+    def _get_string_by_candidates(row: dict, headers: dict, possible_names: list[str]) -> Optional[str]:
+        """Extract string value from row, trying multiple column name candidates."""
         for name in possible_names:
             if name in headers:
                 actual_col = headers[name]

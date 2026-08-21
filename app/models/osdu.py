@@ -380,6 +380,56 @@ class FileUploadOutcome:
 
 
 @dataclass(frozen=True, slots=True)
+class DownloadURLResult:
+    """Outcome of ``GET /api/file/v2/files/{id}/downloadURL``.
+
+    ``signed_url`` is a SAS-signed Azure Blob URL the caller can GET to
+    retrieve (or probe) the file's bulk bytes.
+    """
+
+    ok: bool = False
+    http_status: int | None = None
+    latency_ms: float = 0.0
+    correlation_id: str | None = None
+    error_message: str | None = None
+    signed_url: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class BlobProbeResult:
+    """Outcome of probing a File.Generic record's bulk blob.
+
+    Confirms the persisted blob is actually retrievable (metadata records
+    can exist while the blob is missing/purged). ``present`` is ``True``
+    only when the SAS GET returns 200/206. ``content_length`` is the byte
+    size when the server reports it.
+    """
+
+    record_id: str
+    present: bool = False
+    download_http_status: int | None = None
+    blob_http_status: int | None = None
+    content_length: int | None = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class RecordDeleteResult:
+    """Outcome of ``DELETE /api/storage/v2/records/{id}``.
+
+    A logical (soft) delete. ``ok`` is ``True`` for 204 (deleted) and for
+    404 (already absent) so callers can treat deletes as idempotent.
+    """
+
+    record_id: str
+    ok: bool = False
+    http_status: int | None = None
+    latency_ms: float = 0.0
+    correlation_id: str | None = None
+    error_message: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class DatasetTier:
     """One tier (reference-data / master-data / work-products) of a dataset.
 

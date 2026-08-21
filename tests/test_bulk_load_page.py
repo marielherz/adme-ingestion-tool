@@ -269,6 +269,27 @@ def test_page_renders_without_crashing_on_clean_session(
     assert spy["submit"] == []
 
 
+def test_resolve_session_text_prefers_primary_and_falls_back(
+    streamlit_recorder: StreamlitRecorder,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shared resolver should prefer the primary key but reuse the fallback."""
+    page_module = _load_page(streamlit_recorder, monkeypatch)
+    page_module.st.session_state["primary"] = "primary-value"
+    page_module.st.session_state["fallback"] = "fallback-value"
+
+    assert (
+        page_module._resolve_session_text("primary", fallback_key="fallback")
+        == "primary-value"
+    )
+
+    page_module.st.session_state["primary"] = ""
+    assert (
+        page_module._resolve_session_text("primary", fallback_key="fallback")
+        == "fallback-value"
+    )
+
+
 def test_dataset_selector_populates_from_list_datasets(
     streamlit_recorder: StreamlitRecorder,
     monkeypatch: pytest.MonkeyPatch,

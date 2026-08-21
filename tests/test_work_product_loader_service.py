@@ -15,6 +15,7 @@ import pytest
 
 from app.models.connection import ADMEConnection, AuthMethod
 from app.models.osdu import (
+    FileMetadataResult,
     UploadBytesResult,
     UploadURLResult,
     WorkflowRunResult,
@@ -154,6 +155,35 @@ def test_collect_and_apply_file_sources() -> None:
     assert "PreloadFilePath" not in info
 
 
+def test_relink_datasets_to_records_rewrites_and_drops_section() -> None:
+    body = _wp_manifest("s3://bucket/provided/well-logs/a.las")
+    id_map = {
+        "surrogate-key:file-1": "opendes:dataset--File.Generic:real-guid"
+    }
+
+    wpl.relink_datasets_to_records(body, id_map)
+
+    # The WPC now references the real (version-decorated) File id.
+    wpc = body["Data"]["WorkProductComponents"][0]
+    assert wpc["data"]["Datasets"] == [
+        "opendes:dataset--File.Generic:real-guid:"
+    ]
+    # The Data.Datasets section is dropped so the DAG cannot recreate an
+    # un-promoted duplicate File record.
+    assert "Datasets" not in body["Data"]
+
+
+def test_relink_datasets_leaves_unknown_refs_untouched() -> None:
+    body = _wp_manifest("s3://bucket/provided/well-logs/a.las")
+
+    # An empty map: nothing to rewrite, but the section is still dropped.
+    wpl.relink_datasets_to_records(body, {})
+
+    wpc = body["Data"]["WorkProductComponents"][0]
+    assert wpc["data"]["Datasets"] == ["surrogate-key:file-1"]
+    assert "Datasets" not in body["Data"]
+
+
 def test_stamp_work_product_acl_legal_overwrites_all_records() -> None:
     body = _wp_manifest("s3://bucket/provided/well-logs/a.las")
     wpl.stamp_work_product_acl_legal(
@@ -208,7 +238,7 @@ def _ok_workflow(run_id: str = "wp-run-1") -> WorkflowRunResult:
 
 
 def _patch_ok(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
-    spy: dict[str, list[Any]] = {"url": [], "bytes": [], "submit": []}
+    spy: dict[str, list[Any]] = {"url": [], "bytes": [], "meta": [], "submit": []}
 
     def fake_url(connection: ADMEConnection, token: str) -> UploadURLResult:
         spy["url"].append(token)
@@ -218,6 +248,19 @@ def _patch_ok(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
         spy["bytes"].append(len(file_bytes))
         return _ok_bytes(len(file_bytes))
 
+    def fake_meta(
+        connection: ADMEConnection, token: str, **kw: Any
+    ) -> FileMetadataResult:
+        spy["meta"].append(kw)
+        return FileMetadataResult(
+            ok=True,
+            http_status=201,
+            record_id=(
+                f"example-opendes:dataset--File.Generic:reg-{len(spy['meta'])}"
+            ),
+            record_version=1,
+        )
+
     def fake_submit(
         connection: ADMEConnection, token: str, payload: dict[str, Any]
     ) -> WorkflowRunResult:
@@ -226,6 +269,7 @@ def _patch_ok(monkeypatch: pytest.MonkeyPatch) -> dict[str, list[Any]]:
 
     monkeypatch.setattr(wpl, "get_upload_url", fake_url)
     monkeypatch.setattr(wpl, "upload_file_bytes", fake_bytes)
+    monkeypatch.setattr(wpl, "post_file_metadata", fake_meta)
     monkeypatch.setattr(wpl, "submit_manifest", fake_submit)
     return spy
 
@@ -267,14 +311,17 @@ def test_submit_work_products_happy_path(
     assert results[0].run_id == "wp-run-1"
     assert spy["bytes"] == [len(b"log-bytes")]
 
-    # The submitted manifest carries the staged token + real ACL, not the
-    # placeholder s3 path / testcompany groups.
+    # Each Dataset is registered via the File Service (which promotes the
+    # blob), so the DAG manifest no longer carries a Data.Datasets section;
+    # the WorkProductComponent references the real File record id instead.
+    assert len(spy["meta"]) == 1
+    assert spy["meta"][0]["file_source"] == "staged-1"
     submitted = spy["submit"][0]["executionContext"]["manifest"]
-    info = submitted["Data"]["Datasets"][0]["data"]["DatasetProperties"][
-        "FileSourceInfo"
+    assert "Datasets" not in submitted["Data"]
+    wpc = submitted["Data"]["WorkProductComponents"][0]
+    assert wpc["data"]["Datasets"] == [
+        "example-opendes:dataset--File.Generic:reg-1:"
     ]
-    assert info["FileSource"] == "staged-1"
-    assert "PreloadFilePath" not in info
     assert submitted["Data"]["WorkProduct"]["acl"]["owners"] == [
         "data.owners@x"
     ]

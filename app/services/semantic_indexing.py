@@ -12,7 +12,7 @@ import logging
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Optional
-from datetime import datetime
+from datetime import datetime, timezone
 
 logger = logging.getLogger(__name__)
 
@@ -99,7 +99,7 @@ class TextFieldExtractor:
             measured_depth=None,
             true_vertical_depth=None,
             inclination=None,
-            created_at=well_record.get("createTime", datetime.utcnow().isoformat()),
+            created_at=well_record.get("createTime", datetime.now(timezone.utc).isoformat()),
         )
     
     @staticmethod
@@ -151,7 +151,7 @@ class TextFieldExtractor:
             measured_depth=data.get("MeasuredDepth"),
             true_vertical_depth=data.get("TrueVerticalDepth"),
             inclination=data.get("Inclination"),
-            created_at=wellbore_record.get("createTime", datetime.utcnow().isoformat()),
+            created_at=wellbore_record.get("createTime", datetime.now(timezone.utc).isoformat()),
         )
     
     @staticmethod
@@ -224,7 +224,7 @@ class TextFieldExtractor:
             measured_depth=measured_depth,
             true_vertical_depth=true_vertical_depth,
             inclination=inclination,
-            created_at=trajectory_record.get("createTime", datetime.utcnow().isoformat()),
+            created_at=trajectory_record.get("createTime", datetime.now(timezone.utc).isoformat()),
         )
 
 
@@ -390,9 +390,9 @@ if __name__ == "__main__":
     if well_files:
         well_file = well_files[0]  # Use first match
         well_count = builder.add_from_jsonl(well_file, "Well")
-        print(f"   ✓ {well_count} Wells extracted")
+        print(f"   [OK] {well_count} Wells extracted")
     else:
-        print(f"   ✗ No Well files found in {volve_data_root / 'Well'}")
+        print(f"   [!] No Well files found in {volve_data_root / 'Well'}")
     
     # Auto-discover Wellbore files (pattern: EIQExport *_wellbores.json)
     wellbore_files = list(volve_data_root.glob("Wellbore/EIQExport*_wellbores.json"))
@@ -400,18 +400,18 @@ if __name__ == "__main__":
     if wellbore_files:
         wellbore_file = wellbore_files[0]  # Use first match
         wellbore_count = builder.add_from_jsonl(wellbore_file, "Wellbore")
-        print(f"   ✓ {wellbore_count} Wellbores extracted")
+        print(f"   [OK] {wellbore_count} Wellbores extracted")
     else:
-        print(f"   ✗ No Wellbore files found in {volve_data_root / 'Wellbore'}")
+        print(f"   [!] No Wellbore files found in {volve_data_root / 'Wellbore'}")
     
     # Add WellboreTrajectory (if available from Track B generator)
     trajectory_file = Path.home() / "adme-ingestion-tool" / ".wellbore-trajectories.jsonl"
     trajectory_count = 0
     if trajectory_file.exists():
         trajectory_count = builder.add_from_jsonl(trajectory_file, "WellboreTrajectory")
-        print(f"   ✓ {trajectory_count} WellboreTrajectories extracted")
+        print(f"   [OK] {trajectory_count} WellboreTrajectories extracted")
     else:
-        print(f"   ✗ Trajectory file not available (run Track B generator first)")
+        print(f"   [!] Trajectory file not available (run Track B generator first)")
     
     # Save
     total = well_count + wellbore_count + trajectory_count
@@ -424,6 +424,6 @@ if __name__ == "__main__":
         print(f"   By type: {stats['by_type']}")
         print(f"   Documents with text: {stats['documents_with_remarks']}")
         print(f"   Avg text length: {stats['avg_text_length']:.0f} chars")
-        print(f"\n✓ Ready for embedding generation (semantic_embeddings.py)")
+        print(f"\n[SUCCESS] Ready for embedding generation (semantic_embeddings.py)")
     else:
-        print("\n✗ No records extracted. Check file paths.")
+        print("\n[ERROR] No records extracted. Check file paths.")

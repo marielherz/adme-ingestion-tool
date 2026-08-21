@@ -951,6 +951,7 @@ def submit_records_from_paths(
 
     # Buffer of (record, origin_path) so each record's result names its file.
     buffer: list[tuple[dict[str, Any], Path]] = []
+    seen_record_ids: set[str] = set()
 
     def _flush() -> Iterator[SubmitResult]:
         while len(buffer) >= size:
@@ -1022,6 +1023,16 @@ def submit_records_from_paths(
                 overwrite=overwrite_acl_legal,
             )
             for record in extract_section_records(shaped, section):
+                record_id = record.get("id")
+                if isinstance(record_id, str) and record_id in seen_record_ids:
+                    logger.info(
+                        "Skipping duplicate record %s from %s",
+                        record_id,
+                        manifest_path.name,
+                    )
+                    continue
+                if isinstance(record_id, str):
+                    seen_record_ids.add(record_id)
                 buffer.append((record, manifest_path))
             yield from _flush()
         except (OSError, json.JSONDecodeError, ValueError) as exc:
