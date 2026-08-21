@@ -240,7 +240,13 @@ class SemanticIndexBuilder:
         self.documents.append(doc)
     
     def add_from_jsonl(self, jsonl_path: Path, entity_type: str) -> int:
-        """Load documents from JSONL file (Volve/TNO export format)."""
+        """Load documents from JSON or JSONL file (Volve/TNO export format).
+        
+        Supports multiple formats:
+        - JSON array: [{ ... }, { ... }]
+        - JSON object with MasterData: { "MasterData": [{ ... }] } (Volve format)
+        - JSONL: One JSON object per line
+        """
         count = 0
         extractor = TextFieldExtractor()
         
@@ -250,13 +256,52 @@ class SemanticIndexBuilder:
         
         try:
             with open(jsonl_path) as f:
-                for line_num, line in enumerate(f, 1):
-                    if not line.strip():
-                        continue
+                # Detect format by reading first character
+                first_char = f.read(1)
+                f.seek(0)
+                
+                records = []
+                
+                if first_char == '[':
+                    # JSON array format: [{ ... }, { ... }]
+                    logger.info(f"Loading JSON array from {jsonl_path.name}...")
+                    data = json.load(f)
+                    records = data if isinstance(data, list) else [data]
                     
+                elif first_char == '{':
+                    # JSON object - could be Volve format or single record
+                    logger.info(f"Loading JSON object from {jsonl_path.name}...")
+                    data = json.load(f)
+                    
+                    # Check for Volve format: { "MasterData": [...] }
+                    if isinstance(data, dict) and "MasterData" in data:
+                        records = data["MasterData"]
+                        logger.info(f"  Found MasterData with {len(records)} records")
+                    elif isinstance(data, dict) and entity_type.lower() + "s" in data:
+                        # Alternative format: { "Wells": [...] }, { "Wellbores": [...] }
+                        key = entity_type.lower() + "s"
+                        records = data[key] if isinstance(data[key], list) else [data[key]]
+                        logger.info(f"  Found {key} with {len(records)} records")
+                    elif isinstance(data, dict) and "data" in data:
+                        # Single record format
+                        records = [data]
+                    else:
+                        logger.warning(f"Unknown JSON object format. Keys: {list(data.keys())}")
+                        records = []
+                
+                else:
+                    # JSONL format (one JSON per line)
+                    logger.info(f"Loading JSONL from {jsonl_path.name}...")
+                    for line in f:
+                        if line.strip():
+                            try:
+                                records.append(json.loads(line))
+                            except json.JSONDecodeError as e:
+                                logger.warning(f"Skipping invalid JSON line: {e}")
+                
+                # Process records
+                for record in records:
                     try:
-                        record = json.loads(line)
-                        
                         if entity_type == "Well":
                             doc = extractor.extract_from_well(record)
                         elif entity_type == "Wellbore":
@@ -270,12 +315,13 @@ class SemanticIndexBuilder:
                         self.add_document(doc)
                         count += 1
                         
-                    except (json.JSONDecodeError, KeyError) as e:
-                        logger.warning(f"Error parsing line {line_num}: {e}")
+                    except (KeyError, AttributeError, TypeError) as e:
+                        logger.warning(f"Error extracting from record: {e}")
         
         except Exception as e:
             logger.error(f"Error reading {jsonl_path}: {e}")
         
+        logger.info(f"Loaded {count} {entity_type} records")
         return count
     
     def save_index(self, format: str = "jsonl") -> Path:
@@ -338,23 +384,25 @@ if __name__ == "__main__":
     print(f"\n1. Extracting from Volve master-data...")
     print(f"   Source: {volve_data_root}")
     
-    # Add Wells
-    well_file = volve_data_root / "Well" / "load_Well.jsonl"
+    # Auto-discover Well files (pattern: EIQExport *_wells.json)
+    well_files = list(volve_data_root.glob("Well/EIQExport*_wells.json"))
     well_count = 0
-    if well_file.exists():
+    if well_files:
+        well_file = well_files[0]  # Use first match
         well_count = builder.add_from_jsonl(well_file, "Well")
         print(f"   ✓ {well_count} Wells extracted")
     else:
-        print(f"   ✗ Well file not found: {well_file}")
+        print(f"   ✗ No Well files found in {volve_data_root / 'Well'}")
     
-    # Add Wellbores
-    wellbore_file = volve_data_root / "Wellbore" / "load_Wellbore.jsonl"
+    # Auto-discover Wellbore files (pattern: EIQExport *_wellbores.json)
+    wellbore_files = list(volve_data_root.glob("Wellbore/EIQExport*_wellbores.json"))
     wellbore_count = 0
-    if wellbore_file.exists():
+    if wellbore_files:
+        wellbore_file = wellbore_files[0]  # Use first match
         wellbore_count = builder.add_from_jsonl(wellbore_file, "Wellbore")
         print(f"   ✓ {wellbore_count} Wellbores extracted")
     else:
-        print(f"   ✗ Wellbore file not found: {wellbore_file}")
+        print(f"   ✗ No Wellbore files found in {volve_data_root / 'Wellbore'}")
     
     # Add WellboreTrajectory (if available from Track B generator)
     trajectory_file = Path.home() / "adme-ingestion-tool" / ".wellbore-trajectories.jsonl"
