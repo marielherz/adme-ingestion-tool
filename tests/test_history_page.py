@@ -1,4 +1,4 @@
-"""Tests for the ADME History page (``app/pages/8_📊_History.py``).
+"""Tests for the ADME History page (``app/pages/10_📊_History.py``).
 
 Loads the page via importlib with a ``StreamlitRecorder`` substituted
 for ``streamlit``, seeds the run-history DB via the autouse env-var
@@ -26,7 +26,7 @@ HISTORY_PAGE_PATH = (
     Path(__file__).resolve().parents[1]
     / "app"
     / "pages"
-    / "8_📊_History.py"
+    / "10_📊_History.py"
 )
 
 

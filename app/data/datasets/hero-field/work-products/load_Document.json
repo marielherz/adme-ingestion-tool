@@ -1,0 +1,28 @@
+{
+    "kind": "osdu:wks:Manifest:1.0.0",
+    "MasterData": [
+        {
+            "id": "osdu:work-product-component--Document:AUR-01-final-report",
+            "kind": "osdu:wks:work-product-component--Document:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "tags": {
+                "quality:state": "Certified",
+                "hero:field": "Aurelia",
+                "hero:hazard": "shallow-gas;total-losses",
+                "lineage:source": "Aurelia PSDM 2024 reprocessing"
+            },
+            "data": {
+                "Name": "AUR-01 Final Well Report",
+                "Description": "Final well report for AUR-01. Flags a shallow-gas hazard (470-490 m) and fault-related total losses (~3540 m) that forced the AUR-01-ST1 sidetrack back into the Hugin reservoir. Confirms an oil discovery in the Hugin Formation sealed by the Draupne Formation.",
+                "WellboreID": "<namespace>:master-data--Wellbore:AUR-01-01:"
+            }
+        }
+    ]
+}

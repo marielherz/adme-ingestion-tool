@@ -1,0 +1,41 @@
+{
+    "field": "Aurelia",
+    "story": "Hero 1 \u2014 sidetrack / graph",
+    "counts": {
+        "organisations": 3,
+        "wells": 6,
+        "wellbores": 7,
+        "markersets": 6,
+        "reports": 1
+    },
+    "hero_well": "AUR-01",
+    "sidetrack": {
+        "wellbore": "AUR-01-ST1",
+        "parent": "AUR-01-01",
+        "reason": "fault-related total losses"
+    },
+    "offset_analogs": [
+        "AUR-02",
+        "AUR-03",
+        "AUR-04"
+    ],
+    "dry_hole": [
+        "AUR-06"
+    ],
+    "jv_restricted": [
+        "AUR-05"
+    ],
+    "flagged_quality": [
+        "AUR-03"
+    ],
+    "hazard_report": {
+        "document": "AUR-01 Final Well Report",
+        "wellbore": "AUR-01-01",
+        "hazards": [
+            "shallow gas (470-490 m)",
+            "total losses (~3540 m)"
+        ]
+    },
+    "reservoir": "Hugin Formation",
+    "seal": "Draupne Formation"
+}

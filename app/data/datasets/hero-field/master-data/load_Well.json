@@ -1,0 +1,313 @@
+{
+    "kind": "osdu:wks:Manifest:1.0.0",
+    "MasterData": [
+        {
+            "id": "osdu:master-data--Well:AUR-01",
+            "kind": "osdu:wks:master-data--Well:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "tags": {
+                "quality:state": "Certified",
+                "lineage:source": "Aurelia PSDM 2024 reprocessing",
+                "lineage:curator": "Apex Subsurface Data Services",
+                "hero:field": "Aurelia",
+                "hero:role": "discovery"
+            },
+            "data": {
+                "FacilityName": "Aurelia Discovery 1",
+                "FacilityID": "AUR-01",
+                "Source": "Aurelia synthetic hero dataset",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:AURELIA-ENERGY:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:APEX-DATA:",
+                "SpatialLocation": {
+                    "Wgs84Coordinates": {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "geometry": {
+                                    "type": "Point",
+                                    "coordinates": [
+                                        1.9,
+                                        58.44
+                                    ]
+                                },
+                                "properties": {}
+                            }
+                        ]
+                    }
+                },
+                "NameAliases": [
+                    {
+                        "AliasName": "Aurelia Discovery 1",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Well:AUR-02",
+            "kind": "osdu:wks:master-data--Well:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "tags": {
+                "quality:state": "Certified",
+                "lineage:source": "Aurelia PSDM 2024 reprocessing",
+                "lineage:curator": "Apex Subsurface Data Services",
+                "hero:field": "Aurelia",
+                "hero:role": "appraisal"
+            },
+            "data": {
+                "FacilityName": "Aurelia Appraisal 2",
+                "FacilityID": "AUR-02",
+                "Source": "Aurelia synthetic hero dataset",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:AURELIA-ENERGY:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:APEX-DATA:",
+                "SpatialLocation": {
+                    "Wgs84Coordinates": {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "geometry": {
+                                    "type": "Point",
+                                    "coordinates": [
+                                        1.93,
+                                        58.452
+                                    ]
+                                },
+                                "properties": {}
+                            }
+                        ]
+                    }
+                },
+                "NameAliases": [
+                    {
+                        "AliasName": "Aurelia Appraisal 2",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Well:AUR-03",
+            "kind": "osdu:wks:master-data--Well:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "tags": {
+                "quality:state": "Flagged",
+                "lineage:source": "Aurelia PSDM 2024 reprocessing",
+                "lineage:curator": "Apex Subsurface Data Services",
+                "hero:field": "Aurelia",
+                "hero:role": "appraisal"
+            },
+            "data": {
+                "FacilityName": "Aurelia Appraisal 3",
+                "FacilityID": "AUR-03",
+                "Source": "Aurelia synthetic hero dataset",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:AURELIA-ENERGY:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:APEX-DATA:",
+                "SpatialLocation": {
+                    "Wgs84Coordinates": {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "geometry": {
+                                    "type": "Point",
+                                    "coordinates": [
+                                        1.872,
+                                        58.421
+                                    ]
+                                },
+                                "properties": {}
+                            }
+                        ]
+                    }
+                },
+                "NameAliases": [
+                    {
+                        "AliasName": "Aurelia Appraisal 3",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Well:AUR-04",
+            "kind": "osdu:wks:master-data--Well:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "tags": {
+                "quality:state": "Certified",
+                "lineage:source": "Aurelia PSDM 2024 reprocessing",
+                "lineage:curator": "Apex Subsurface Data Services",
+                "hero:field": "Aurelia",
+                "hero:role": "appraisal"
+            },
+            "data": {
+                "FacilityName": "Aurelia Appraisal 4",
+                "FacilityID": "AUR-04",
+                "Source": "Aurelia synthetic hero dataset",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:AURELIA-ENERGY:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:APEX-DATA:",
+                "SpatialLocation": {
+                    "Wgs84Coordinates": {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "geometry": {
+                                    "type": "Point",
+                                    "coordinates": [
+                                        1.955,
+                                        58.418
+                                    ]
+                                },
+                                "properties": {}
+                            }
+                        ]
+                    }
+                },
+                "NameAliases": [
+                    {
+                        "AliasName": "Aurelia Appraisal 4",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Well:AUR-05",
+            "kind": "osdu:wks:master-data--Well:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "tags": {
+                "quality:state": "Provisional",
+                "lineage:source": "Aurelia PSDM 2024 reprocessing",
+                "lineage:curator": "Apex Subsurface Data Services",
+                "hero:field": "Aurelia",
+                "hero:role": "jv-appraisal",
+                "entitlement:jv": "true",
+                "entitlement:visibility": "metadata-only"
+            },
+            "data": {
+                "FacilityName": "Aurelia JV Appraisal 5",
+                "FacilityID": "AUR-05",
+                "Source": "Aurelia synthetic hero dataset",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:NORDLYS-PARTNER:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:APEX-DATA:",
+                "SpatialLocation": {
+                    "Wgs84Coordinates": {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "geometry": {
+                                    "type": "Point",
+                                    "coordinates": [
+                                        1.815,
+                                        58.47
+                                    ]
+                                },
+                                "properties": {}
+                            }
+                        ]
+                    }
+                },
+                "NameAliases": [
+                    {
+                        "AliasName": "Aurelia JV Appraisal 5",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Well:AUR-06",
+            "kind": "osdu:wks:master-data--Well:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "tags": {
+                "quality:state": "Certified",
+                "lineage:source": "Aurelia PSDM 2024 reprocessing",
+                "lineage:curator": "Apex Subsurface Data Services",
+                "hero:field": "Aurelia",
+                "hero:role": "dry-hole"
+            },
+            "data": {
+                "FacilityName": "Aurelia Exploration 6",
+                "FacilityID": "AUR-06",
+                "Source": "Aurelia synthetic hero dataset",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:AURELIA-ENERGY:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:APEX-DATA:",
+                "SpatialLocation": {
+                    "Wgs84Coordinates": {
+                        "type": "FeatureCollection",
+                        "features": [
+                            {
+                                "type": "Feature",
+                                "geometry": {
+                                    "type": "Point",
+                                    "coordinates": [
+                                        1.988,
+                                        58.401
+                                    ]
+                                },
+                                "properties": {}
+                            }
+                        ]
+                    }
+                },
+                "NameAliases": [
+                    {
+                        "AliasName": "Aurelia Exploration 6",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ]
+            }
+        }
+    ]
+}

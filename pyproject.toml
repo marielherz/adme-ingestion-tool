@@ -10,6 +10,9 @@ dependencies = [
     "azure-identity>=1.19.0",
     "msal>=1.31.0",
     "requests>=2.32.0",
+    "openai>=1.106.0",
+    "azure-search-documents>=11.5.0",
+    "pyvis>=0.3.2",
     "python-dotenv>=1.1.0",
     "keyring>=25.0",
     "sqlalchemy>=2.0",
@@ -46,6 +49,9 @@ select = ["E", "F", "I", "N", "W", "UP"]
 "app/pages/7_🔍_Search.py" = ["N999"]
 "app/pages/8_📊_History.py" = ["N999"]
 "app/pages/9_📥_Bulk_Load.py" = ["N999"]
+"app/pages/13_🕸️_Well_Graph.py" = ["N999"]
+"app/pages/14_🔮_Discovery.py" = ["N999"]
+"app/pages/15_🧠_Semantic_Connection.py" = ["N999"]
 
 [tool.mypy]
 python_version = "3.11"

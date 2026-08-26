@@ -9,12 +9,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
-from abc import ABC, abstractmethod
-
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -130,33 +127,89 @@ class SentenceTransformerEmbedding(EmbeddingModel):
 
 
 class OpenAIEmbedding(EmbeddingModel):
-    """Cloud embeddings via OpenAI API."""
-    
-    def __init__(self, model: str = "text-embedding-3-small", api_key: Optional[str] = None):
-        """Initialize OpenAI embedding client.
-        
+    """Cloud embeddings via OpenAI or Microsoft Foundry."""
+
+    def __init__(
+        self,
+        model: str = "text-embedding-3-small",
+        api_key: str | None = None,
+        endpoint: str | None = None,
+    ) -> None:
+        """Initialize an OpenAI-compatible embedding client.
+
         Args:
-            model: OpenAI model (e.g., "text-embedding-3-small", "text-embedding-3-large")
-            api_key: OpenAI API key (default: OPENAI_API_KEY env var)
+            model: Model or Azure deployment name.
+            api_key: Explicit API key. For Foundry, Microsoft Entra ID is used
+                when no key is provided.
+            endpoint: Foundry/Azure OpenAI endpoint. Defaults to
+                AZURE_OPENAI_ENDPOINT or OPENAI_BASE_URL.
         """
-        api_key = api_key or os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY not found in environment")
-        
         try:
             from openai import OpenAI
-        except ImportError:
-            raise ImportError("openai library required. Install: pip install openai")
-        
-        self.client = OpenAI(api_key=api_key)
+        except ImportError as exc:
+            raise ImportError(
+                "openai library required. Install: pip install openai"
+            ) from exc
+
+        endpoint = (
+            endpoint
+            or os.getenv("AZURE_OPENAI_ENDPOINT")
+            or os.getenv("OPENAI_BASE_URL")
+        )
+
+        if endpoint:
+            azure_api_key = api_key or os.getenv("AZURE_OPENAI_API_KEY")
+            if azure_api_key:
+                credential = azure_api_key
+                self.auth_method = "api_key"
+            else:
+                try:
+                    from azure.identity import (
+                        DefaultAzureCredential,
+                        get_bearer_token_provider,
+                    )
+                except ImportError as exc:
+                    raise ImportError(
+                        "azure-identity is required for Microsoft Entra authentication"
+                    ) from exc
+
+                self.credential = DefaultAzureCredential()
+                credential = get_bearer_token_provider(
+                    self.credential,
+                    "https://ai.azure.com/.default",
+                )
+                self.auth_method = "entra_id"
+
+            self.base_url = self._azure_base_url(endpoint)
+            self.client = OpenAI(base_url=self.base_url, api_key=credential)
+            self.provider = "azure_openai"
+        else:
+            openai_api_key = api_key or os.getenv("OPENAI_API_KEY")
+            if not openai_api_key:
+                raise ValueError(
+                    "Set AZURE_OPENAI_ENDPOINT for Microsoft Foundry or "
+                    "OPENAI_API_KEY for OpenAI"
+                )
+            self.client = OpenAI(api_key=openai_api_key)
+            self.auth_method = "api_key"
+            self.provider = "openai"
+
         self.model = model
         self.embedding_dim = 1536 if "small" in model else 3072
-    
+
+    @staticmethod
+    def _azure_base_url(endpoint: str) -> str:
+        """Normalize a Foundry/Azure OpenAI endpoint for the v1 API."""
+        base_url = endpoint.rstrip("/")
+        if not base_url.endswith("/openai/v1"):
+            base_url = f"{base_url}/openai/v1"
+        return f"{base_url}/"
+
     def embed(self, text: str) -> list[float]:
         """Generate embedding for text."""
         response = self.client.embeddings.create(input=text, model=self.model)
         return response.data[0].embedding
-    
+
     def embed_batch(self, texts: list[str]) -> list[list[float]]:
         """Generate embeddings for multiple texts (batched for efficiency)."""
         response = self.client.embeddings.create(input=texts, model=self.model)
@@ -239,7 +292,11 @@ class EmbeddingPipeline:
                     continue
                 
                 doc["embedding"] = embedding
-                doc["embedding_model"] = self.model.__class__.__name__
+                doc["embedding_model"] = getattr(
+                    self.model,
+                    "model",
+                    self.model.__class__.__name__,
+                )
                 doc["embedding_dim"] = len(embedding)
                 doc["searchable_text"] = text
                 
@@ -252,8 +309,6 @@ class EmbeddingPipeline:
 
 # Example usage
 if __name__ == "__main__":
-    import sys
-    
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
