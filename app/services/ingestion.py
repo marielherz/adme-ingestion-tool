@@ -26,6 +26,7 @@ import requests  # type: ignore[import-untyped]
 from app.models.connection import ADMEConnection
 from app.models.osdu import (
     LegalTagCheckResult,
+    RecordDeleteResult,
     StorageRecordsResult,
     WorkflowRunResult,
     WorkflowStatus,
@@ -54,6 +55,7 @@ __all__ = [
     "WORKFLOW_INGEST_RUN_PATH",
     "WORKFLOW_RUN_STATUS_PATH_TEMPLATE",
     "check_legal_tag",
+    "delete_record",
     "get_workflow_status",
     "put_records",
     "submit_manifest",
@@ -591,6 +593,43 @@ def put_records(
     )
 
 
+def delete_record(
+    connection: ADMEConnection,
+    token: str,
+    record_id: str,
+) -> RecordDeleteResult:
+    """Logically delete one record via ``DELETE /storage/v2/records/{id}``.
+
+    A soft delete: the id is retained but the record is no longer served.
+    Any trailing version marker (``:``) on ``record_id`` is stripped. Both
+    ``204`` (deleted) and ``404`` (already absent) are treated as success so
+    callers can retry/resume idempotently.
+    """
+    if not record_id or not record_id.strip():
+        raise ValueError("A non-empty record_id is required for delete_record.")
+
+    rid = record_id.rstrip(":")
+    parsed_body, http_status, correlation_id, latency_ms, error_message = (
+        _call(
+            connection=connection,
+            token=token,
+            method="DELETE",
+            path=f"{STORAGE_RECORDS_PATH}/{quote(rid, safe=':')}",
+            json_body=None,
+        )
+    )
+    ok = http_status in (204, 404)
+    return RecordDeleteResult(
+        record_id=record_id,
+        ok=ok,
+        http_status=http_status,
+        latency_ms=latency_ms,
+        correlation_id=correlation_id,
+        error_message=None if ok else (error_message or f"HTTP {http_status}"),
+    )
+
+
+
 def get_workflow_status(
     connection: ADMEConnection,
     token: str,
@@ -773,6 +812,13 @@ def _call(
                 url=url,
                 headers=headers,
                 json=json_body,
+                timeout=INGESTION_TIMEOUT_SECONDS,
+                allow_redirects=False,
+            )
+        elif method == "DELETE":
+            response = requests.delete(
+                url=url,
+                headers=headers,
                 timeout=INGESTION_TIMEOUT_SECONDS,
                 allow_redirects=False,
             )

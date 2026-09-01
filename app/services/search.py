@@ -418,6 +418,61 @@ def search_with_cursor(
     )
 
 
+def search_by_distance(
+    connection: ADMEConnection,
+    token: str,
+    *,
+    kind: str,
+    latitude: float,
+    longitude: float,
+    distance_m: float,
+    spatial_field: str = "data.SpatialLocation.Wgs84Coordinates",
+    returned_fields: tuple[str, ...] = ("id",),
+    limit: int = DEFAULT_SEARCH_LIMIT,
+) -> tuple[list[dict[str, Any]], int | None, str | None]:
+    """``POST /api/search/v2/query`` with a ``byDistance`` spatial filter.
+
+    Finds records of ``kind`` whose ``spatial_field`` geometry lies within
+    ``distance_m`` metres of the given point. Returns the raw hit list (each a
+    dict with ``id`` and requested ``data.*`` fields), the HTTP status, and an
+    error message when the call fails.
+    """
+    if not kind or not kind.strip():
+        raise ValueError("A non-empty kind is required for search_by_distance.")
+    if limit < 1:
+        raise ValueError("limit must be >= 1.")
+
+    body: dict[str, Any] = {
+        "kind": kind,
+        "limit": limit,
+        "returnedFields": list(returned_fields),
+        "spatialFilter": {
+            "field": spatial_field,
+            "byDistance": {
+                "point": {"latitude": latitude, "longitude": longitude},
+                "distance": distance_m,
+            },
+        },
+    }
+
+    parsed_body, http_status, _correlation_id, _latency_ms, error_message = (
+        _call_search(
+            connection=connection,
+            token=token,
+            method="POST",
+            path=SEARCH_QUERY_PATH,
+            json_body=body,
+            timeout=EXPORT_TIMEOUT_SECONDS,
+        )
+    )
+    if http_status is not None and 200 <= http_status < 300:
+        payload = parsed_body if isinstance(parsed_body, dict) else {}
+        results = payload.get("results")
+        hits = [r for r in results if isinstance(r, dict)] if isinstance(results, list) else []
+        return hits, http_status, None
+    return [], http_status, error_message
+
+
 def export_all_records(
     connection: ADMEConnection,
     token: str,

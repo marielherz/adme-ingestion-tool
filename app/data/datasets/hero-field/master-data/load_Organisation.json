@@ -1,0 +1,53 @@
+{
+    "kind": "osdu:wks:Manifest:1.0.0",
+    "MasterData": [
+        {
+            "id": "osdu:master-data--Organisation:AURELIA-ENERGY",
+            "kind": "osdu:wks:master-data--Organisation:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "data": {
+                "OrganisationName": "Aurelia Energy AS",
+                "Source": "Aurelia synthetic hero dataset"
+            }
+        },
+        {
+            "id": "osdu:master-data--Organisation:NORDLYS-PARTNER",
+            "kind": "osdu:wks:master-data--Organisation:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "data": {
+                "OrganisationName": "Nordlys Partner ASA",
+                "Source": "Aurelia synthetic hero dataset"
+            }
+        },
+        {
+            "id": "osdu:master-data--Organisation:APEX-DATA",
+            "kind": "osdu:wks:master-data--Organisation:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "data": {
+                "OrganisationName": "Apex Subsurface Data Services",
+                "Source": "Aurelia synthetic hero dataset"
+            }
+        }
+    ]
+}

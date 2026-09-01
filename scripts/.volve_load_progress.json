@@ -1,0 +1,15 @@
+{
+  "work-products/documents": [
+    "rc--3.0.0_5-templates_wpc_ex_DocumentLoadManifest_1_DC.json",
+    "rc--3.0.0_5-templates_wpc_ex_DocumentLoadManifest_1_NN.json"
+  ],
+  "work-products/fault-system": [
+    "ex_FaultSystemLoadManifest_1_NN.json"
+  ],
+  "work-products/horizons": [
+    "ex_SeismicHorizonLoadManifest_1_NN.json"
+  ],
+  "work-products/time-depth-curves": [
+    "ex_WellLogLoadManifest.1.1.0_1_KW_Checkshots.json"
+  ]
+}

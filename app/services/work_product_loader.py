@@ -18,9 +18,17 @@ first: for each Dataset we upload the local file to Azure Blob (reusing
 the File Service ``uploadURL`` + ``PUT`` primitives), then swap the
 placeholder ``FileSource`` for the returned staging token before submit.
 
-We do **not** call ``post_file_metadata`` here — the manifest's
-``Datasets`` section already registers the File.Generic record through the
-DAG, so a separate metadata POST would create an orphan duplicate.
+We register each Dataset through the File Service ``POST /files/metadata``
+call (``post_file_metadata``) rather than letting the DAG create the
+File.Generic record from the manifest's ``Datasets`` section. This is
+**required for the blob to be retrievable**: only the File Service call
+promotes the staged blob out of the transient landing zone into the
+persistent area. Registering datasets via the DAG leaves the blob in
+staging where it is purged by retention, so ``downloadURL`` later 404s
+even though the metadata record exists. We therefore replace each
+WorkProductComponent's ``surrogate-key:file-*`` reference with the real
+File record id the File Service returns, and drop the ``Data.Datasets``
+section so the DAG only creates the WorkProduct + WorkProductComponents.
 """
 
 from __future__ import annotations
@@ -47,7 +55,13 @@ from app.services.file_uploader import (
     UPLOAD_BYTES_TIMEOUT_SECONDS,
     guess_content_type,
 )
-from app.services.files import get_upload_url, upload_file_bytes
+from app.services.files import (
+    FILES_BLOCK_UPLOAD_THRESHOLD_BYTES,
+    get_upload_url,
+    post_file_metadata,
+    upload_file_blocks,
+    upload_file_bytes,
+)
 from app.services.ingestion import submit_manifest
 
 logger = logging.getLogger(__name__)
@@ -67,6 +81,7 @@ __all__ = [
     "WORK_PRODUCT_SUBMIT_SOURCE",
     "apply_uploaded_file_sources",
     "collect_file_sources",
+    "relink_datasets_to_records",
     "resolve_local_file",
     "stamp_work_product_acl_legal",
     "submit_work_products",
@@ -111,6 +126,17 @@ def resolve_local_file(
         candidate = datasets_root / sub / name
         if candidate.is_file():
             return candidate
+
+    # Volve seismic sources include an extra category directory, e.g.
+    # ``.../seismic/st0299/file.segy``. The downloader preserves that layout,
+    # so also try the final two source path components below datasets_root.
+    if len(parts) >= 3:
+        nested = datasets_root.joinpath(*parts[-3:])
+        if nested.is_file():
+            return nested
+        seismic_nested = datasets_root / "seismic" / Path(*parts[-3:])
+        if seismic_nested.is_file():
+            return seismic_nested
     return None
 
 
@@ -200,27 +226,52 @@ def apply_uploaded_file_sources(
         info.pop("PreloadFilePath", None)
 
 
-def _stage_dataset_files(
+def _versioned_ref(record_id: str) -> str:
+    """Return an OSDU "latest version" reference for ``record_id``.
+
+    OSDU references end with a trailing ``:`` (the empty version marker),
+    e.g. ``opendes:dataset--File.Generic:<guid>:``. Idempotent.
+    """
+    return record_id if record_id.endswith(":") else f"{record_id}:"
+
+
+def _register_dataset_files(
     connection: ADMEConnection,
     token: str,
     manifest_body: dict[str, Any],
     *,
     datasets_root: Path,
-) -> tuple[list[str], str | None]:
-    """Upload every referenced blob; return (staged tokens, error or None)."""
-    tokens: list[str] = []
-    for source in collect_file_sources(manifest_body):
+    acl_owners: Sequence[str],
+    acl_viewers: Sequence[str],
+    legal_tag: str,
+) -> tuple[dict[str, str], str | None]:
+    """Upload + register every Dataset via the File Service.
+
+    For each Dataset: upload the local blob, then ``post_file_metadata`` so
+    the File Service promotes the blob to the persistent area and mints a
+    real File.Generic record id. Returns ``({surrogate_id: real_id}, error)``
+    where ``surrogate_id`` is the Dataset's ``id`` (e.g. ``surrogate-key:file-1``).
+    Stops at the first failure and returns the partial map plus the error.
+    """
+    owner = acl_owners[0] if acl_owners else ""
+    viewer = acl_viewers[0] if acl_viewers else ""
+    id_map: dict[str, str] = {}
+    for dataset in _dataset_records(manifest_body):
+        surrogate = dataset.get("id")
+        data = dataset.get("data") if isinstance(dataset.get("data"), dict) else {}
+        info = data.get("DatasetProperties", {}).get("FileSourceInfo", {})
+        source = info.get("FileSource") if isinstance(info, dict) else None
         if not source:
-            return tokens, "Dataset is missing a FileSource path."
+            return id_map, "Dataset is missing a FileSource path."
         local = resolve_local_file(source, datasets_root=datasets_root)
         if local is None:
-            return tokens, f"Local file not found for {source!r}."
+            return id_map, f"Local file not found for {source!r}."
         try:
-            file_bytes = local.read_bytes()
+            file_size = local.stat().st_size
         except OSError as exc:
-            return tokens, f"Cannot read {local.name}: {exc}"
-        if not file_bytes:
-            return tokens, f"{local.name} is empty; nothing to upload."
+            return id_map, f"Cannot read {local.name}: {exc}"
+        if file_size <= 0:
+            return id_map, f"{local.name} is empty; nothing to upload."
 
         url_result = get_upload_url(connection, token)
         if (
@@ -228,21 +279,92 @@ def _stage_dataset_files(
             or not url_result.signed_url
             or not url_result.file_source
         ):
-            return tokens, (
+            return id_map, (
                 url_result.error_message or "Failed to allocate upload URL."
             )
-        bytes_result = upload_file_bytes(
-            url_result.signed_url,
-            file_bytes,
-            content_type=guess_content_type(local),
-            timeout=UPLOAD_BYTES_TIMEOUT_SECONDS,
-        )
+        bytes_result = _upload_local_file(url_result.signed_url, local, file_size)
         if not bytes_result.ok:
-            return tokens, (
+            return id_map, (
                 bytes_result.error_message or f"Failed to upload {local.name}."
             )
-        tokens.append(url_result.file_source)
-    return tokens, None
+
+        display_name = (
+            info.get("Name") if isinstance(info, dict) else None
+        ) or local.name
+        extra_data = {
+            key: value
+            for key, value in data.items()
+            if key not in ("Name", "Description", "DatasetProperties")
+        }
+        meta = post_file_metadata(
+            connection,
+            token,
+            file_source=url_result.file_source,
+            file_id=url_result.file_id or "",
+            display_name=display_name,
+            description=str(data.get("Description", "")),
+            legal_tag=legal_tag,
+            acl_owners=owner,
+            acl_viewers=viewer,
+            extra_data=extra_data,
+        )
+        if not meta.ok or not meta.record_id:
+            return id_map, (
+                meta.error_message or f"Failed to register {local.name}."
+            )
+        if isinstance(surrogate, str) and surrogate:
+            id_map[surrogate] = meta.record_id
+    return id_map, None
+
+
+def _upload_local_file(signed_url: str, local: Path, file_size: int):
+    """Upload ``local`` through the right Azure Blob primitive for its size."""
+    content_type = guess_content_type(local)
+    if file_size >= FILES_BLOCK_UPLOAD_THRESHOLD_BYTES:
+        return upload_file_blocks(
+            signed_url,
+            local,
+            content_type=content_type,
+        )
+    return upload_file_bytes(
+        signed_url,
+        local.read_bytes(),
+        content_type=content_type,
+        timeout=UPLOAD_BYTES_TIMEOUT_SECONDS,
+    )
+
+
+def relink_datasets_to_records(
+    manifest_body: dict[str, Any],
+    id_map: Mapping[str, str],
+) -> None:
+    """Point WorkProductComponents at real File ids and drop ``Data.Datasets``.
+
+    Rewrites each ``WorkProductComponent.data.Datasets`` surrogate reference
+    that appears in ``id_map`` to the real (version-decorated) File record
+    id, then removes the ``Data.Datasets`` section so the DAG does not
+    recreate an un-promoted duplicate File.Generic record. Mutates in place.
+    """
+    data = manifest_body.get("Data")
+    if not isinstance(data, dict):
+        return
+    components = data.get("WorkProductComponents")
+    if isinstance(components, list):
+        for wpc in components:
+            if not isinstance(wpc, dict):
+                continue
+            wpc_data = wpc.get("data")
+            if not isinstance(wpc_data, dict):
+                continue
+            datasets = wpc_data.get("Datasets")
+            if isinstance(datasets, list):
+                wpc_data["Datasets"] = [
+                    _versioned_ref(id_map[ref])
+                    if isinstance(ref, str) and ref in id_map
+                    else ref
+                    for ref in datasets
+                ]
+    data.pop("Datasets", None)
 
 
 def submit_work_products(
@@ -285,13 +407,19 @@ def submit_work_products(
             if not isinstance(body, dict):
                 raise ValueError("manifest body is not a JSON object")
 
-            tokens, stage_error = _stage_dataset_files(
-                connection, active_token, body, datasets_root=datasets_root
+            id_map, stage_error = _register_dataset_files(
+                connection,
+                active_token,
+                body,
+                datasets_root=datasets_root,
+                acl_owners=acl_owners,
+                acl_viewers=acl_viewers,
+                legal_tag=legal_tag,
             )
             if stage_error is not None:
                 raise ValueError(stage_error)
 
-            apply_uploaded_file_sources(body, tokens)
+            relink_datasets_to_records(body, id_map)
             stamp_work_product_acl_legal(
                 body,
                 acl_owners=acl_owners,

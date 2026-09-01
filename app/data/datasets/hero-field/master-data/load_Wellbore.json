@@ -1,0 +1,248 @@
+{
+    "kind": "osdu:wks:Manifest:1.0.0",
+    "MasterData": [
+        {
+            "id": "osdu:master-data--Wellbore:AUR-01-01",
+            "kind": "osdu:wks:master-data--Wellbore:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "tags": {
+                "quality:state": "Certified",
+                "hero:field": "Aurelia",
+                "hero:role": "discovery"
+            },
+            "data": {
+                "FacilityName": "Aurelia Discovery 1 main bore",
+                "FacilityID": "AUR-01-01",
+                "WellID": "<namespace>:master-data--Well:AUR-01:",
+                "SequenceNumber": 0,
+                "Source": "Aurelia synthetic hero dataset",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:AURELIA-ENERGY:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:APEX-DATA:",
+                "TrajectoryTypeID": "<namespace>:reference-data--WellboreTrajectoryType:Directional:",
+                "NameAliases": [
+                    {
+                        "AliasName": "Aurelia Discovery 1 main bore",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Wellbore:AUR-01-ST1",
+            "kind": "osdu:wks:master-data--Wellbore:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "tags": {
+                "quality:state": "Certified",
+                "hero:field": "Aurelia",
+                "hero:role": "discovery",
+                "hero:sidetrack-of": "AUR-01-01"
+            },
+            "data": {
+                "FacilityName": "Aurelia Discovery 1 sidetrack 1",
+                "FacilityID": "AUR-01-ST1",
+                "WellID": "<namespace>:master-data--Well:AUR-01:",
+                "SequenceNumber": 1,
+                "Source": "Aurelia synthetic hero dataset",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:AURELIA-ENERGY:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:APEX-DATA:",
+                "TrajectoryTypeID": "<namespace>:reference-data--WellboreTrajectoryType:Directional:",
+                "NameAliases": [
+                    {
+                        "AliasName": "Aurelia Discovery 1 sidetrack 1",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ],
+                "ParentWellboreID": "<namespace>:master-data--Wellbore:AUR-01-01:",
+                "Remark": "Sidetrack kicked off above the fault after total circulation losses; geosteered back into Hugin."
+            }
+        },
+        {
+            "id": "osdu:master-data--Wellbore:AUR-02-01",
+            "kind": "osdu:wks:master-data--Wellbore:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "tags": {
+                "quality:state": "Certified",
+                "hero:field": "Aurelia",
+                "hero:role": "appraisal"
+            },
+            "data": {
+                "FacilityName": "Aurelia Appraisal 2 main bore",
+                "FacilityID": "AUR-02-01",
+                "WellID": "<namespace>:master-data--Well:AUR-02:",
+                "SequenceNumber": 0,
+                "Source": "Aurelia synthetic hero dataset",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:AURELIA-ENERGY:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:APEX-DATA:",
+                "TrajectoryTypeID": "<namespace>:reference-data--WellboreTrajectoryType:Directional:",
+                "NameAliases": [
+                    {
+                        "AliasName": "Aurelia Appraisal 2 main bore",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Wellbore:AUR-03-01",
+            "kind": "osdu:wks:master-data--Wellbore:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "tags": {
+                "quality:state": "Flagged",
+                "hero:field": "Aurelia",
+                "hero:role": "appraisal"
+            },
+            "data": {
+                "FacilityName": "Aurelia Appraisal 3 main bore",
+                "FacilityID": "AUR-03-01",
+                "WellID": "<namespace>:master-data--Well:AUR-03:",
+                "SequenceNumber": 0,
+                "Source": "Aurelia synthetic hero dataset",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:AURELIA-ENERGY:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:APEX-DATA:",
+                "TrajectoryTypeID": "<namespace>:reference-data--WellboreTrajectoryType:Directional:",
+                "NameAliases": [
+                    {
+                        "AliasName": "Aurelia Appraisal 3 main bore",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Wellbore:AUR-04-01",
+            "kind": "osdu:wks:master-data--Wellbore:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "tags": {
+                "quality:state": "Certified",
+                "hero:field": "Aurelia",
+                "hero:role": "appraisal"
+            },
+            "data": {
+                "FacilityName": "Aurelia Appraisal 4 main bore",
+                "FacilityID": "AUR-04-01",
+                "WellID": "<namespace>:master-data--Well:AUR-04:",
+                "SequenceNumber": 0,
+                "Source": "Aurelia synthetic hero dataset",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:AURELIA-ENERGY:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:APEX-DATA:",
+                "TrajectoryTypeID": "<namespace>:reference-data--WellboreTrajectoryType:Directional:",
+                "NameAliases": [
+                    {
+                        "AliasName": "Aurelia Appraisal 4 main bore",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Wellbore:AUR-05-01",
+            "kind": "osdu:wks:master-data--Wellbore:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "tags": {
+                "quality:state": "Provisional",
+                "hero:field": "Aurelia",
+                "hero:role": "jv-appraisal",
+                "entitlement:jv": "true",
+                "entitlement:visibility": "metadata-only"
+            },
+            "data": {
+                "FacilityName": "Aurelia JV Appraisal 5 main bore",
+                "FacilityID": "AUR-05-01",
+                "WellID": "<namespace>:master-data--Well:AUR-05:",
+                "SequenceNumber": 0,
+                "Source": "Aurelia synthetic hero dataset",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:NORDLYS-PARTNER:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:APEX-DATA:",
+                "TrajectoryTypeID": "<namespace>:reference-data--WellboreTrajectoryType:Directional:",
+                "NameAliases": [
+                    {
+                        "AliasName": "Aurelia JV Appraisal 5 main bore",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ]
+            }
+        },
+        {
+            "id": "osdu:master-data--Wellbore:AUR-06-01",
+            "kind": "osdu:wks:master-data--Wellbore:1.0.0",
+            "acl": {
+                "owners": [],
+                "viewers": []
+            },
+            "legal": {
+                "legaltags": [],
+                "otherRelevantDataCountries": []
+            },
+            "tags": {
+                "quality:state": "Certified",
+                "hero:field": "Aurelia",
+                "hero:role": "dry-hole"
+            },
+            "data": {
+                "FacilityName": "Aurelia Exploration 6 main bore",
+                "FacilityID": "AUR-06-01",
+                "WellID": "<namespace>:master-data--Well:AUR-06:",
+                "SequenceNumber": 0,
+                "Source": "Aurelia synthetic hero dataset",
+                "ExistenceKind": "<namespace>:reference-data--ExistenceKind:Active:",
+                "CurrentOperatorID": "<namespace>:master-data--Organisation:AURELIA-ENERGY:",
+                "DataSourceOrganisationID": "<namespace>:master-data--Organisation:APEX-DATA:",
+                "TrajectoryTypeID": "<namespace>:reference-data--WellboreTrajectoryType:Directional:",
+                "NameAliases": [
+                    {
+                        "AliasName": "Aurelia Exploration 6 main bore",
+                        "AliasNameTypeID": "<namespace>:reference-data--AliasNameType:RegulatoryName:"
+                    }
+                ]
+            }
+        }
+    ]
+}

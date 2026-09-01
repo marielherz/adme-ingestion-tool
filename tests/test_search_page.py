@@ -1,4 +1,4 @@
-"""Tests for the ADME Search page (`app/pages/7_🔍_Search.py`)."""
+"""Tests for the ADME Search page (`app/pages/8_🔍_Search.py`)."""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ SEARCH_PAGE_PATH = (
     Path(__file__).resolve().parents[1]
     / "app"
     / "pages"
-    / "7_🔍_Search.py"
+    / "8_🔍_Search.py"
 )
 
 # Locked session-state keys mirror those in the page.

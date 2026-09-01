@@ -43,6 +43,9 @@ SEARCH_PAGE_PATH = "pages/8_🔍_Search.py"
 BULK_LOAD_PAGE_PATH = "pages/9_📥_Bulk_Load.py"
 TNO_PAGE_PATH = "pages/11_📦_TNO_Dataset.py"
 HISTORY_PAGE_PATH = "pages/10_📊_History.py"
+WELL_GRAPH_PAGE_PATH = "pages/13_🕸️_Well_Graph.py"
+DISCOVERY_PAGE_PATH = "pages/14_🔮_Discovery.py"
+SEMANTIC_CONN_PAGE_PATH = "pages/15_🧠_Semantic_Connection.py"
 
 
 def _render_home() -> None:
@@ -181,6 +184,11 @@ def main() -> None:
         title="Legal Tags",
         icon="🏷️",
     )
+    semantic_conn_page = st.Page(
+        SEMANTIC_CONN_PAGE_PATH,
+        title="Semantic Connection",
+        icon="🧠",
+    )
     ingest_landing_page = st.Page(
         INGEST_PAGE_PATH,
         title="Overview",
@@ -221,6 +229,16 @@ def main() -> None:
         title="History",
         icon="📊",
     )
+    well_graph_page = st.Page(
+        WELL_GRAPH_PAGE_PATH,
+        title="Graph",
+        icon="🕸️",
+    )
+    discovery_page = st.Page(
+        DISCOVERY_PAGE_PATH,
+        title="Intelligent Discovery",
+        icon="🔮",
+    )
 
     nav = st.navigation(
         {
@@ -229,6 +247,7 @@ def main() -> None:
                 instance_config_page,
                 entitlements_page,
                 legal_tags_page,
+                semantic_conn_page,
             ],
             "Ingest": [
                 ingest_landing_page,
@@ -238,7 +257,12 @@ def main() -> None:
                 tno_page,
                 bulk_load_page,
             ],
-            "Operate": [search_page, history_page],
+            "Operate": [
+                search_page,
+                discovery_page,
+                well_graph_page,
+                history_page,
+            ],
         }
     )
     nav.run()

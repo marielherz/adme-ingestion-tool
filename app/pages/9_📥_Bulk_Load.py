@@ -92,6 +92,12 @@ from app.services.bulk_loader import (  # noqa: E402
     submit_records_from_paths,
     submit_tier,
 )
+from app.services.dataset_verification import (  # noqa: E402
+    diff_part,
+    repair_duplicates,
+    repair_missing,
+    sample_bulk,
+)
 from app.services.downloaded_dataset import (  # noqa: E402
     DownloadedPart,
     discover_parts,
@@ -167,6 +173,15 @@ SMART_ACL_VIEWERS_KEY = "smart_acl_viewers"
 _INTERVAL_PROGRESS_DIR = (
     Path.home() / ".adme-ingestion-tool" / "interval_progress"
 )
+
+
+# --- Verify & Repair session-state keys ----------------------------------
+VERIFY_ROOT_KEY = "verify_root"  # str — downloaded dataset root to check
+VERIFY_RESULTS_KEY = "verify_results"  # dict — last verification snapshot
+VERIFY_LEGAL_TAG_KEY = "verify_legal_tag"
+VERIFY_ACL_OWNERS_KEY = "verify_acl_owners"
+VERIFY_ACL_VIEWERS_KEY = "verify_acl_viewers"
+VERIFY_REPAIR_MESSAGE_KEY = "verify_repair_message"  # str — last repair result
 
 
 # --- Generate-from-CSV session-state keys (prefixed gen_) ----------------
@@ -285,12 +300,15 @@ def main() -> None:
         f"Endpoint: `{connection.endpoint}`"
     )
 
-    tab_smart, tab_advanced = st.tabs(
-        ["🎯 Smart Tier Load", "🛠️ Advanced"]
+    tab_smart, tab_verify, tab_advanced = st.tabs(
+        ["🎯 Smart Tier Load", "🔎 Verify & Repair", "🛠️ Advanced"]
     )
 
     with tab_smart:
         _render_smart_tier_tab(connection)
+
+    with tab_verify:
+        _render_verify_repair_tab(connection)
 
     with tab_advanced:
         st.caption(
@@ -340,7 +358,16 @@ def _render_registered_datasets_tab(connection: ADMEConnection) -> None:
     _render_source_and_license(descriptor)
     tier_name = _render_tier_selector(descriptor)
 
-    _render_input_form(connection)
+    _render_setup_block(
+        connection,
+        legal_key=BULK_LEGAL_TAG_KEY,
+        owners_key=BULK_ACL_OWNERS_KEY,
+        viewers_key=BULK_ACL_VIEWERS_KEY,
+        prefix_key=BULK_LOAD_PREFIX_KEY,
+        refresh_key="bulk_refresh_options",
+        show_prefix=True,
+        label="Setup",
+    )
 
     if tier_name is None:
         st.info(
@@ -468,13 +495,15 @@ def _render_downloaded_dataset_tab(connection: ADMEConnection) -> None:
         "placeholder groups)."
     )
 
-    _render_input_form(
+    _render_setup_block(
         connection,
         legal_key=DOWNLOAD_LEGAL_TAG_KEY,
         owners_key=DOWNLOAD_ACL_OWNERS_KEY,
         viewers_key=DOWNLOAD_ACL_VIEWERS_KEY,
         prefix_key=DOWNLOAD_LOAD_PREFIX_KEY,
         refresh_key="bulk_dl_refresh_options",
+        show_prefix=True,
+        label="Setup",
     )
 
     st.checkbox(
@@ -524,11 +553,11 @@ def _download_disabled_reason(manifests: Sequence[Path]) -> str | None:
     """Return why the download Load button is disabled, or ``None``."""
     if not manifests:
         return "No manifests match the current selection."
-    if not str(st.session_state.get(DOWNLOAD_LEGAL_TAG_KEY) or "").strip():
+    if not _resolve_session_text(DOWNLOAD_LEGAL_TAG_KEY):
         return "Select a legal tag."
-    if not str(st.session_state.get(DOWNLOAD_ACL_OWNERS_KEY) or "").strip():
+    if not _resolve_session_text(DOWNLOAD_ACL_OWNERS_KEY):
         return "Fill ACL owners group."
-    if not str(st.session_state.get(DOWNLOAD_ACL_VIEWERS_KEY) or "").strip():
+    if not _resolve_session_text(DOWNLOAD_ACL_VIEWERS_KEY):
         return "Fill ACL viewers group."
     return None
 
@@ -549,13 +578,9 @@ def _start_download_job(
     if token is None:
         return
 
-    legal_tag = str(st.session_state.get(DOWNLOAD_LEGAL_TAG_KEY) or "").strip()
-    acl_owners = [
-        str(st.session_state.get(DOWNLOAD_ACL_OWNERS_KEY) or "").strip()
-    ]
-    acl_viewers = [
-        str(st.session_state.get(DOWNLOAD_ACL_VIEWERS_KEY) or "").strip()
-    ]
+    legal_tag = _resolve_session_text(DOWNLOAD_LEGAL_TAG_KEY)
+    acl_owners = [_resolve_session_text(DOWNLOAD_ACL_OWNERS_KEY)]
+    acl_viewers = [_resolve_session_text(DOWNLOAD_ACL_VIEWERS_KEY)]
     load_prefix = str(
         st.session_state.get(DOWNLOAD_LOAD_PREFIX_KEY) or ""
     ).strip()
@@ -713,11 +738,11 @@ def _smart_disabled_reason(plans: Sequence[Any]) -> str | None:
         return "Enter the downloaded dataset root folder."
     if not plans:
         return "No loadable tiers found under that root."
-    if not str(st.session_state.get(SMART_LEGAL_TAG_KEY) or "").strip():
+    if not _resolve_session_text(SMART_LEGAL_TAG_KEY):
         return "Select a legal tag."
-    if not str(st.session_state.get(SMART_ACL_OWNERS_KEY) or "").strip():
+    if not _resolve_session_text(SMART_ACL_OWNERS_KEY):
         return "Fill ACL owners group."
-    if not str(st.session_state.get(SMART_ACL_VIEWERS_KEY) or "").strip():
+    if not _resolve_session_text(SMART_ACL_VIEWERS_KEY):
         return "Fill ACL viewers group."
     return None
 
@@ -770,13 +795,14 @@ def _render_smart_tier_tab(connection: ADMEConnection) -> None:
             ),
         )
 
-    _render_input_form(
+    _render_setup_block(
         connection,
         legal_key=SMART_LEGAL_TAG_KEY,
         owners_key=SMART_ACL_OWNERS_KEY,
         viewers_key=SMART_ACL_VIEWERS_KEY,
         refresh_key="smart_refresh_options",
         show_prefix=False,
+        label="Setup",
     )
     st.checkbox(
         "🔄 Auto-refresh token via Azure CLI (recommended for long loads)",
@@ -833,11 +859,9 @@ def _start_smart_tier_job(connection: ADMEConnection) -> None:
     batch = int(
         st.session_state.get(SMART_BATCH_KEY) or DEFAULT_STORAGE_BATCH_SIZE
     )
-    legal_tag = str(st.session_state.get(SMART_LEGAL_TAG_KEY) or "").strip()
-    acl_owners = [str(st.session_state.get(SMART_ACL_OWNERS_KEY) or "").strip()]
-    acl_viewers = [
-        str(st.session_state.get(SMART_ACL_VIEWERS_KEY) or "").strip()
-    ]
+    legal_tag = _resolve_session_text(SMART_LEGAL_TAG_KEY)
+    acl_owners = [_resolve_session_text(SMART_ACL_OWNERS_KEY)]
+    acl_viewers = [_resolve_session_text(SMART_ACL_VIEWERS_KEY)]
 
     token = _acquire_token(connection)
     if token is None:
@@ -901,6 +925,231 @@ def _start_smart_tier_job(connection: ADMEConnection) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Verify & Repair
+# ---------------------------------------------------------------------------
+
+
+def _render_verify_repair_tab(connection: ADMEConnection) -> None:
+    """Reconcile a loaded dataset against the instance, and repair gaps.
+
+    Read-only *verify* (counts, downloadable-bulk sampling, and per-part
+    missing/duplicate detection by ``data.Name``) plus one-click *repair*
+    (re-submit the missing manifests; delete duplicate work-products and
+    their files). Generalizes the manual reconciliation a work-product load
+    needs after an interrupted/throttled run.
+    """
+    st.subheader("Verify & Repair a loaded work-product dataset")
+    st.caption(
+        "Compare the on-disk manifests against what actually landed in ADME "
+        "— record counts, whether the bulk blobs are downloadable, and which "
+        "work-products are missing or duplicated — then fix gaps in place."
+    )
+
+    st.text_input(
+        "Downloaded dataset root",
+        key=VERIFY_ROOT_KEY,
+        placeholder=r"C:\Users\you\osdu-data\tno",
+        help=(
+            "The same folder you loaded from (contains TNO/provided and "
+            "datasets). Only the work-product parts are checked."
+        ),
+    )
+    root_str = str(st.session_state.get(VERIFY_ROOT_KEY, "")).strip()
+
+    _render_setup_block(
+        connection,
+        legal_key=VERIFY_LEGAL_TAG_KEY,
+        owners_key=VERIFY_ACL_OWNERS_KEY,
+        viewers_key=VERIFY_ACL_VIEWERS_KEY,
+        refresh_key="verify_refresh_options",
+        show_prefix=False,
+        label="Setup",
+    )
+
+    if st.button(
+        "🔎 Run verification",
+        key="verify_run_button",
+        type="primary",
+        disabled=not root_str,
+    ):
+        _run_verification(connection, Path(root_str))
+
+    message = st.session_state.get(VERIFY_REPAIR_MESSAGE_KEY)
+    if message:
+        st.info(message)
+
+    snapshot = st.session_state.get(VERIFY_RESULTS_KEY)
+    if snapshot:
+        _render_verification_results(connection, snapshot)
+
+
+def _run_verification(connection: ADMEConnection, root: Path) -> None:
+    """Enumerate work-product parts and store a verification snapshot."""
+    token = _acquire_token(connection)
+    if token is None:
+        st.error("Could not acquire an access token for verification.")
+        return
+    parts = [
+        p
+        for p in discover_parts(root)
+        if p.is_work_product and not p.key.endswith("_1_1_0")
+    ]
+    if not parts:
+        st.warning(
+            "No work-product parts found under that root. Point at the "
+            "download folder that contains `TNO/provided/work-products`."
+        )
+        return
+    with st.spinner("Reconciling manifests against the instance…"):
+        diffs = [diff_part(connection, token, part) for part in parts]
+        bulk = sample_bulk(connection, token)
+    st.session_state[VERIFY_RESULTS_KEY] = {
+        "root": str(root),
+        "diffs": diffs,
+        "bulk": bulk,
+    }
+    st.session_state[VERIFY_REPAIR_MESSAGE_KEY] = None
+
+
+def _render_verification_results(
+    connection: ADMEConnection, snapshot: dict[str, Any]
+) -> None:
+    """Render the counts table, bulk sample, and per-part repair controls."""
+    diffs = snapshot.get("diffs", [])
+    bulk = snapshot.get("bulk", [])
+
+    rows = [
+        {
+            "Part": d.part_key.split("/")[-1],
+            "Expected": d.expected,
+            "Present": d.unique_present,
+            "Missing": len(d.missing_names),
+            "Duplicates": len(d.duplicate_extra_ids),
+            "Status": "✅ OK" if d.clean else "⚠️ needs repair",
+        }
+        for d in diffs
+    ]
+    if rows:
+        st.dataframe(
+            pd.DataFrame(rows), hide_index=True, use_container_width=True
+        )
+
+    if bulk:
+        present = sum(1 for b in bulk if b.present)
+        line = f"Bulk blobs sampled: **{present}/{len(bulk)}** downloadable."
+        (st.success if present == len(bulk) else st.error)(line)
+        if present < len(bulk):
+            st.caption(
+                "Missing blobs mean the metadata exists but the file bytes "
+                "were never promoted to persistent storage — reload those "
+                "work-products with the current loader to fix."
+            )
+
+    if all(d.clean for d in diffs):
+        st.success("Everything reconciles — no missing or duplicate items. 🎉")
+        return
+
+    st.markdown("#### Repairs")
+    for diff in diffs:
+        if diff.clean:
+            continue
+        with st.expander(
+            f"🛠️ {diff.part_key} — {len(diff.missing_names)} missing, "
+            f"{len(diff.duplicate_extra_ids)} duplicate",
+            expanded=True,
+        ):
+            if diff.missing_names:
+                preview = ", ".join(diff.missing_names[:15])
+                if len(diff.missing_names) > 15:
+                    preview += f" … (+{len(diff.missing_names) - 15} more)"
+                st.write(f"**Missing ({len(diff.missing_names)}):** {preview}")
+                if st.button(
+                    f"⬆️ Fill {len(diff.missing_names)} missing",
+                    key=f"verify_fill_{diff.part_key}",
+                ):
+                    _do_fill(connection, snapshot["root"], diff)
+            if diff.duplicate_extra_ids:
+                st.write(
+                    f"**Duplicates:** {len(diff.duplicate_extra_ids)} extra "
+                    "work-product(s) to remove (with their files + parents)."
+                )
+                if st.button(
+                    f"🗑️ Remove {len(diff.duplicate_extra_ids)} duplicates",
+                    key=f"verify_dedup_{diff.part_key}",
+                ):
+                    _do_dedup(connection, diff)
+
+
+def _find_part(root_str: str, part_key: str) -> DownloadedPart | None:
+    for part in discover_parts(Path(root_str)):
+        if part.key == part_key:
+            return part
+    return None
+
+
+def _do_fill(connection: ADMEConnection, root_str: str, diff: Any) -> None:
+    """Re-submit the missing manifests for one part."""
+    token = _acquire_token(connection)
+    if token is None:
+        st.error("Could not acquire an access token.")
+        return
+    legal = str(st.session_state.get(VERIFY_LEGAL_TAG_KEY, "")).strip()
+    owners = str(st.session_state.get(VERIFY_ACL_OWNERS_KEY, "")).strip()
+    viewers = str(st.session_state.get(VERIFY_ACL_VIEWERS_KEY, "")).strip()
+    if not (legal and owners and viewers):
+        st.error(
+            "Set the legal tag and ACL owners/viewers (expander above) "
+            "before filling missing items."
+        )
+        return
+    part = _find_part(root_str, diff.part_key)
+    if part is None:
+        st.error("Could not locate that part under the dataset root.")
+        return
+    provider = RefreshingTokenProvider(acquire=acquire_cli_token)
+    ok = 0
+    with st.spinner(f"Re-submitting {len(diff.missing_names)} missing item(s)…"):
+        for res in repair_missing(
+            connection,
+            token,
+            part,
+            diff,
+            acl_owners=[owners],
+            acl_viewers=[viewers],
+            legal_tag=legal,
+            token_provider=provider,
+        ):
+            if res.status == "success":
+                ok += 1
+    st.session_state[VERIFY_REPAIR_MESSAGE_KEY] = (
+        f"Filled {ok}/{len(diff.missing_names)} for `{diff.part_key}`. "
+        "Re-run verification in ~1 minute to confirm (the DAG and Search "
+        "indexing settle asynchronously)."
+    )
+    st.rerun()
+
+
+def _do_dedup(connection: ADMEConnection, diff: Any) -> None:
+    """Delete the duplicate work-products for one part."""
+    token = _acquire_token(connection)
+    if token is None:
+        st.error("Could not acquire an access token.")
+        return
+    deleted = 0
+    with st.spinner(
+        f"Removing {len(diff.duplicate_extra_ids)} duplicate(s)…"
+    ):
+        for res in repair_duplicates(connection, token, diff):
+            if res.ok:
+                deleted += 1
+    st.session_state[VERIFY_REPAIR_MESSAGE_KEY] = (
+        f"Deleted {deleted} record(s) for `{diff.part_key}` duplicates "
+        "(work-product components + their files + parent work-products)."
+    )
+    st.rerun()
+
+
+# ---------------------------------------------------------------------------
 # Session bootstrap
 # ---------------------------------------------------------------------------
 
@@ -928,6 +1177,12 @@ def _ensure_page_defaults() -> None:
     st.session_state.setdefault(SMART_LEGAL_TAG_KEY, "")
     st.session_state.setdefault(SMART_ACL_OWNERS_KEY, "")
     st.session_state.setdefault(SMART_ACL_VIEWERS_KEY, "")
+    st.session_state.setdefault(VERIFY_ROOT_KEY, "")
+    st.session_state.setdefault(VERIFY_RESULTS_KEY, None)
+    st.session_state.setdefault(VERIFY_LEGAL_TAG_KEY, "")
+    st.session_state.setdefault(VERIFY_ACL_OWNERS_KEY, "")
+    st.session_state.setdefault(VERIFY_ACL_VIEWERS_KEY, "")
+    st.session_state.setdefault(VERIFY_REPAIR_MESSAGE_KEY, None)
     st.session_state.setdefault(DOWNLOAD_LEGAL_TAG_KEY, "")
     st.session_state.setdefault(DOWNLOAD_ACL_OWNERS_KEY, "")
     st.session_state.setdefault(DOWNLOAD_ACL_VIEWERS_KEY, "")
@@ -1081,6 +1336,50 @@ def _render_sticky_error(key_suffix: str = "") -> None:
     if st.button(DISMISS_BUTTON_LABEL, key=f"bulk_dismiss_error{key_suffix}"):
         _clear_sticky_error()
         st.rerun()
+
+
+def _resolve_session_text(
+    primary_key: str, *, fallback_key: str | None = None
+) -> str:
+    """Return the first non-empty value from the primary or fallback session key."""
+    value = st.session_state.get(primary_key)
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            return text
+    if fallback_key is None:
+        return ""
+    value = st.session_state.get(fallback_key)
+    if isinstance(value, str):
+        text = value.strip()
+        if text:
+            return text
+    return ""
+
+
+def _render_setup_block(
+    connection: ADMEConnection,
+    *,
+    legal_key: str,
+    owners_key: str,
+    viewers_key: str,
+    prefix_key: str | None = None,
+    refresh_key: str,
+    show_prefix: bool = True,
+    expanded: bool = False,
+    label: str = "ACL / legal",
+) -> None:
+    """Render the common legal-tag / ACL setup block in one place."""
+    with st.expander(f"{label} — required for submission", expanded=expanded):
+        _render_input_form(
+            connection,
+            legal_key=legal_key,
+            owners_key=owners_key,
+            viewers_key=viewers_key,
+            prefix_key=prefix_key or BULK_LOAD_PREFIX_KEY,
+            refresh_key=refresh_key,
+            show_prefix=show_prefix,
+        )
 
 
 # ---------------------------------------------------------------------------

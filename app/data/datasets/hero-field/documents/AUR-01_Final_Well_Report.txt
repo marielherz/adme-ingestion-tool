@@ -1,0 +1,32 @@
+AURELIA DISCOVERY 1 (AUR-01) — FINAL WELL REPORT
+=================================================
+
+SUMMARY
+AUR-01 was drilled to appraise the Hugin Formation on the Aurelia structure.
+The well confirmed an oil discovery in clean Hugin sandstones sealed by the
+Draupne Formation claystone. A drilling hazard was encountered that materially
+changed the well programme and is documented below.
+
+DRILLING HAZARDS
+1. SHALLOW GAS (approx. 470-490 m MD). A shallow gas sand was flagged on the
+   site-survey and confirmed while drilling the 26" section. The interval was
+   drilled with a weighted mud cap and the diverter armed. No influx reached
+   surface. Offset wells AUR-02 and AUR-04 should treat 450-500 m as a
+   shallow-gas hazard zone.
+
+2. FAULT-RELATED TOTAL LOSSES (approx. 3540 m MD). While drilling toward the
+   Hugin target the bit intersected a sub-seismic fault at the Heather level and
+   the well took total circulation losses. Losses could not be cured with LCM.
+   The lower hole was plugged back and a SIDETRACK (AUR-01-ST1) was kicked off
+   above the fault and geosteered back into the Hugin reservoir, which was
+   penetrated with good oil shows and net pay.
+
+RESERVOIR
+The Hugin Formation was encountered near 3620 m MD with an oil-water contact
+consistent with AUR-02. The Draupne Formation provides an effective top seal.
+The Skagerrak Formation forms the base of the prognosed section.
+
+DATA QUALITY / LINEAGE
+Positional data derived from the Aurelia PSDM 2024 reprocessing (curated by
+Apex Subsurface Data Services). Directional surveys passed QC. This report is
+the authoritative narrative source for the AUR-01 sidetrack decision.

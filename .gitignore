@@ -10,6 +10,13 @@ __pycache__/
 scripts/wp_load.log
 scripts/.wp_load_progress.json
 
+# Generated semantic-search artifacts
+.wellbore-trajectories-semantic.jsonl
+.wellbore-trajectories-embedded.jsonl
+
+# Local POC outputs (read-only graph/ontology experiments)
+poc-output/
+
 # Distribution / packaging
 .Python
 build/

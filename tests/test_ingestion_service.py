@@ -11,6 +11,7 @@ import requests  # type: ignore[import-untyped]
 from app.models.connection import ADMEConnection, AuthMethod
 from app.models.osdu import (
     LegalTagCheckResult,
+    RecordDeleteResult,
     WorkflowRunResult,
     WorkflowStatus,
 )
@@ -23,6 +24,7 @@ from app.services.ingestion import (
     WORKFLOW_INGEST_RUN_PATH,
     WORKFLOW_RUN_STATUS_PATH_TEMPLATE,
     check_legal_tag,
+    delete_record,
     get_workflow_status,
     put_records,
     submit_manifest,
@@ -111,6 +113,61 @@ def _patch_put(
 
     monkeypatch.setattr(ingestion_module.requests, "put", fake_put)
     return captured
+
+
+def _patch_delete(
+    monkeypatch: pytest.MonkeyPatch,
+    response_factory: Any,
+) -> list[dict[str, Any]]:
+    captured: list[dict[str, Any]] = []
+
+    def fake_delete(**kwargs: Any) -> Any:
+        captured.append(kwargs)
+        return response_factory(**kwargs)
+
+    monkeypatch.setattr(ingestion_module.requests, "delete", fake_delete)
+    return captured
+
+
+def test_delete_record_204_ok(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _patch_delete(
+        monkeypatch, lambda **_: _FakeResponse(status_code=204)
+    )
+    res = delete_record(
+        _connection(), "t", "opendes:work-product-component--WellLog:abc:"
+    )
+    assert isinstance(res, RecordDeleteResult)
+    assert res.ok is True
+    assert res.http_status == 204
+    # trailing version marker stripped in the request path
+    assert captured[0]["url"].endswith(
+        "/api/storage/v2/records/opendes:work-product-component--WellLog:abc"
+    )
+
+
+def test_delete_record_404_is_idempotent_ok(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_delete(monkeypatch, lambda **_: _FakeResponse(status_code=404))
+    res = delete_record(_connection(), "t", "opendes:x:1")
+    assert res.ok is True  # already gone counts as success
+    assert res.http_status == 404
+
+
+def test_delete_record_403_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_delete(
+        monkeypatch,
+        lambda **_: _FakeResponse(status_code=403, json_payload={"message": "nope"}),
+    )
+    res = delete_record(_connection(), "t", "opendes:x:1")
+    assert res.ok is False
+    assert res.http_status == 403
+    assert res.error_message is not None
+
+
+def test_delete_record_requires_id() -> None:
+    with pytest.raises(ValueError):
+        delete_record(_connection(), "t", "  ")
 
 
 _VALID_MANIFEST: dict[str, Any] = {

@@ -24,6 +24,8 @@ from app.services.files import (
     FILES_TIMEOUT_SECONDS,
     FILES_UPLOAD_URL_PATH,
     MAX_FILE_BYTES_V1,
+    check_file_blob,
+    get_download_url,
     get_upload_url,
     post_file_metadata,
     upload_file_blocks,
@@ -551,6 +553,47 @@ def test_post_file_metadata_omits_description_when_blank(
     assert "Description" not in captured[0]["json"]["data"]
 
 
+def test_post_file_metadata_merges_extra_data(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured = _patch_method(
+        monkeypatch,
+        "post",
+        lambda **_: _FakeResponse(
+            status_code=201, json_payload={"id": "r", "version": 1}
+        ),
+    )
+
+    post_file_metadata(
+        _connection(),
+        token="t",
+        **_md_kwargs(
+            extra_data={
+                "SchemaFormatTypeID": "osdu:reference-data--SchemaFormatType:LAS2:",
+                "ResourceSecurityClassification": (
+                    "osdu:reference-data--ResourceSecurityClassification:RESTRICTED:"
+                ),
+                # These must NOT clobber the canonical fields.
+                "Name": "SHOULD_BE_IGNORED",
+                "DatasetProperties": {"FileSourceInfo": {"FileSource": "bad"}},
+            }
+        ),
+    )
+    data = captured[0]["json"]["data"]
+
+    # Rich fields carried through.
+    assert (
+        data["SchemaFormatTypeID"]
+        == "osdu:reference-data--SchemaFormatType:LAS2:"
+    )
+    assert data["ResourceSecurityClassification"].endswith("RESTRICTED:")
+    # Canonical Name + FileSource win over extra_data.
+    assert data["Name"] == "well.las"
+    assert (
+        data["DatasetProperties"]["FileSourceInfo"]["FileSource"] == "/abc/def"
+    )
+
+
 @pytest.mark.parametrize("status_code", [400, 401, 403, 404, 500])
 def test_post_file_metadata_http_errors(
     monkeypatch: pytest.MonkeyPatch, status_code: int
@@ -652,6 +695,88 @@ def test_post_file_metadata_correlation_id_case_insensitive(
     )
     result = post_file_metadata(_connection(), token="t", **_md_kwargs())
     assert result.correlation_id == "corr-x"
+
+
+# ===========================================================================
+# get_download_url / check_file_blob
+# ===========================================================================
+
+
+def test_get_download_url_happy_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured = _patch_method(
+        monkeypatch,
+        "get",
+        lambda **_: _FakeResponse(
+            status_code=200,
+            json_payload={"SignedUrl": "https://blob.example/sas?sig=z"},
+        ),
+    )
+    res = get_download_url(
+        _connection(), "t", "opendes:dataset--File.Generic:abc:"
+    )
+    assert res.ok is True
+    assert res.signed_url == "https://blob.example/sas?sig=z"
+    # trailing version marker stripped from the record id in the path
+    assert captured[0]["url"].endswith(
+        "/api/file/v2/files/opendes:dataset--File.Generic:abc/downloadURL"
+    )
+
+
+def test_get_download_url_missing_signed_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_method(
+        monkeypatch, "get",
+        lambda **_: _FakeResponse(status_code=200, json_payload={}),
+    )
+    res = get_download_url(_connection(), "t", "opendes:x:1")
+    assert res.ok is False
+    assert "SignedUrl" in (res.error_message or "")
+
+
+def test_check_file_blob_present(monkeypatch: pytest.MonkeyPatch) -> None:
+    def factory(**kwargs: Any) -> _FakeResponse:
+        if str(kwargs.get("url", "")).endswith("/downloadURL"):
+            return _FakeResponse(
+                status_code=200,
+                json_payload={"SignedUrl": "https://blob.example/sas"},
+            )
+        # the SAS blob GET
+        return _FakeResponse(status_code=206, headers={"Content-Length": "42"})
+
+    _patch_method(monkeypatch, "get", factory)
+    res = check_file_blob(_connection(), "t", "opendes:file:1")
+    assert res.present is True
+    assert res.blob_http_status == 206
+    assert res.content_length == 42
+
+
+def test_check_file_blob_missing_blob(monkeypatch: pytest.MonkeyPatch) -> None:
+    def factory(**kwargs: Any) -> _FakeResponse:
+        if str(kwargs.get("url", "")).endswith("/downloadURL"):
+            return _FakeResponse(
+                status_code=200,
+                json_payload={"SignedUrl": "https://blob.example/sas"},
+            )
+        return _FakeResponse(status_code=404, body="BlobNotFound")
+
+    _patch_method(monkeypatch, "get", factory)
+    res = check_file_blob(_connection(), "t", "opendes:file:1")
+    assert res.present is False
+    assert res.blob_http_status == 404
+
+
+def test_check_file_blob_download_url_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _patch_method(
+        monkeypatch, "get",
+        lambda **_: _FakeResponse(status_code=404, body="not found"),
+    )
+    res = check_file_blob(_connection(), "t", "opendes:file:1")
+    assert res.present is False
+    assert res.blob_http_status is None
+
 
 
 @pytest.mark.parametrize("token", ["", "   ", "\t\n"])

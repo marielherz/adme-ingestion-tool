@@ -25,6 +25,9 @@ __all__ = [
 
 _PROVIDED_CANDIDATES: tuple[tuple[str, ...], ...] = (
     ("TNO", "provided"),
+    ("Volve", "provided"),
+    ("Volve",),
+    ("generated-json", "provided"),
     ("provided",),
     (),
 )
